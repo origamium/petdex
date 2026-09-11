@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const native_sdk = @import("native_sdk");
+const canvas = native_sdk.canvas;
 const app = @import("main.zig");
 const plat = @import("plat.zig");
 const hook_server = @import("hook_server.zig");
@@ -58,17 +59,15 @@ pub const State = struct {
     pet_len: usize = 0,
     pet_name: [96]u8 = undefined,
     pet_name_len: usize = 0,
-    input: [2048]u8 = undefined,
-    input_len: usize = 0,
+    /// Text fields mirror the runtime editor (selection and IME
+    /// composition too), so rebuilds keep the caret where it is.
+    input: canvas.TextBuffer(2048) = .{},
     /// Backend of the stream in flight; the setting may change mid-reply.
     stream_kind: domain.ProviderKind = .openai_compat,
     kind: domain.ProviderKind = .openai_compat,
-    local_url: [256]u8 = undefined,
-    local_url_len: usize = 0,
-    local_model: [128]u8 = undefined,
-    local_model_len: usize = 0,
-    codex_model: [128]u8 = undefined,
-    codex_model_len: usize = 0,
+    local_url: canvas.TextBuffer(256) = .{},
+    local_model: canvas.TextBuffer(128) = .{},
+    codex_model: canvas.TextBuffer(128) = .{},
     bubble_excerpt: bool = true,
     creds: codex.Credentials = .{},
     chatgpt: ChatgptPhase = .signed_out,
@@ -98,19 +97,19 @@ pub const State = struct {
     }
 
     pub fn inputText(self: *const State) []const u8 {
-        return self.input[0..self.input_len];
+        return self.input.text();
     }
 
     pub fn localUrl(self: *const State) []const u8 {
-        return self.local_url[0..self.local_url_len];
+        return self.local_url.text();
     }
 
     pub fn localModel(self: *const State) []const u8 {
-        return self.local_model[0..self.local_model_len];
+        return self.local_model.text();
     }
 
     pub fn codexModel(self: *const State) []const u8 {
-        return self.codex_model[0..self.codex_model_len];
+        return self.codex_model.text();
     }
 
     pub fn noteText(self: *const State) []const u8 {
@@ -121,7 +120,7 @@ pub const State = struct {
     pub fn ready(self: *const State) bool {
         return switch (self.kind) {
             .codex => self.creds.signedIn(),
-            .openai_compat => self.local_url_len > 0,
+            .openai_compat => self.local_url.len > 0,
         };
     }
 };
@@ -166,7 +165,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
         .open_chat => open(model, fx),
         .chat_closed => st.open = false,
-        .chat_input => |edit| app.editPathText(&st.input, &st.input_len, edit),
+        .chat_input => |edit| st.input.apply(edit),
         .chat_submit => submit(model, fx),
         .chat_stop => stop(model, fx),
         .chat_clear => clear(model, fx),
@@ -181,13 +180,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .chat_model_input => |edit| {
             switch (st.kind) {
-                .codex => app.editPathText(&st.codex_model, &st.codex_model_len, edit),
-                .openai_compat => app.editPathText(&st.local_model, &st.local_model_len, edit),
+                .codex => st.codex_model.apply(edit),
+                .openai_compat => st.local_model.apply(edit),
             }
             saveConfig(st);
         },
         .chat_url_input => |edit| {
-            app.editPathText(&st.local_url, &st.local_url_len, edit);
+            st.local_url.apply(edit);
             saveConfig(st);
         },
         .chat_detect_models => detectModels(st, fx),
@@ -291,7 +290,7 @@ fn submit(model: *Model, fx: *Effects) void {
     if (st.pet_len == 0) return;
     const action = st.session.submit(st.inputText(), needsRefresh(st, fx));
     if (action == .none) return;
-    st.input_len = 0;
+    st.input.clear();
     st.scroll = 0;
     if (st.session.transcript.last()) |m| {
         if (ensureHistory()) |h| _ = h.append(st.petSlug(), .user, m.text, st.kind, fx.wallMs());
@@ -328,7 +327,7 @@ fn startRequest(model: *Model, fx: *Effects) void {
     const request = provider.buildRequest(st.kind, target, auth, persona_buf[0..persona_len], turns, &bufs) orelse {
         const why: []const u8 = switch (st.kind) {
             .codex => if (st.creds.signedIn()) "The conversation is too long to send." else "Sign in to ChatGPT in Settings first.",
-            .openai_compat => if (st.local_url_len == 0) "Set the server URL in Settings first." else "The conversation is too long to send.",
+            .openai_compat => if (st.local_url.len == 0) "Set the server URL in Settings first." else "The conversation is too long to send.",
         };
         run(model, st.session.onResponse(st.kind, st.session.streamKey(), 0, why), fx);
         return;
@@ -554,7 +553,7 @@ fn onModels(st: *State, response: native_sdk.EffectResponse) void {
     const scratch = std.heap.page_allocator.alloc(u8, 512 * 1024) catch return;
     defer std.heap.page_allocator.free(scratch);
     const id = openai_compat.firstModelId(response.body, scratch) orelse return setNote(st, "The server has no model loaded.");
-    setField(&st.local_model, &st.local_model_len, id);
+    setText(&st.local_model, id);
     saveConfig(st);
 }
 
@@ -574,9 +573,9 @@ fn loadConfig(st: *State) void {
         if (plat.readFileAlloc(arena.allocator(), path, 64 * 1024)) |bytes| cfg = config.parse(arena.allocator(), bytes);
     }
     st.kind = cfg.provider;
-    setField(&st.local_url, &st.local_url_len, cfg.openai_compat.base_url);
-    setField(&st.local_model, &st.local_model_len, cfg.openai_compat.model);
-    setField(&st.codex_model, &st.codex_model_len, cfg.codex.model);
+    setText(&st.local_url, cfg.openai_compat.base_url);
+    setText(&st.local_model, cfg.openai_compat.model);
+    setText(&st.codex_model, cfg.codex.model);
     st.bubble_excerpt = cfg.bubble_excerpt;
 }
 
@@ -597,6 +596,10 @@ fn setField(buf: []u8, len: *usize, value: []const u8) void {
     const kept = domain.utf8Floor(value, buf.len);
     @memcpy(buf[0..kept.len], kept);
     len.* = kept.len;
+}
+
+fn setText(buf: anytype, value: []const u8) void {
+    buf.set(domain.utf8Floor(value, buf.storage.len));
 }
 
 fn setNote(st: *State, message: []const u8) void {

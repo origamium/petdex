@@ -626,7 +626,7 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
                     "Optional local .ttf path; leave empty for the default font"),
                 ui.el(.input, .{
                     .height = 34,
-                    .text = model.font_path[0..model.font_path_len],
+                    .text = model.font_path.text(),
                     .on_input = AppUi.inputMsg(.font_path_input),
                     .placeholder = "/path/to/font.ttf",
                     .semantics = .{ .label = "Custom font file path" },

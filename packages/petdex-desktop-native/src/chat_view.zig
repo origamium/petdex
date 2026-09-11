@@ -33,7 +33,7 @@ pub fn view(ui: *AppUi, model: *const Model) AppUi.Node {
 fn header(ui: *AppUi, st: *const State) AppUi.Node {
     const caption = switch (st.kind) {
         .codex => ui.fmt("ChatGPT · {s}", .{st.codexModel()}),
-        .openai_compat => if (st.local_model_len > 0) ui.fmt("Local · {s}", .{st.localModel()}) else "Local server",
+        .openai_compat => if (st.local_model.len > 0) ui.fmt("Local · {s}", .{st.localModel()}) else "Local server",
     };
     return ui.row(.{ .padding = 12, .gap = 8, .cross = .center }, .{
         ui.column(.{ .grow = 1 }, .{
@@ -165,7 +165,7 @@ fn composer(ui: *AppUi, st: *const State) AppUi.Node {
         if (st.session.busy())
             ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .chat_stop }, "Stop")
         else
-            ui.button(.{ .size = .sm, .variant = .primary, .disabled = st.input_len == 0 or !st.ready(), .on_press = .chat_submit }, "Send"),
+            ui.button(.{ .size = .sm, .variant = .primary, .disabled = st.input.len == 0 or !st.ready(), .on_press = .chat_submit }, "Send"),
     });
 }
 

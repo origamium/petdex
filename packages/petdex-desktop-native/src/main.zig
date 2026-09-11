@@ -310,8 +310,7 @@ pub const Model = struct {
     bubble_columns_text_len: usize = 2,
     bubble_answer_lines_text: [2]u8 = .{ '2', 0 },
     bubble_answer_lines_text_len: usize = 1,
-    font_path: [512]u8 = @splat(0),
-    font_path_len: usize = 0,
+    font_path: canvas.TextBuffer(512) = .{},
     font_path_dirty: bool = false,
     font_load_failed: bool = false,
     /// macOS: run as a menu-bar app — no Dock icon, no app switcher
@@ -1366,7 +1365,7 @@ fn saveSettings(model: *const Model) void {
     else
         "";
     var escaped_font_buf: [1024]u8 = undefined;
-    const font_path = std.mem.trim(u8, model.font_path[0..model.font_path_len], " \t\r\n");
+    const font_path = std.mem.trim(u8, model.font_path.text(), " \t\r\n");
     const escaped_font = jsonEscapeString(font_path, &escaped_font_buf) orelse return;
     const latest = model.latest_version[0..model.latest_version_len];
     const json = std.fmt.bufPrint(&buf, "{{\"active_pet\":\"{s}\",\"scale\":{d:.2},\"bubbles\":{},\"bubbles_per_conversation\":{},\"waiting_sound\":{},\"bubble_text\":{d:.1},\"bubble_lifetime\":{d:.0},\"bubble_columns\":{},\"bubble_answer_lines\":{},\"font_path\":\"{s}\",\"hide_dock\":{},\"rotate_pets\":{},\"rotation_day\":{d},\"update_checks\":{},\"last_update_check_ms\":{d},\"latest_desktop_version\":\"{s}\"{s},\"agents_prompted\":{}}}", .{ active, model.scale, model.bubbles_enabled, model.bubbles_per_conversation, model.waiting_sound, model.bubble_text_px, model.bubble_lifetime_secs, model.bubble_columns, model.bubble_answer_lines, escaped_font, model.hide_dock, model.rotate_pets, model.rotation_day, model.update_checks_enabled, model.last_update_check_ms, latest, pos, model.agents_prompted }) catch return;
@@ -1397,23 +1396,6 @@ fn editUnsignedText(buffer: []u8, length: *usize, edit: canvas.TextInputEvent, m
     const value = std.fmt.parseInt(u16, buffer[0..length.*], 10) catch return null;
     if (value < min_value or value > max_value) return null;
     return value;
-}
-
-pub fn editPathText(buffer: []u8, length: *usize, edit: canvas.TextInputEvent) void {
-    switch (edit) {
-        .insert_text => |text| {
-            const available = buffer.len - length.*;
-            const count = @min(available, text.len);
-            @memcpy(buffer[length.* .. length.* + count], text[0..count]);
-            length.* += count;
-        },
-        .delete_backward, .delete_word_backward => {
-            if (length.* > 0) length.* -= 1;
-            while (length.* > 0 and (buffer[length.*] & 0xC0) == 0x80) length.* -= 1;
-        },
-        .clear => length.* = 0,
-        else => {},
-    }
 }
 
 /// Read a pet's encoded sheet bytes into `buf`. Prefers pet.json's
@@ -2193,8 +2175,7 @@ pub fn boot(model: *Model, fx: *Effects) void {
     model.bubble_answer_lines = initial_bubble_answer_lines;
     setUnsignedText(model.bubble_columns_text[0..], &model.bubble_columns_text_len, model.bubble_columns);
     setUnsignedText(model.bubble_answer_lines_text[0..], &model.bubble_answer_lines_text_len, model.bubble_answer_lines);
-    @memcpy(model.font_path[0..initial_font_path_len], initial_font_path[0..initial_font_path_len]);
-    model.font_path_len = initial_font_path_len;
+    model.font_path.set(initial_font_path[0..initial_font_path_len]);
     model.font_load_failed = initial_font_load_failed;
     model.agents_prompted = initial_agents_prompted;
     model.hide_dock = initial_hide_dock;
@@ -2893,7 +2874,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
         },
         .font_path_input => |edit| {
-            editPathText(model.font_path[0..], &model.font_path_len, edit);
+            model.font_path.apply(edit);
             model.font_path_dirty = true;
             model.font_load_failed = false;
             saveSettings(model);
