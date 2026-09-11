@@ -19,10 +19,14 @@ Runtime-loaded pet animating its real atlas in a chromeless window:
 ## Build & run
 
 ```bash
-native build -Dautomation
+native build -Dautomation -Dtrace=off
 PETDEX_PET=boba ./zig-out/bin/petdex-desktop-native
 native automate screenshot pet-canvas
 ```
+
+Without `-Dtrace=off` the SDK appends a trace record per frame and timer to
+`native-sdk.jsonl` in the platform log directory (#714). Drop the flag only
+while debugging; the app deletes that file once it passes 32 MB.
 
 Requires the `@native-sdk/cli` global (`bun add -g @native-sdk/cli`).
 

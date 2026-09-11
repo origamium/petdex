@@ -206,6 +206,15 @@ pub fn fileExists(path: []const u8) bool {
     return true;
 }
 
+/// Size in bytes; null when the path is missing or not a regular file.
+pub fn fileSize(path: []const u8) ?u64 {
+    var scope = Scope.init();
+    defer scope.deinit();
+    const stat = std.Io.Dir.cwd().statFile(scope.io(), path, .{}) catch return null;
+    if (stat.kind != .file) return null;
+    return stat.size;
+}
+
 pub fn dirExists(path: []const u8) bool {
     var scope = Scope.init();
     defer scope.deinit();

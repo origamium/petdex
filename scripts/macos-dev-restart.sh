@@ -30,7 +30,8 @@ fi
 "$ROOT/scripts/patch-native-sdk.sh"
 
 echo "==> Build native desktop"
-(cd "$DESKTOP_DIR" && "$NATIVE_CLI" build -Dcpu=baseline)
+# -Dtrace=off matches the release builds; tracing writes a record per frame (#714).
+(cd "$DESKTOP_DIR" && "$NATIVE_CLI" build -Dcpu=baseline -Dtrace=off)
 
 echo "==> Ensure Petdex Dev.app"
 "$ROOT/scripts/macos-dev-app.sh" >/dev/null
