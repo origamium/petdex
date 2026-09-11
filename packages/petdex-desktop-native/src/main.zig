@@ -5475,6 +5475,7 @@ test {
     // block is the standard aggregator: referencing the imports forces
     // their semantic analysis, which is what registers their tests.
     _ = agent_hooks;
+    _ = desktop_auth;
     _ = hook_runner;
     _ = hook_server;
     _ = installer;
