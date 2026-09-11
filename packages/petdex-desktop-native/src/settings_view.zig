@@ -33,6 +33,7 @@ const catalog_len = &catalog_mod.catalog_len;
 const max_catalog = catalog_mod.max_catalog;
 const agent_hooks = @import("agent_hooks.zig");
 const remote_runtime = @import("remote_runtime.zig");
+const chat_view = @import("chat_view.zig");
 const settingsBackground = app.settingsBackground;
 const companion_header_h = app.companion_header_h;
 
@@ -560,6 +561,8 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
         agentsSection(ui, model, icons),
         herdrSection(ui, model, icons),
         remoteSection(ui, model),
+        ui.el(.stack, .{ .height = 10 }, .{}),
+        chat_view.settingsSection(ui, model),
         ui.el(.stack, .{ .height = 10 }, .{}),
         ui.text(.{ .size = .lg }, "Appearance"),
         ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{

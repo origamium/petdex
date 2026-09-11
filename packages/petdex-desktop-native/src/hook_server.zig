@@ -375,6 +375,126 @@ pub const AuthMailbox = struct {
 
 pub var auth_mailbox: AuthMailbox = .{};
 
+/// ChatGPT sign-in (chat/codex.zig). Codex's OAuth client only redirects
+/// to `http://localhost:1455/auth/callback`, so this is a second, short
+/// listener rather than a route on :7777. It stops after one callback or
+/// a `GET /cancel` — the request `codex login` sends to reclaim the port.
+pub var chatgpt_mailbox: AuthMailbox = .{};
+var oauth_listener_running = std.atomic.Value(bool).init(false);
+
+/// Idempotent: a second sign-in while the listener is up reuses it (the
+/// app checks `state` against its newest attempt).
+pub fn startOAuthListener(port: u16, path: []const u8, inbox: *AuthMailbox) void {
+    if (oauth_listener_running.swap(true, .acq_rel)) return;
+    const thread = std.Thread.spawn(.{}, runOAuthListener, .{ port, path, inbox }) catch {
+        oauth_listener_running.store(false, .release);
+        inbox.set(errorCallback("Could not start the sign-in listener."));
+        return;
+    };
+    thread.detach();
+}
+
+fn runOAuthListener(port: u16, path: []const u8, inbox: *AuthMailbox) void {
+    defer oauth_listener_running.store(false, .release);
+    var scope = plat.Scope.init();
+    defer scope.deinit();
+    const io = scope.io();
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+    var listener = addr.listen(io, .{
+        .kernel_backlog = 4,
+        .reuse_address = false,
+        .mode = .stream,
+        .protocol = .tcp,
+    }) catch {
+        inbox.set(errorCallback("Port 1455 is in use, usually by `codex login`. Finish or cancel it, then try again."));
+        return;
+    };
+    defer listener.deinit(io);
+    while (true) {
+        const stream = listener.accept(io) catch continue;
+        var conn: Conn = .{ .stream = stream, .io = io };
+        const finished = handleOAuthConnection(&conn, path, inbox);
+        stream.shutdown(io, .send) catch {};
+        stream.close(io);
+        if (finished) return;
+    }
+}
+
+/// One request per connection, handled inline: a browser redirect is the
+/// only expected client. True once the listener's job is done.
+fn handleOAuthConnection(conn: *Conn, path: []const u8, inbox: *AuthMailbox) bool {
+    var buf: [max_request_bytes]u8 = undefined;
+    var total: usize = 0;
+    const timeout = (std.Io.Timeout{ .duration = .{
+        .raw = std.Io.Duration.fromMilliseconds(connection_timeout_ms),
+        .clock = .awake,
+    } }).toDeadline(conn.io);
+    while (std.mem.indexOf(u8, buf[0..total], "\r\n") == null) {
+        if (total == buf.len) return false;
+        const got = receiveWithTimeout(conn, buf[total..], timeout) catch return false;
+        if (got == 0) return false;
+        total += got;
+    }
+    const line = buf[0..std.mem.indexOf(u8, buf[0..total], "\r\n").?];
+    var parts = std.mem.splitScalar(u8, line, ' ');
+    const method = parts.next() orelse return false;
+    const target = parts.next() orelse return false;
+    const query_at = std.mem.indexOfScalar(u8, target, '?');
+    const request_path = if (query_at) |q| target[0..q] else target;
+    if (!std.mem.eql(u8, method, "GET")) {
+        respond(conn, 404, "{\"ok\":false}");
+        return false;
+    }
+    if (std.mem.eql(u8, request_path, "/cancel")) {
+        respondHtml(conn, 200, callbackPage("Sign-in cancelled", "You can close this tab."));
+        return true;
+    }
+    if (!std.mem.eql(u8, request_path, path)) {
+        respond(conn, 404, "{\"ok\":false}");
+        return false;
+    }
+    const callback = callbackFromQuery(if (query_at) |q| target[q + 1 ..] else "");
+    inbox.set(callback);
+    if (callback.code_len > 0 and callback.state_len > 0) {
+        respondHtml(conn, 200, callbackPage("Signed in to ChatGPT", "Your pet can talk now. You can close this tab."));
+    } else {
+        respondHtml(conn, 400, callbackPage("ChatGPT sign-in failed", "Return to Petdex and try again."));
+    }
+    return true;
+}
+
+fn callbackFromQuery(query: []const u8) AuthCallback {
+    var callback: AuthCallback = .{};
+    if (queryValue(query, "code", &callback.code)) |value| callback.code_len = value.len;
+    if (queryValue(query, "state", &callback.state)) |value| callback.state_len = value.len;
+    if (queryValue(query, "error_description", &callback.error_text)) |value| {
+        callback.error_len = value.len;
+    } else if (queryValue(query, "error", &callback.error_text)) |value| {
+        callback.error_len = value.len;
+    }
+    return callback;
+}
+
+fn errorCallback(message: []const u8) AuthCallback {
+    var callback: AuthCallback = .{};
+    callback.error_len = @min(message.len, callback.error_text.len);
+    @memcpy(callback.error_text[0..callback.error_len], message[0..callback.error_len]);
+    return callback;
+}
+
+fn callbackPage(comptime heading: []const u8, comptime detail: []const u8) []const u8 {
+    return "<!doctype html><meta charset=utf-8><title>Petdex</title><style>body{background:#0c0c0f;color:#f5f5f7;font:16px system-ui;display:grid;place-items:center;height:100vh;margin:0}main{text-align:center}h1{font-size:24px}</style><main><h1>" ++ heading ++ "</h1><p>" ++ detail ++ "</p></main>";
+}
+
+test "OAuth callback queries decode code, state and errors" {
+    const ok = callbackFromQuery("code=ab%2Fc&state=xyz&scope=openid");
+    try std.testing.expectEqualStrings("ab/c", ok.codeSlice());
+    try std.testing.expectEqualStrings("xyz", ok.stateSlice());
+    const denied = callbackFromQuery("error=access_denied&error_description=User+cancelled");
+    try std.testing.expectEqualStrings("User cancelled", denied.errorSlice());
+    try std.testing.expectEqual(@as(usize, 0), denied.code_len);
+}
+
 const valid_states = [_][]const u8{
     "idle",    "running", "running-left", "running-right", "waving",
     "jumping", "failed",  "review",       "waiting",
@@ -664,19 +784,12 @@ fn route(server: *Server, conn: *Conn, method: []const u8, target: []const u8, p
 
     if (get and std.mem.eql(u8, path, "/callback")) {
         const query = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[q + 1 ..] else "";
-        var callback: AuthCallback = .{};
-        if (queryValue(query, "code", &callback.code)) |value| callback.code_len = value.len;
-        if (queryValue(query, "state", &callback.state)) |value| callback.state_len = value.len;
-        if (queryValue(query, "error_description", &callback.error_text)) |value| {
-            callback.error_len = value.len;
-        } else if (queryValue(query, "error", &callback.error_text)) |value| {
-            callback.error_len = value.len;
-        }
+        const callback = callbackFromQuery(query);
         auth_mailbox.set(callback);
         if (callback.code_len > 0 and callback.state_len > 0) {
-            return respondHtml(conn, 200, "<!doctype html><meta charset=utf-8><title>Petdex</title><style>body{background:#0c0c0f;color:#f5f5f7;font:16px system-ui;display:grid;place-items:center;height:100vh;margin:0}main{text-align:center}h1{font-size:24px}</style><main><h1>Signed in to Petdex</h1><p>You can close this tab and return to the app.</p></main>");
+            return respondHtml(conn, 200, callbackPage("Signed in to Petdex", "You can close this tab and return to the app."));
         }
-        return respondHtml(conn, 400, "<!doctype html><meta charset=utf-8><title>Petdex</title><style>body{background:#0c0c0f;color:#f5f5f7;font:16px system-ui;display:grid;place-items:center;height:100vh;margin:0}main{text-align:center}h1{font-size:24px}</style><main><h1>Petdex sign-in failed</h1><p>Return to the app and try again.</p></main>");
+        return respondHtml(conn, 400, callbackPage("Petdex sign-in failed", "Return to the app and try again."));
     }
 
     if (get and std.mem.eql(u8, path, "/health")) {

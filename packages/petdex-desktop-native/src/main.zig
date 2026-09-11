@@ -29,6 +29,10 @@ const remote_writeback = @import("remote_writeback.zig");
 const remote_runtime = @import("remote_runtime.zig");
 const herdr_status = @import("herdr_status.zig");
 const sdk_log = @import("sdk_log.zig");
+const chat = @import("chat/chat.zig");
+const chat_history = @import("chat_history.zig");
+const chat_shell = @import("chat_shell.zig");
+const chat_view = @import("chat_view.zig");
 pub const desktop_auth = @import("desktop_auth.zig");
 const flock_mod = @import("flock.zig");
 pub const updates = @import("updates.zig");
@@ -39,8 +43,8 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 const canvas_label = "pet-canvas";
-const frame_w: f32 = 192;
-const frame_h: f32 = 208;
+pub const frame_w: f32 = 192;
+pub const frame_h: f32 = 208;
 const max_scale: f32 = 1.2;
 const pet_edge_pad: f32 = 8;
 const win_w: f32 = frame_w * max_scale;
@@ -158,9 +162,29 @@ pub const Msg = union(enum) {
     auth_avatar_response: native_sdk.EffectResponse,
     auth_preview_response: native_sdk.EffectResponse,
     auth_library_done: native_sdk.EffectExit,
+    // Pet chat (chat_shell.zig).
+    open_chat,
+    chat_closed,
+    chat_input: canvas.TextInputEvent,
+    chat_submit,
+    chat_stop,
+    chat_clear,
+    chat_retry,
+    chat_scrolled: canvas.ScrollState,
+    chat_line: native_sdk.EffectLine,
+    chat_response: native_sdk.EffectResponse,
+    set_chat_provider: u32,
+    chat_model_input: canvas.TextInputEvent,
+    chat_url_input: canvas.TextInputEvent,
+    chat_detect_models,
+    chat_models_response: native_sdk.EffectResponse,
+    chatgpt_sign_in,
+    chatgpt_import,
+    chatgpt_sign_out,
+    chatgpt_token_response: native_sdk.EffectResponse,
     noop,
 
-    pub const view_unbound = .{ "frame_tick", "poll_tick", "physics_tick", "frame_clock", "cycle_state", "native_drag_watchdog", "chime_done", "quit_app", "toggle_focus_mode", "shuffle_pet", "dsh_install_done", "dsh_remove_done", "remote_line", "remote_done", "remote_backoff", "update_boot_check", "update_response", "homebrew_done", "homebrew_timeout", "brew_command_copied", "auth_token_response", "auth_avatar_response", "auth_preview_response", "auth_library_done" };
+    pub const view_unbound = .{ "frame_tick", "poll_tick", "physics_tick", "frame_clock", "cycle_state", "native_drag_watchdog", "chime_done", "quit_app", "toggle_focus_mode", "shuffle_pet", "dsh_install_done", "dsh_remove_done", "remote_line", "remote_done", "remote_backoff", "update_boot_check", "update_response", "homebrew_done", "homebrew_timeout", "brew_command_copied", "auth_token_response", "auth_avatar_response", "auth_preview_response", "auth_library_done", "chat_line", "chat_response", "chat_models_response", "chatgpt_token_response" };
 };
 
 pub const Model = struct {
@@ -360,6 +384,7 @@ pub const Model = struct {
     settings_scroll: f32 = 0,
     auth_preview_next: usize = 0,
     auth_preview_ready: [12]bool = @splat(false),
+    chat: chat_shell.State = .{},
 };
 
 /// Petdex web tokens (globals.css) translated from OKLCH: brand purple
@@ -1192,7 +1217,7 @@ var sheet: Sheet = .{};
 /// (caller frees) and the display name.
 /// Env snapshot taken in main() from init.environ_map (Zig 0.16 has no
 /// global getenv; env rides std.process.Init).
-var env_home: ?[]const u8 = null;
+pub var env_home: ?[]const u8 = null;
 var env_wanted_pet: ?[]const u8 = null;
 var env_auth_library_url: []const u8 = desktop_auth.library_url;
 
@@ -1374,7 +1399,7 @@ fn editUnsignedText(buffer: []u8, length: *usize, edit: canvas.TextInputEvent, m
     return value;
 }
 
-fn editPathText(buffer: []u8, length: *usize, edit: canvas.TextInputEvent) void {
+pub fn editPathText(buffer: []u8, length: *usize, edit: canvas.TextInputEvent) void {
     switch (edit) {
         .insert_text => |text| {
             const available = buffer.len - length.*;
@@ -2040,7 +2065,7 @@ fn shouldEscalate(state: State, waiting_since_ms: i64, escalated: bool, now: i64
     return state == .waiting and !escalated and now - waiting_since_ms >= waiting_escalation_ms;
 }
 
-fn applyState(model: *Model, state: State, duration_ms: u32, fx: *Effects) void {
+pub fn applyState(model: *Model, state: State, duration_ms: u32, fx: *Effects) void {
     if (shouldChime(model.state, state)) {
         model.waiting_since_ms = fx.wallMs();
         model.waiting_escalated = false;
@@ -2146,6 +2171,7 @@ pub fn boot(model: *Model, fx: *Effects) void {
         startRemotes(model, fx);
     }
     loadAuthSession(model, fx);
+    chat_shell.boot(model);
     fx.startTimer(.{
         .key = poll_timer_key,
         .interval_ms = poll_interval_ms,
@@ -2625,6 +2651,26 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             startAuthImages(model, fx);
         },
         .settings_closed => model.settings_open = false,
+        .open_chat,
+        .chat_closed,
+        .chat_input,
+        .chat_submit,
+        .chat_stop,
+        .chat_clear,
+        .chat_retry,
+        .chat_scrolled,
+        .chat_line,
+        .chat_response,
+        .set_chat_provider,
+        .chat_model_input,
+        .chat_url_input,
+        .chat_detect_models,
+        .chat_models_response,
+        .chatgpt_sign_in,
+        .chatgpt_import,
+        .chatgpt_sign_out,
+        .chatgpt_token_response,
+        => chat_shell.update(model, msg, fx),
         .update_boot_check => |timer| {
             if (timer.outcome == .fired and model.update_checks_enabled) startUpdateCheck(model, false, fx);
         },
@@ -3091,6 +3137,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // canned (#557's "pet" interaction).
                 if (isTap(now - model.press_ms, release_x - model.press_x, release_y - model.press_y)) {
                     model.sample_len = 0;
+                    // A second tap soon after the first opens the chat.
+                    if (now - model.chat.last_tap_ms <= chat_shell.double_tap_ms) {
+                        model.chat.last_tap_ms = 0;
+                        chat_shell.update(model, .open_chat, fx);
+                        return;
+                    }
+                    model.chat.last_tap_ms = now;
                     if (newestBubble(model)) |bubble| {
                         const focused = if (env_home) |home| plat.activateHerdrPane(home, bubble.herdrPaneSlice()) else false;
                         if (!focused) _ = plat.activateOriginApplication(bubble.origin_app, bubble.ttySlice(), bubble.cwdSlice());
@@ -3161,6 +3214,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // `petdex://<slug>` link has work to do.
             drainPendingInstall(model, fx);
             sdk_log.tick(fx.wallMs());
+            chat_shell.poll(model, fx);
             if (!model.sheet_loaded) return;
             if (model.settings_open and thumbs_built < catalog_mod.catalog_len) buildNextThumb(fx);
             const now = fx.wallMs();
@@ -3280,6 +3334,7 @@ pub fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "petdex.pet-page")) return .open_active_pet_page;
     if (std.mem.eql(u8, name, "petdex.updates")) return .check_updates;
     if (std.mem.eql(u8, name, "petdex.flock")) return .toggle_flock_window;
+    if (std.mem.eql(u8, name, "petdex.chat")) return .open_chat;
     return null;
 }
 
@@ -3291,6 +3346,7 @@ const pet_menu = [_]AppUi.ContextMenuItem{
     .{ .label = "Open Settings", .msg = .open_settings },
     .{ .label = "Open Flock", .msg = .toggle_flock_window },
     .{ .label = "View Pet on Petdex", .msg = .open_active_pet_page },
+    .{ .label = "Chat", .msg = .open_chat },
     .{ .label = "Close Pet", .msg = .close_pet },
 };
 
@@ -4865,6 +4921,19 @@ fn petdexWindows(model: *const Model, scratch: *PetdexApp.WindowsScratch) []cons
         };
         count += 1;
     }
+    if (model.chat.open) {
+        scratch.windows[count] = .{
+            .label = chat_shell.window_label,
+            .canvas_label = chat_shell.canvas_label,
+            .title = "Chat",
+            .width = chat_shell.window_w,
+            .height = chat_shell.window_h,
+            .resizable = false,
+            .titlebar = .hidden_inset,
+            .on_close = .chat_closed,
+        };
+        count += 1;
+    }
     return scratch.windows[0..count];
 }
 
@@ -4888,6 +4957,7 @@ test "companion windows use the unified opaque shell" {
 fn petdexWindowView(ui: *PetdexApp.Ui, model: *const Model, window_label: []const u8) PetdexApp.Ui.Node {
     if (std.mem.eql(u8, window_label, "bubble")) return bubbleView(ui, model);
     if (std.mem.eql(u8, window_label, flock_window_label)) return flockView(ui, model);
+    if (std.mem.eql(u8, window_label, chat_shell.window_label)) return chat_view.view(ui, model);
     std.debug.assert(std.mem.eql(u8, window_label, settings_window_label));
     return settings_view.settingsView(ui, model, .{
         .ready = agents_icons_ready,
@@ -4952,25 +5022,26 @@ fn petdexStatusItem(model: *const Model, scratch: *PetdexApp.StatusItemScratch) 
         .idle, .failed => std.fmt.bufPrint(&scratch.title_buffer, "Check for Updates… · {s}", .{updates.current_version}) catch "Check for Updates…",
     };
     scratch.items[0] = .{ .id = 1, .label = "Open Settings", .command = "petdex.settings" };
-    scratch.items[1] = .{ .id = 2, .label = "Open petdex.dev", .command = "petdex.website" };
-    scratch.items[2] = .{ .id = 3, .separator = true };
-    scratch.items[3] = .{
+    scratch.items[1] = .{ .id = 12, .label = "Chat…", .command = "petdex.chat" };
+    scratch.items[2] = .{ .id = 2, .label = "Open petdex.dev", .command = "petdex.website" };
+    scratch.items[3] = .{ .id = 3, .separator = true };
+    scratch.items[4] = .{
         .id = 4,
         .label = if (model.focus_mode) "Focus Mode: On" else "Focus Mode: Off",
         .command = "petdex.focus",
     };
-    scratch.items[4] = .{ .id = 5, .label = "Shuffle Pet", .command = "petdex.shuffle" };
-    scratch.items[5] = .{
+    scratch.items[5] = .{ .id = 5, .label = "Shuffle Pet", .command = "petdex.shuffle" };
+    scratch.items[6] = .{
         .id = 6,
         .label = if (model.flock.open) "Hide Flock" else "Show Flock",
         .command = "petdex.flock",
     };
-    scratch.items[6] = .{ .id = 7, .label = "View Pet on Petdex", .command = "petdex.pet-page" };
-    scratch.items[7] = .{ .id = 8, .separator = true };
-    scratch.items[8] = .{ .id = 9, .label = update_label, .command = "petdex.updates", .enabled = model.update_phase != .checking };
-    scratch.items[9] = .{ .id = 10, .separator = true };
-    scratch.items[10] = .{ .id = 11, .label = "Quit Petdex", .command = "petdex.quit" };
-    return .{ .items = scratch.items[0..11] };
+    scratch.items[7] = .{ .id = 7, .label = "View Pet on Petdex", .command = "petdex.pet-page" };
+    scratch.items[8] = .{ .id = 8, .separator = true };
+    scratch.items[9] = .{ .id = 9, .label = update_label, .command = "petdex.updates", .enabled = model.update_phase != .checking };
+    scratch.items[10] = .{ .id = 10, .separator = true };
+    scratch.items[11] = .{ .id = 11, .label = "Quit Petdex", .command = "petdex.quit" };
+    return .{ .items = scratch.items[0..12] };
 }
 
 /// The menu-bar button icon: the brand mark's silhouette with the face
@@ -5000,6 +5071,7 @@ const app_menus = [_]native_sdk.platform.Menu{.{
     .title = "Pet",
     .items = &.{
         .{ .label = "Settings...", .command = "petdex.settings", .key = ",", .modifiers = .{ .primary = true } },
+        .{ .label = "Chat...", .command = "petdex.chat", .key = "k", .modifiers = .{ .primary = true } },
         .{ .separator = true },
         .{ .label = "Close Pet", .command = "petdex.close", .key = "w", .modifiers = .{ .primary = true } },
     },
@@ -5038,6 +5110,7 @@ pub fn main(init: std.process.Init) !void {
     agent_hooks.env_qoder_cn_cli_home = init.environ_map.get("QODERCN_CLI_HOME");
     agent_hooks.env_hermes_home = init.environ_map.get("HERMES_HOME");
     dsh_integration.env_dsh_home = init.environ_map.get("DSH_HOME");
+    chat_shell.env_codex_home = init.environ_map.get("CODEX_HOME");
     // Hook hot path: `<binary> bubble <phase> [agent]` runs the
     // in-binary runner and exits before any UI machinery spins up.
     // initAllocator, not init: on Windows the command line arrives as
@@ -5418,17 +5491,19 @@ test "tray exposes website active pet and updater commands" {
     var model: Model = .{};
     var scratch: PetdexApp.StatusItemScratch = .{};
     var state = petdexStatusItem(&model, &scratch);
-    try std.testing.expectEqual(@as(usize, 11), state.items.len);
-    try std.testing.expectEqualStrings("Open petdex.dev", state.items[1].label);
-    try std.testing.expectEqualStrings("Show Flock", state.items[5].label);
-    try std.testing.expectEqualStrings("View Pet on Petdex", state.items[6].label);
-    try std.testing.expect(std.mem.startsWith(u8, state.items[8].label, "Check for Updates"));
+    try std.testing.expectEqual(@as(usize, 12), state.items.len);
+    try std.testing.expectEqualStrings("petdex.chat", state.items[1].command);
+    try std.testing.expectEqualStrings("Open petdex.dev", state.items[2].label);
+    try std.testing.expectEqualStrings("Show Flock", state.items[6].label);
+    try std.testing.expectEqualStrings("View Pet on Petdex", state.items[7].label);
+    try std.testing.expect(std.mem.startsWith(u8, state.items[9].label, "Check for Updates"));
+    try std.testing.expectEqual(std.meta.Tag(Msg).open_chat, std.meta.activeTag(onCommand("petdex.chat").?));
 
     model.update_phase = .available;
     @memcpy(model.latest_version[0.."0.10.0".len], "0.10.0");
     model.latest_version_len = "0.10.0".len;
     state = petdexStatusItem(&model, &scratch);
-    try std.testing.expectEqualStrings("Update to Petdex 0.10.0…", state.items[8].label);
+    try std.testing.expectEqualStrings("Update to Petdex 0.10.0…", state.items[9].label);
 }
 
 test "bubble text default is its own value, not the range floor" {
@@ -5475,6 +5550,9 @@ test {
     // block is the standard aggregator: referencing the imports forces
     // their semantic analysis, which is what registers their tests.
     _ = agent_hooks;
+    _ = chat;
+    _ = chat_history;
+    _ = chat_shell;
     _ = desktop_auth;
     _ = hook_runner;
     _ = hook_server;
