@@ -18,22 +18,31 @@ Runtime-loaded pet animating its real atlas in a chromeless window:
 
 ## Build & run
 
+Needs Zig 0.16.0 and git. From this directory:
+
 ```bash
-native build -Dautomation -Dtrace=off
-PETDEX_PET=boba ./zig-out/bin/petdex-desktop-native
-native automate screenshot pet-canvas
+make                         # release-flag build (what CI builds)
+make dev PETDEX_PET=boba     # automation build, then run it
+make test                    # unit tests
+make restart                 # macOS: rebuild and relaunch "Petdex Dev.app"
 ```
 
-Without `-Dtrace=off` the SDK appends a trace record per frame and timer to
-`native-sdk.jsonl` in the platform log directory (#714). Drop the flag only
-while debugging; the app deletes that file once it passes 32 MB.
+The first `make` clones the Native SDK at the commit
+`.github/workflows/desktop-native-ci.yml` pins, applies the Petdex patches
+from `/patches`, and builds its `native` CLI into
+`~/.cache/petdex/native-sdk-<ref>`. Later runs reuse it; bumping the pin in
+the workflow switches to a fresh checkout.
 
-Requires the `@native-sdk/cli` global (`bun add -g @native-sdk/cli`).
+`DEV_HOME=/tmp/petdex-home` runs against an isolated home, keeping your real
+settings, pets and chat history untouched. The installed Petdex app owns
+`127.0.0.1:7777`, so agent hooks keep reaching it until you quit it.
 
-For the pinned desktop build, set `NATIVE_CLI` and `NATIVE_SDK_PATH` to the
-CLI and SDK checkout used by the matching release workflow. The build scripts
-apply the Petdex-owned macOS Mach-O headerpad patch before compiling; they
-fail if the SDK source no longer matches the pinned patch.
+With the automation build running, drive it with the SDK's CLI, e.g.
+`~/.cache/petdex/native-sdk-<ref>/zig-out/bin/native automate screenshot pet-canvas`.
+
+Builds pass `-Dtrace=off`. Without it the SDK appends a trace record per frame
+and timer to `native-sdk.jsonl` in the platform log directory (#714); the app
+deletes that file once it passes 32 MB.
 
 ## Herdr
 
