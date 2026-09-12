@@ -99,7 +99,10 @@ pub fn readFileTail(path: []const u8, buf: []u8) ?[]const u8 {
 /// line may be cut, so it is never offered. Returns a slice of `buf`.
 pub fn lastLineMatching(path: []const u8, buf: []u8, accept: *const fn ([]const u8) bool) ?[]const u8 {
     const tail = readFileTail(path, buf) orelse return null;
-    const lo = if (tail.len < buf.len) 0 else (std.mem.indexOfScalar(u8, tail, '\n') orelse return null) + 1;
+    // Whether the start was cut off goes by the file's size, not by how
+    // many bytes came back.
+    const size = fileSize(path) orelse return null;
+    const lo = if (size <= tail.len) 0 else (std.mem.indexOfScalar(u8, tail, '\n') orelse return null) + 1;
     var end = tail.len;
     while (end > lo) {
         const start = if (std.mem.lastIndexOfScalar(u8, tail[lo..end], '\n')) |i| lo + i + 1 else lo;

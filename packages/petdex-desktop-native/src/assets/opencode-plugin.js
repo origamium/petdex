@@ -42,7 +42,9 @@ const WARP_FOCUS_URL = /^(warp|warppreview|warposs):\/\/session\/[0-9a-f]{32}$/;
 function originMetadata() {
   const sourceApp = process.env.TERM_PROGRAM;
   const focusUrl = process.env.WARP_FOCUS_URL;
-  const warp = typeof focusUrl === "string" && WARP_FOCUS_URL.test(focusUrl) ? { warp_focus_url: focusUrl } : {};
+  // Only inside Warp: the variable is inherited by VS Code or tmux started
+  // from a Warp pane, and a stale link would open the wrong pane.
+  const warp = sourceApp === "WarpTerminal" && typeof focusUrl === "string" && WARP_FOCUS_URL.test(focusUrl) ? { warp_focus_url: focusUrl } : {};
   if (sourceApp !== "Apple_Terminal" && sourceApp !== "vscode") return warp;
   return {
     source_app: sourceApp,

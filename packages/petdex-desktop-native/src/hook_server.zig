@@ -298,8 +298,11 @@ pub const Mailbox = struct {
         const model_len = slot.model_len;
         const effort = slot.effort;
         const effort_len = slot.effort_len;
+        // Senders without a session id share the "" key; another agent
+        // landing there must not wear this one's model.
+        const same_agent = std.mem.eql(u8, slot.agent[0..slot.agent_len], agent[0..@min(agent.len, slot.agent.len)]);
         slot.* = .{};
-        if (reused) {
+        if (reused and same_agent) {
             slot.model = model;
             slot.model_len = model_len;
             slot.effort = effort;
@@ -369,8 +372,10 @@ pub const Mailbox = struct {
     }
 
     /// Record the model and effort for a session that already has a slot,
-    /// the way setBubbleAgentState records attention. An empty value
-    /// leaves the one already known.
+    /// the way setBubbleAgentState records attention. A model comes with
+    /// its effort, so a model named without one (not every model has an
+    /// effort) clears the old effort. An effort alone updates the effort,
+    /// and naming neither keeps both.
     pub fn setBubbleModel(self: *Mailbox, session: []const u8, model: []const u8, effort: []const u8) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -381,7 +386,7 @@ pub const Mailbox = struct {
                 @memcpy(b.model[0..n], model[0..n]);
                 b.model_len = n;
             }
-            if (effort.len > 0) {
+            if (model.len > 0 or effort.len > 0) {
                 const n = @min(effort.len, b.effort.len);
                 @memcpy(b.effort[0..n], effort[0..n]);
                 b.effort_len = n;
@@ -1367,6 +1372,13 @@ test "a conversation keeps its model and effort across updates, and a new one st
     mb.setBubbleModel("s1", "", "max");
     try std.testing.expectEqualStrings("claude-opus-5", mb.bubbles[0].modelSlice());
     try std.testing.expectEqualStrings("max", mb.bubbles[0].effortSlice());
+    // A model named without an effort clears the old effort.
+    mb.setBubbleModel("s1", "claude-haiku-4-5", "");
+    try std.testing.expectEqualStrings("claude-haiku-4-5", mb.bubbles[0].modelSlice());
+    try std.testing.expectEqualStrings("", mb.bubbles[0].effortSlice());
+    // Another agent on the same key starts blank.
+    _ = mb.setBubble("s1", "Reading", "codex", "", true);
+    try std.testing.expectEqualStrings("", mb.bubbles[0].modelSlice());
     _ = mb.setBubble("s2", "Thinking…", "codex", "", true);
     try std.testing.expectEqualStrings("", mb.bubbles[1].modelSlice());
 }

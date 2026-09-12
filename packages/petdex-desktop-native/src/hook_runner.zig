@@ -318,6 +318,10 @@ fn modelSettings(payload: []const u8, scan_buf: []u8, model_out: *[48]u8, effort
     if (plat.lastLineMatching(path, scan_buf, carriesSettings)) |line| {
         return copySettings(settingsFromLine(line, from_payload), model_out, effort_out);
     }
+    // The first read held the whole file (or this agent's transcript has
+    // no such line at all): there is nothing further back to find.
+    const size = plat.fileSize(path) orelse return from_payload;
+    if (size <= scan_buf.len) return from_payload;
     const big = std.heap.page_allocator.alloc(u8, settings_scan_back) catch return from_payload;
     defer std.heap.page_allocator.free(big);
     const line = plat.lastLineMatching(path, big, carriesSettings) orelse return from_payload;

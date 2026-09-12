@@ -61,6 +61,8 @@ pub const Body = struct {
     pop: f32 = 0,
     /// Opened as a card; any number can be.
     opened: bool = false,
+    /// When it was opened, so the oldest card closes first.
+    open_seq: u32 = 0,
     /// Its conversation left the list: it pops now.
     leaving: bool = false,
 
@@ -85,6 +87,8 @@ pub const Layout = struct {
     height: f32,
     /// Below the pet: the cluster fills from the top edge.
     flipped: bool = false,
+    /// Reduce Motion: bubbles hold their places, and nothing sways.
+    still: bool = false,
     card_w: f32,
     /// Each body's card height, by body index; cards differ by their text.
     card_heights: [capacity]f32,
@@ -148,6 +152,7 @@ pub fn shape(b: Body, card_h: f32, layout: Layout) Shape {
 pub const Sim = struct {
     bodies: [capacity]Body = @splat(.{}),
     seq: u32 = 0,
+    open_counter: u32 = 0,
     t: f32 = 0,
     /// The layout height of the last step.
     height: f32 = 0,
@@ -194,7 +199,9 @@ pub const Sim = struct {
         }
         const dt = std.math.clamp(dt_in, 0, max_dt);
         if (dt == 0) return;
-        self.t += dt;
+        // f32 seconds lose precision after days of ticking; wrapping costs
+        // the drift a skip of a few points once an hour instead.
+        self.t = @mod(self.t + dt, 3600);
         var homes: [capacity]Point = undefined;
         self.placeHomes(layout, &homes);
         for (&self.bodies, 0..) |*b, i| {
@@ -208,7 +215,7 @@ pub const Sim = struct {
             }
             var home = homes[i];
             // Cards hold still to be read, and so do resting bubbles.
-            if (b.open == 0 and b.sways()) {
+            if (b.open == 0 and b.sways() and !layout.still) {
                 const seed: f32 = @floatFromInt(b.id % 997);
                 const period = 3 + @mod(seed, 20) / 10;
                 const phase = seed * 0.37;
@@ -230,8 +237,26 @@ pub const Sim = struct {
     /// Open a body as a card, or close its card.
     pub fn toggle(self: *Sim, index: usize) void {
         if (index >= capacity) return;
-        if (!self.bodies[index].staying()) return;
-        self.bodies[index].opened = !self.bodies[index].opened;
+        const b = &self.bodies[index];
+        if (!b.staying()) return;
+        b.opened = !b.opened;
+        if (b.opened) {
+            self.open_counter +%= 1;
+            b.open_seq = self.open_counter;
+        }
+    }
+
+    /// Close the card opened longest ago, other than `keep`. False when
+    /// there is no other card.
+    pub fn closeOldestCard(self: *Sim, keep: usize) bool {
+        var oldest: ?usize = null;
+        for (self.bodies, 0..) |b, i| {
+            if (i == keep or !b.opened or !b.staying()) continue;
+            if (oldest == null or b.open_seq < self.bodies[oldest.?].open_seq) oldest = i;
+        }
+        const i = oldest orelse return false;
+        self.bodies[i].opened = false;
+        return true;
     }
 
     pub fn isOpen(self: *const Sim, index: usize) bool {
@@ -251,21 +276,22 @@ pub const Sim = struct {
                 i -= 1;
                 const b = self.bodies[i];
                 if (!b.staying() or b.opened != cards) continue;
-                if (inside(self.shapeAt(i, layout), x, y)) return i;
+                if (inside(self.shapeAt(i, layout), x, y, b.open == 0)) return i;
             }
         }
         return null;
     }
 
     /// The window height for the bodies holding a place, the open ones as
-    /// cards of `card_heights`.
-    pub fn contentHeightFor(self: *const Sim, card_heights: [capacity]f32) f32 {
+    /// cards of `card_heights`. With `closing`, a card still on its way
+    /// shut counts too, so the window does not cut it off mid-animation.
+    pub fn contentHeightFor(self: *const Sim, card_heights: [capacity]f32, closing: bool) f32 {
         var cards: [capacity]f32 = undefined;
         var open: usize = 0;
         var closed: usize = 0;
         for (self.bodies, 0..) |b, i| {
             if (!b.staying()) continue;
-            if (b.opened) {
+            if (b.opened or (closing and b.open > 0)) {
                 cards[open] = card_heights[i];
                 open += 1;
             } else closed += 1;
@@ -273,16 +299,21 @@ pub const Sim = struct {
         return contentHeight(closed, cards[0..open]);
     }
 
-    /// Something still moves: a bubble that sways or waits (its light
-    /// breathes), grows in, pops, opens or closes, or has not come to rest.
-    /// When nothing does, the caller can stop stepping until something
-    /// changes.
-    pub fn restless(self: *const Sim) bool {
-        for (self.bodies) |b| {
+    /// Something still moves under `layout`: a bubble that sways or waits
+    /// (its light breathes), grows in, pops, opens or closes, has not come
+    /// to rest, or is away from its place (the window changed height or
+    /// flipped, or a card changed size). When nothing does, the caller can
+    /// stop stepping until something changes.
+    pub fn restless(self: *const Sim, layout: Layout) bool {
+        if (self.height != layout.height) return true;
+        var homes: [capacity]Point = undefined;
+        self.placeHomes(layout, &homes);
+        for (self.bodies, 0..) |b, i| {
             if (!b.live()) continue;
-            if (b.sways() or b.leaving or b.pop > 0 or b.born < 1) return true;
+            if ((b.sways() and !layout.still) or b.leaving or b.pop > 0 or b.born < 1) return true;
             if (b.open != @as(f32, if (b.opened) 1 else 0)) return true;
             if (@abs(b.vx) > settle_speed or @abs(b.vy) > settle_speed) return true;
+            if (@abs(b.x - homes[i].x) > 0.5 or @abs(b.y - homes[i].y) > 0.5) return true;
         }
         return false;
     }
@@ -514,7 +545,12 @@ fn clampAxis(pos: *f32, vel: *f32, lo: f32, hi: f32) void {
     }
 }
 
-fn inside(s: Shape, x: f32, y: f32) bool {
+/// Within a shape: the circle of a bubble, the rect of a card.
+fn inside(s: Shape, x: f32, y: f32, round: bool) bool {
+    if (round) {
+        const r = s.w / 2 * s.scale;
+        return (x - s.x) * (x - s.x) + (y - s.y) * (y - s.y) <= r * r;
+    }
     return @abs(x - s.x) <= s.w / 2 and @abs(y - s.y) <= s.h / 2;
 }
 
@@ -643,21 +679,34 @@ test "several cards open at once stack without overlapping" {
     }
 }
 
+test "the card opened longest ago closes first, never the one kept" {
+    var sim: Sim = .{};
+    run(&sim, &.{ .{ .id = 1, .status = .done }, .{ .id = 2, .status = .done }, .{ .id = 3, .status = .done } }, 0.5);
+    sim.toggle(1);
+    sim.toggle(0);
+    sim.toggle(2);
+    try t.expect(sim.closeOldestCard(2));
+    try t.expect(!sim.isOpen(1) and sim.isOpen(0) and sim.isOpen(2));
+    try t.expect(sim.closeOldestCard(2));
+    try t.expect(!sim.closeOldestCard(2));
+    try t.expect(sim.isOpen(2));
+}
+
 test "a finished bubble stays and rests, and pops only when its conversation leaves" {
     var sim: Sim = .{};
     run(&sim, &.{.{ .id = 7, .status = .working }}, 0.5);
     try t.expectEqual(@as(f32, 1), sim.bodies[0].born);
-    try t.expect(sim.restless());
+    try t.expect(sim.restless(test_layout));
     const done = [_]Entry{.{ .id = 7, .status = .done }};
     run(&sim, &done, 5);
     try t.expect(sim.bodies[0].live());
     try t.expectEqual(@as(f32, 0), sim.bodies[0].pop);
     // Nothing moves any more, so there is nothing to step.
-    try t.expect(!sim.restless());
+    try t.expect(!sim.restless(test_layout));
     // A conversation first seen finished still gets its bubble.
     run(&sim, &.{ .{ .id = 7, .status = .done }, .{ .id = 8, .status = .done } }, 0.2);
     try t.expect(sim.indexOf(8) != null);
-    try t.expect(sim.restless());
+    try t.expect(sim.restless(test_layout));
     // Leaving pops it.
     run(&sim, &.{.{ .id = 8, .status = .done }}, 0.5);
     try t.expect(sim.indexOf(7) == null);
@@ -666,11 +715,17 @@ test "a finished bubble stays and rests, and pops only when its conversation lea
 test "working and waiting bubbles keep the clock running" {
     var sim: Sim = .{};
     run(&sim, &.{.{ .id = 1, .status = .working }}, 5);
-    try t.expect(sim.restless());
+    try t.expect(sim.restless(test_layout));
     run(&sim, &.{.{ .id = 1, .status = .waiting }}, 1);
-    try t.expect(sim.restless());
+    try t.expect(sim.restless(test_layout));
+    // Under Reduce Motion nothing sways, so a working bubble rests too.
+    var still_sim: Sim = .{};
+    var still = test_layout;
+    still.still = true;
+    runIn(&still_sim, &.{.{ .id = 1, .status = .working }}, 3, still);
+    try t.expect(!still_sim.restless(still));
     run(&sim, &.{.{ .id = 1, .status = .failed }}, 5);
-    try t.expect(!sim.restless());
+    try t.expect(!sim.restless(test_layout));
 }
 
 test "a conversation that leaves pops at once, card and all" {
@@ -718,4 +773,6 @@ test "a hit finds the bubble under the point, and nothing between them" {
     const b = sim.bodies[1];
     try t.expectEqual(@as(?usize, 1), sim.hit(test_layout, b.x, b.y));
     try t.expectEqual(@as(?usize, null), sim.hit(test_layout, 1, 1));
+    // A bubble is round: its square's corner is not it.
+    try t.expectEqual(@as(?usize, null), sim.hit(test_layout, b.x + radius - 1, b.y + radius - 1));
 }

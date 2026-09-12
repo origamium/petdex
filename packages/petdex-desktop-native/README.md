@@ -49,14 +49,15 @@ deletes that file once it passes 32 MB.
 Each coding-agent conversation floats over the pet as a bubble with the
 agent's logo. A bubble waiting on you glows, with an orange dot; one that hit
 an error wears a red "!". Click a bubble to open it into a card: the project,
-the agent and its status, the model and reasoning effort when the agent
-reports them (Claude Code, Codex, OpenCode), and the first lines of what it is
-doing or last said. When the agent runs in Warp (2026.05 or later) or in
+the agent and its status, the model (Claude Code, Codex, OpenCode) and the
+reasoning effort (Claude Code, Codex) when the agent reports them, and the
+first lines of what it is doing or last said. When the agent runs in Warp (2026.05 or later) or in
 Terminal, the card also brings its pane or tab to the front. Click again to
 close it. Any number can be open; the cards stack without overlapping. A finished bubble stays with a green check, its card and terminal
 still a click away, until you clear the bubbles from the pet's menu or the
 tray, or its lifetime in Settings runs out. Up to ten conversations float at
-once; past that, the one idle longest makes way.
+once; past that, the one idle longest makes way. On Linux the bubbles show
+their state but do not open into cards.
 
 Claude Code reports failed tools and failed turns once its hooks are installed
 again from Settings; an earlier install keeps working without them.

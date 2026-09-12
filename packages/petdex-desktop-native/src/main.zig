@@ -1330,21 +1330,54 @@ fn jsonUnescapeString(value: []const u8, output: []u8) ?[]const u8 {
         input_index += 1;
         if (byte == '\\') {
             if (input_index >= value.len) return null;
-            byte = switch (value[input_index]) {
+            const escape = value[input_index];
+            input_index += 1;
+            if (escape == 'u') {
+                const code_point = unicodeEscape(value, &input_index) orelse return null;
+                if (len + 4 > output.len) return null;
+                len += std.unicode.utf8Encode(code_point, output[len..]) catch return null;
+                continue;
+            }
+            byte = switch (escape) {
                 '"' => '"',
                 '\\' => '\\',
+                '/' => '/',
                 'n' => '\n',
                 'r' => '\r',
                 't' => '\t',
+                'b' => 0x08,
+                'f' => 0x0c,
                 else => return null,
             };
-            input_index += 1;
         }
         if (len >= output.len) return null;
         output[len] = byte;
         len += 1;
     }
     return output[0..len];
+}
+
+/// The code point of a `\uXXXX` escape whose four digits start at
+/// `index.*`, joining a surrogate pair; a lone half reads as U+FFFD.
+fn unicodeEscape(value: []const u8, index: *usize) ?u21 {
+    const first = hex4(value, index.*) orelse return null;
+    index.* += 4;
+    if (first >= 0xDC00 and first <= 0xDFFF) return 0xFFFD;
+    if (first < 0xD800 or first > 0xDBFF) return first;
+    if (index.* + 6 <= value.len and value[index.*] == '\\' and value[index.* + 1] == 'u') {
+        if (hex4(value, index.* + 2)) |second| {
+            if (second >= 0xDC00 and second <= 0xDFFF) {
+                index.* += 6;
+                return 0x10000 + ((@as(u21, first) - 0xD800) << 10) + (second - 0xDC00);
+            }
+        }
+    }
+    return 0xFFFD;
+}
+
+fn hex4(value: []const u8, at: usize) ?u16 {
+    if (at + 4 > value.len) return null;
+    return std.fmt.parseInt(u16, value[at..][0..4], 16) catch null;
 }
 
 fn saveSettings(model: *const Model) void {
@@ -3384,6 +3417,9 @@ const bubble_text_width: f32 = bubble_card_width - bubble_card_padding * 2 - bub
 const bubble_text_max_lines = 3;
 /// The card's button to the agent's terminal.
 const hook_button_h: f32 = 26;
+/// The tallest the bubble window grows with cards open. Past it, the
+/// card opened longest ago closes.
+const bubble_window_max_h: f32 = 480;
 /// The simulation's clock, running only while a bubble is on screen.
 const hook_tick_key: u64 = 0xb0bb1e;
 const hook_tick_interval_ms: u32 = 33;
@@ -3574,7 +3610,20 @@ fn bubbleStatus(model: *const Model, slot: usize) []const u8 {
 /// The window holds the bubbles that keep a place, and every open card.
 /// It changes only when those do, never per frame of motion.
 fn bubbleWindowHeight(model: *const Model) f32 {
-    return model.hook_sim.contentHeightFor(hookCardHeights(model));
+    return model.hook_sim.contentHeightFor(hookCardHeights(model), true);
+}
+
+/// The height the open cards ask for, not counting cards on their way
+/// shut: what the budget on open cards is checked against.
+fn hookWantedHeight(model: *const Model) f32 {
+    return model.hook_sim.contentHeightFor(hookCardHeights(model), false);
+}
+
+/// Close the cards opened longest ago while the window would pass its
+/// height budget, never `keep`, the one just opened. The budget keeps
+/// the stack clear of the pet and on a small screen.
+fn trimHookCards(model: *Model, keep: usize) void {
+    while (hookWantedHeight(model) > bubble_window_max_h and model.hook_sim.closeOldestCard(keep)) {}
 }
 
 fn bubbleFontSize(model: *const Model) f32 {
@@ -3604,8 +3653,9 @@ fn hookLayout(model: *const Model) bubble_sim.Layout {
     const heights = hookCardHeights(model);
     return .{
         .width = bubble_window_width,
-        .height = model.hook_sim.contentHeightFor(heights),
+        .height = model.hook_sim.contentHeightFor(heights, true),
         .flipped = model.bubble_flipped,
+        .still = model.reduce_motion,
         .card_w = bubble_card_width,
         .card_heights = heights,
         .card_radius = bubble_card_radius,
@@ -3656,13 +3706,16 @@ fn syncHookSim(model: *Model) void {
         }
     }
     model.hook_sim.sync(entries[0..n], hookLayout(model));
+    // A window that changed height carries the bubbles with it in this
+    // same update, not a tick later.
+    model.hook_sim.step(0, hookLayout(model));
 }
 
 /// Start the simulation's clock when something moves. The pet's own
 /// frames stop while it sits still, so the bubbles keep their own;
 /// tickHookBubbles stops it once everything is at rest.
 fn startHookTicks(model: *Model, fx: *Effects) void {
-    if (model.hook_ticking or !model.hook_sim.restless()) return;
+    if (model.hook_ticking or !model.hook_sim.restless(hookLayout(model))) return;
     model.hook_ticking = true;
     model.hook_last_tick_ms = fx.wallMs();
     fx.startTimer(.{
@@ -3691,7 +3744,7 @@ fn tickHookBubbles(model: *Model, fx: *Effects) void {
     model.hook_hover = hookUnderCursor(model, fx) != null;
     // Only finished and failed bubbles, settled: the clock sleeps until
     // something moves again, and the poll keeps the hover current.
-    if (!model.hook_sim.restless()) {
+    if (!model.hook_sim.restless(hookLayout(model))) {
         fx.cancelTimer(hook_tick_key);
         model.hook_ticking = false;
     }
@@ -3718,6 +3771,9 @@ fn pressHookBubble(model: *Model, fx: *Effects) void {
     if (cardButtonHit(model, at[0], at[1])) |slot| return openDestination(&model.bubbles[slot]);
     const index = model.hook_sim.hit(hookLayout(model), at[0], at[1]) orelse return;
     model.hook_sim.toggle(index);
+    if (model.hook_sim.isOpen(index)) trimHookCards(model, index);
+    // The window resizes now, so the bubbles move with it now too.
+    model.hook_sim.step(0, hookLayout(model));
     syncBubbleWindow(model, fx);
     // The card swells open or shut on the clock.
     startHookTicks(model, fx);
@@ -4911,7 +4967,11 @@ pub fn main(init: std.process.Init) !void {
             const phase = args_it.next() orelse return;
             const agent: ?[]const u8 = args_it.next();
             const origin_app = plat.OriginApplication.fromTermProgram(init.environ_map.get("TERM_PROGRAM"));
-            hook_runner.run(phase, agent, origin_app, init.environ_map.get("PWD"), init.environ_map.get("HERDR_PANE_ID"), init.environ_map.get("WARP_FOCUS_URL"), env_home orelse return);
+            // Only a pane Warp itself runs has a live link: the variable is
+            // inherited (by VS Code or tmux started from Warp), and a stale
+            // one would bring the wrong pane forward.
+            const in_warp = std.mem.eql(u8, init.environ_map.get("TERM_PROGRAM") orelse "", "WarpTerminal");
+            hook_runner.run(phase, agent, origin_app, init.environ_map.get("PWD"), init.environ_map.get("HERDR_PANE_ID"), if (in_warp) init.environ_map.get("WARP_FOCUS_URL") else null, env_home orelse return);
             return;
         }
     }
@@ -6012,6 +6072,27 @@ test "several cards can be open at once, and the window holds them all" {
     try std.testing.expect(one > closed);
     try std.testing.expect(two > one);
     try std.testing.expect(model.hook_sim.isOpen(0) and model.hook_sim.isOpen(1));
+}
+
+test "opening cards past the window's budget closes the oldest ones" {
+    var model: Model = .{};
+    const sessions = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
+    for (sessions) |session| testPushBubble(&model, session, "reading", true, -1);
+    syncHookSim(&model);
+    for (0..sessions.len) |i| {
+        model.hook_sim.toggle(i);
+        trimHookCards(&model, i);
+    }
+    try std.testing.expect(hookWantedHeight(&model) <= bubble_window_max_h);
+    try std.testing.expect(model.hook_sim.isOpen(sessions.len - 1));
+    try std.testing.expect(!model.hook_sim.isOpen(0));
+}
+
+test "card text decodes every JSON escape" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("a\u{e9}\u{1F600}/b\"", jsonUnescapeString("a\\u00e9\\ud83d\\ude00\\/b\\\"", &buf).?);
+    // A lone surrogate half stands in as U+FFFD rather than blanking the text.
+    try std.testing.expectEqualStrings("x\u{FFFD}y", jsonUnescapeString("x\\ud83dy", &buf).?);
 }
 
 test "a seventh conversation starts a second row of bubbles" {
