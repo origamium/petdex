@@ -72,20 +72,22 @@ diff --git a/src/platform/macos/appkit_host.h b/src/platform/macos/appkit_host.h
 diff --git a/src/platform/macos/appkit_host.m b/src/platform/macos/appkit_host.m
 --- a/src/platform/macos/appkit_host.m
 +++ b/src/platform/macos/appkit_host.m
-@@ -5513,6 +5513,12 @@
- }
- 
- - (BOOL)acceptsFirstResponder {
-+    return YES;
-+}
-+
-+// petdex: a click on a window that is not key (a non-activating overlay
-+// panel) lands on the first press instead of only focusing the window.
-+- (BOOL)acceptsFirstMouse:(NSEvent *)event {
+@@ -5516,6 +5516,14 @@
      return YES;
  }
  
-@@ -10361,6 +10367,20 @@
++// petdex: a click on a non-activating overlay panel (the hook bubbles)
++// lands on the first press. Every other window keeps AppKit's default,
++// where the first click only brings it forward and cannot press a button
++// the user has not seen yet.
++- (BOOL)acceptsFirstMouse:(NSEvent *)event {
++    return (self.window.styleMask & NSWindowStyleMaskNonactivatingPanel) != 0;
++}
++
+ - (void)resetCursorRects {
+     [super resetCursorRects];
+     [self addCursorRect:self.bounds cursor:self.surfaceCursor ?: [NSCursor arrowCursor]];
+@@ -10361,6 +10369,20 @@
      if (!object.windows[@(window_id)]) return 0;
      [object miniaturizeWindowWithId:window_id];
      return 1;
