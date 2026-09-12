@@ -36,6 +36,7 @@ const chat_shell = @import("chat_shell.zig");
 const chat_view = @import("chat_view.zig");
 pub const desktop_auth = @import("desktop_auth.zig");
 const flock_mod = @import("flock.zig");
+const bubble_sim = @import("bubble_sim.zig");
 pub const updates = @import("updates.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
@@ -5453,6 +5454,7 @@ test {
     // block is the standard aggregator: referencing the imports forces
     // their semantic analysis, which is what registers their tests.
     _ = agent_hooks;
+    _ = bubble_sim;
     _ = chat;
     _ = chat_history;
     _ = chat_shell;
