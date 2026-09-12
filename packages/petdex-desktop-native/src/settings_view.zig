@@ -148,7 +148,7 @@ fn installBanner(ui: *AppUi, model: *const Model) AppUi.Node {
     }
     if (model.install.error_len > 0) {
         var message = ui.text(.{ .size = .sm }, model.install.errorSlice());
-        message.widget.style.foreground = canvas.Color.rgb8(250, 105, 94);
+        message.widget.style.foreground = app.petdexThemeTokens(model).colors.destructive;
         return ui.el(.panel, .{ .padding = 12, .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.row(.{ .gap = 10, .cross = .center }, .{
                 ui.column(.{ .grow = 1 }, .{message}),
@@ -496,6 +496,30 @@ fn languagePanel(ui: *AppUi, model: *const Model) AppUi.Node {
     });
 }
 
+/// Auto follows the system's appearance; Light and Dark keep one look.
+/// The menus stay the system's either way.
+fn themePanel(ui: *AppUi, model: *const Model) AppUi.Node {
+    var buttons: [3]AppUi.Node = undefined;
+    for (&buttons, [_]app.ThemePref{ .auto, .light, .dark }) |*button, pref| button.* = ui.button(.{
+        .size = .sm,
+        .variant = if (model.theme == pref) .primary else .secondary,
+        .on_press = Msg{ .set_theme = @intFromEnum(pref) },
+    }, switch (pref) {
+        .auto => i18n.t("Auto", "自動"),
+        .light => i18n.t("Light", "ライト"),
+        .dark => i18n.t("Dark", "ダーク"),
+    });
+    return ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
+        ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
+            ui.column(.{ .grow = 1 }, .{
+                ui.text(.{}, i18n.t("Appearance", "外観モード")),
+                mutedParagraph(ui, i18n.t("Auto follows your system's appearance", "自動はシステムの外観に合わせます")),
+            }),
+            ui.row(.{ .gap = 6 }, @as([]const AppUi.Node, &buttons)),
+        }),
+    });
+}
+
 pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: ThumbAtlas, cloud_images: CloudImages) AppUi.Node {
     var rows: [max_catalog]AppUi.Node = undefined;
     var shown: usize = 0;
@@ -595,6 +619,7 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
         ui.el(.stack, .{ .height = 10 }, .{}),
         ui.text(.{ .size = .lg }, i18n.t("Appearance", "外観")),
         languagePanel(ui, model),
+        themePanel(ui, model),
         ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
                 ui.column(.{ .grow = 1 }, .{

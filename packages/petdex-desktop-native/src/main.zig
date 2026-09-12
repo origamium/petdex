@@ -184,6 +184,7 @@ pub const Msg = union(enum) {
     set_chat_provider: u32,
     set_chat_stack: u32,
     set_language: u32,
+    set_theme: u32,
     chat_model_input: canvas.TextInputEvent,
     chat_url_input: canvas.TextInputEvent,
     chat_detect_models,
@@ -376,7 +377,11 @@ pub const Model = struct {
     install: InstallState = .{},
     remotes: [remote_runtime.max_remotes]remote_runtime.Slot = .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} },
     remote_count: usize = 0,
+    /// Drawn dark: the system's appearance under `.auto`, else the choice.
     dark: bool = true,
+    theme: ThemePref = .auto,
+    /// What the system reports, kept so `.auto` can return to it.
+    system_dark: bool = true,
     high_contrast: bool = false,
     reduce_motion: bool = false,
     auth: desktop_auth.State = .{},
@@ -390,7 +395,7 @@ pub const Model = struct {
 /// Petdex web tokens (globals.css) translated from OKLCH: brand purple
 /// #5266ea family, cool-tinted near-white light surfaces, stone-900
 /// dark cards. High contrast keeps the stock loud register untouched.
-fn petdexThemeTokens(model: *const Model) canvas.DesignTokens {
+pub fn petdexThemeTokens(model: *const Model) canvas.DesignTokens {
     const scheme: canvas.ColorScheme = if (model.dark) .dark else .light;
     var tokens = canvas.DesignTokens.theme(.{
         .color_scheme = scheme,
@@ -1400,7 +1405,7 @@ fn saveSettings(model: *const Model) void {
 // whole save): keep room for the configurable bubble fields, rotation
 // state, a long slug, and negative coordinates. Grown with every key
 // added; `font_path` alone can escape to 1024.
-const settings_json_bytes = 2336;
+const settings_json_bytes = 2360;
 
 fn settingsJson(model: *const Model, buf: []u8) ?[]const u8 {
     const active = if (model.active_pet < catalog_mod.catalog_len) catalog[model.active_pet].slice() else "";
@@ -1417,7 +1422,7 @@ fn settingsJson(model: *const Model, buf: []u8) ?[]const u8 {
     const font_path = std.mem.trim(u8, model.font_path.text(), " \t\r\n");
     const escaped_font = jsonEscapeString(font_path, &escaped_font_buf) orelse return null;
     const latest = model.latest_version[0..model.latest_version_len];
-    return std.fmt.bufPrint(buf, "{{\"active_pet\":\"{s}\",\"scale\":{d:.2},\"bubbles\":{},\"bubbles_per_conversation\":{},\"waiting_sound\":{},\"bubble_text\":{d:.1},\"bubble_lifetime\":{d:.0},\"font_path\":\"{s}\",\"hide_dock\":{},\"rotate_pets\":{},\"rotation_day\":{d},\"update_checks\":{},\"last_update_check_ms\":{d},\"latest_desktop_version\":\"{s}\"{s},\"agents_prompted\":{},\"language\":\"{s}\"}}", .{ active, model.scale, model.bubbles_enabled, model.bubbles_per_conversation, model.waiting_sound, model.bubble_text_px, model.bubble_lifetime_secs, escaped_font, model.hide_dock, model.rotate_pets, model.rotation_day, model.update_checks_enabled, model.last_update_check_ms, latest, pos, model.agents_prompted, @tagName(model.language) }) catch null;
+    return std.fmt.bufPrint(buf, "{{\"active_pet\":\"{s}\",\"scale\":{d:.2},\"bubbles\":{},\"bubbles_per_conversation\":{},\"waiting_sound\":{},\"bubble_text\":{d:.1},\"bubble_lifetime\":{d:.0},\"font_path\":\"{s}\",\"hide_dock\":{},\"rotate_pets\":{},\"rotation_day\":{d},\"update_checks\":{},\"last_update_check_ms\":{d},\"latest_desktop_version\":\"{s}\"{s},\"agents_prompted\":{},\"language\":\"{s}\",\"theme\":\"{s}\"}}", .{ active, model.scale, model.bubbles_enabled, model.bubbles_per_conversation, model.waiting_sound, model.bubble_text_px, model.bubble_lifetime_secs, escaped_font, model.hide_dock, model.rotate_pets, model.rotation_day, model.update_checks_enabled, model.last_update_check_ms, latest, pos, model.agents_prompted, @tagName(model.language), @tagName(model.theme) }) catch null;
 }
 
 fn setUnsignedText(buffer: []u8, length: *usize, value: u16) void {
@@ -1538,6 +1543,34 @@ fn freeSheet(s: *Sheet) void {
 
 var initial_scale: f32 = 0.7;
 var initial_language: i18n.Pref = .auto;
+var initial_theme: ThemePref = .auto;
+
+/// Settings → Appearance: follow the system, or keep one look.
+pub const ThemePref = enum { auto, light, dark };
+
+fn resolveDark(theme: ThemePref, system_dark: bool) bool {
+    return switch (theme) {
+        .auto => system_dark,
+        .light => false,
+        .dark => true,
+    };
+}
+
+/// Draw in the chosen look, or the system's under `.auto`.
+fn applyTheme(model: *Model, fx: *Effects) void {
+    model.dark = resolveDark(model.theme, model.system_dark);
+    registerTail(model.dark, fx);
+    // The strip is themed, so bubbles drawing from it have to re-pack on
+    // an appearance flip exactly like settings does.
+    if (model.settings_open or model.bubbles_len > 0) loadAgentsAtlas(model.dark, fx);
+}
+
+test "the theme follows the system only under auto" {
+    try std.testing.expect(resolveDark(.auto, true));
+    try std.testing.expect(!resolveDark(.auto, false));
+    try std.testing.expect(!resolveDark(.light, true));
+    try std.testing.expect(resolveDark(.dark, false));
+}
 /// Whether the launch environment asks for Japanese (macOS preferences,
 /// the Windows UI language, the POSIX locale); read once in main().
 var os_japanese = false;
@@ -1883,6 +1916,9 @@ fn resolveInitialPet(io: std.Io, allocator: std.mem.Allocator, environ_map: *std
             }
             if (hook_server.jsonStringPub(json, "language")) |value| {
                 initial_language = std.meta.stringToEnum(i18n.Pref, value) orelse .auto;
+            }
+            if (hook_server.jsonStringPub(json, "theme")) |value| {
+                initial_theme = std.meta.stringToEnum(ThemePref, value) orelse .auto;
             }
             if (hook_server.jsonStringPub(json, "bubbles")) |_| {} else if (std.mem.indexOf(u8, json, "\"bubbles\":false") != null) {
                 initial_bubbles = false;
@@ -2236,6 +2272,7 @@ pub fn boot(model: *Model, fx: *Effects) void {
     // Agents section.
     model.scale = initial_scale;
     model.language = initial_language;
+    model.theme = initial_theme;
     model.bubbles_enabled = initial_bubbles;
     model.bubbles_per_conversation = initial_bubbles_per_conversation;
     model.waiting_sound = initial_waiting_sound;
@@ -2704,6 +2741,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             applyLanguage(model.language);
             saveSettings(model);
         },
+        .set_theme => |raw| {
+            model.theme = std.enums.fromInt(ThemePref, raw) orelse return;
+            applyTheme(model, fx);
+            saveSettings(model);
+        },
         .open_chat,
         .show_chat,
         .chat_brief,
@@ -2978,11 +3020,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .open_website => plat.openExternal("https://petdex.dev"),
         .appearance => |a| {
-            model.dark = a.color_scheme == .dark;
-            registerTail(model.dark, fx);
-            // The strip is themed, so bubbles drawing from it have to
-            // re-pack on an appearance flip exactly like settings does.
-            if (model.settings_open or model.bubbles_len > 0) loadAgentsAtlas(model.dark, fx);
+            model.system_dark = a.color_scheme == .dark;
+            applyTheme(model, fx);
             model.high_contrast = a.high_contrast;
             model.reduce_motion = a.reduce_motion;
         },
@@ -4269,11 +4308,10 @@ fn emptyStateView(ui: *AppUi, model: *const Model) AppUi.Node {
         count += 1;
     }
     if (model.install.error_len > 0) {
-        // Same literal the settings banner uses: the token set has no
-        // error colour, so matching it keeps the two error surfaces
-        // reading as one thing.
+        // The palette's destructive, which the settings banner uses too,
+        // so the two error surfaces read as one thing in either theme.
         var err = ui.text(.{ .size = .sm, .text_alignment = .center }, model.install.errorSlice());
-        err.widget.style.foreground = canvas.Color.rgb8(250, 105, 94);
+        err.widget.style.foreground = petdexThemeTokens(model).colors.destructive;
         children[count] = err;
         count += 1;
     }
@@ -4678,7 +4716,7 @@ fn flockMember(ui: *AppUi, model: *const Model, index: usize, spec: flock_mod.La
         .on_press = if (pressable) .{ .focus_flock_member = @intCast(index) } else null,
     }, .{
         body,
-        flockBadge(ui, member),
+        flockBadge(ui, member, model.dark),
     });
 }
 
@@ -4687,7 +4725,7 @@ fn flockMember(ui: *AppUi, model: *const Model, index: usize, spec: flock_mod.La
 /// is already compiled into the binary for the bubbles. The name stays as
 /// the accessibility label, so screen readers and the automation snapshot
 /// still get it.
-fn flockBadge(ui: *AppUi, member: *const flock_mod.Member) AppUi.Node {
+fn flockBadge(ui: *AppUi, member: *const flock_mod.Member, dark: bool) AppUi.Node {
     const name = member.labelSlice();
     const identity = if (agents_icons_ready and name.len != 0) blk: {
         var badge = ui.image(.{
@@ -4703,11 +4741,11 @@ fn flockBadge(ui: *AppUi, member: *const flock_mod.Member) AppUi.Node {
 
     // An agent that needs the human is the one thing worth spotting from
     // across the room, and the resting poses of waiting and idle are too
-    // close to carry that on their own. Same amber marker the bubble
-    // already uses for the same meaning.
+    // close to carry that on their own. The same system orange the
+    // bubble's dot uses for the same meaning.
     if (!flockNeedsAttention(member.state)) return identity;
     var marker = ui.text(.{ .size = .sm }, "!");
-    marker.widget.style.foreground = canvas.Color.rgb8(250, 170, 48);
+    marker.widget.style.foreground = if (dark) canvas.Color.rgb8(255, 159, 10) else canvas.Color.rgb8(255, 149, 0);
     return ui.row(.{ .cross = .center, .gap = 3 }, .{ identity, marker });
 }
 
@@ -5617,6 +5655,8 @@ test "the hook stack keeps clear of an open chat bubble" {
 test "settings JSON keeps the language and fits the worst-case font path" {
     var model: Model = .{};
     model.language = .ja;
+    // The longest theme tag.
+    model.theme = .light;
     model.window_fitted = true;
     model.pet_x = -123456;
     model.pet_y = -123456;
@@ -5625,6 +5665,7 @@ test "settings JSON keeps the language and fits the worst-case font path" {
     var buf: [settings_json_bytes]u8 = undefined;
     const json = settingsJson(&model, &buf).?;
     try std.testing.expectEqual(i18n.Pref.ja, std.meta.stringToEnum(i18n.Pref, hook_server.jsonStringPub(json, "language").?).?);
+    try std.testing.expectEqual(ThemePref.light, std.meta.stringToEnum(ThemePref, hook_server.jsonStringPub(json, "theme").?).?);
 }
 
 test "custom font path round-trips through settings JSON escaping" {
