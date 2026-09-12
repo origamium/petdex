@@ -94,6 +94,22 @@ pub fn readFileTail(path: []const u8, buf: []u8) ?[]const u8 {
     return buf[0..total];
 }
 
+/// The newest line of a text file that `accept` takes, among the last
+/// `buf.len` bytes. When the file is longer than that, the tail's first
+/// line may be cut, so it is never offered. Returns a slice of `buf`.
+pub fn lastLineMatching(path: []const u8, buf: []u8, accept: *const fn ([]const u8) bool) ?[]const u8 {
+    const tail = readFileTail(path, buf) orelse return null;
+    const lo = if (tail.len < buf.len) 0 else (std.mem.indexOfScalar(u8, tail, '\n') orelse return null) + 1;
+    var end = tail.len;
+    while (end > lo) {
+        const start = if (std.mem.lastIndexOfScalar(u8, tail[lo..end], '\n')) |i| lo + i + 1 else lo;
+        const line = std.mem.trim(u8, tail[start..end], " \r");
+        if (line.len > 0 and accept(line)) return line;
+        end = if (start > lo) start - 1 else lo;
+    }
+    return null;
+}
+
 /// Allocate-and-read, capped at `max`. Returns a slice sized to the
 /// bytes actually read so the caller's free matches the allocation.
 pub fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max: usize) ?[]u8 {
@@ -996,4 +1012,28 @@ test "writeFile creates missing parent directories atomically" {
     var buf: [32]u8 = undefined;
     const got = readFile(path, &buf) orelse return error.ReadFailed;
     try std.testing.expectEqualStrings("petdex", got);
+}
+
+test "the newest matching line comes from the tail, never a cut first line" {
+    const root = ".zig-cache/petdex-plat-last-line";
+    _ = deleteTree(root);
+    defer _ = deleteTree(root);
+    const path = root ++ "/rollout.jsonl";
+    const content = "{\"type\":\"turn_context\",\"model\":\"old\"}\n" ++
+        ("{\"type\":\"event\"}\n" ** 20) ++
+        "{\"type\":\"last\"}";
+    try std.testing.expect(writeFile(path, content));
+    const Accept = struct {
+        fn turnContext(line: []const u8) bool {
+            return std.mem.indexOf(u8, line, "turn_context") != null;
+        }
+    };
+    // Far back past a small tail; found by a tail that holds it.
+    var small: [64]u8 = undefined;
+    try std.testing.expectEqual(@as(?[]const u8, null), lastLineMatching(path, &small, Accept.turnContext));
+    var big: [1024]u8 = undefined;
+    try std.testing.expectEqualStrings("{\"type\":\"turn_context\",\"model\":\"old\"}", lastLineMatching(path, &big, Accept.turnContext).?);
+    // A tail that starts inside the matching line does not offer its piece.
+    var cut: [content.len - 5]u8 = undefined;
+    try std.testing.expectEqual(@as(?[]const u8, null), lastLineMatching(path, &cut, Accept.turnContext));
 }

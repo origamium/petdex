@@ -19,8 +19,14 @@ const jsonString = hook_server.jsonStringPub;
 
 const stdin_cap = 64 * 1024;
 const title_max = 60;
-const preview_max = 110;
+const preview_max = 190;
 const transcript_tail_cap = 64 * 1024;
+/// Largest request body the runner sends. A deep cwd, a long title, the
+/// preview and the model together pass 1 KiB; the server reads 8 KiB.
+pub const post_body_cap = 2048;
+/// How far back a transcript is searched for the model and effort: Codex
+/// writes them once per turn, and a long turn leaves them megabytes back.
+const settings_scan_back: u64 = 4 * 1024 * 1024;
 const session_ttl_secs: i64 = 24 * 60 * 60;
 const post_timeout_ms: u64 = 300;
 const post_poll_ms: u64 = 5;
@@ -78,6 +84,14 @@ pub fn run(phase: []const u8, arg_agent: ?[]const u8, origin_app: plat.OriginApp
     var title_buf: [256]u8 = undefined;
     const title: []const u8 = jsonString(payload, "petdex_session_title") orelse if (session_id) |sid| (readTitle(sessions_dir, sid, &title_buf) orelse "") else "";
 
+    // The model and effort change with a new prompt and are settled at a
+    // turn's end, so they are read there and never on a tool call; the
+    // server keeps them for the updates in between.
+    var scan_buf: [transcript_tail_cap]u8 = undefined;
+    var model_buf: [48]u8 = undefined;
+    var effort_buf: [16]u8 = undefined;
+    const settings: Settings = if (isPromptPhase(phase) or isStopPhase(phase)) modelSettings(payload, &scan_buf, &model_buf, &effort_buf) else .{};
+
     var text_buf: [256]u8 = undefined;
     var text = formatBubble(phase, payload, &text_buf) orelse "";
 
@@ -97,7 +111,7 @@ pub fn run(phase: []const u8, arg_agent: ?[]const u8, origin_app: plat.OriginApp
                 break :blk lastAssistantFromTail(tail);
             };
         if (written) |w| {
-            if (clipEscaped(w, preview_max, &preview_buf)) |p| {
+            if (clipEscapedLines(w, preview_max, &preview_buf)) |p| {
                 if (p.len > 0) text = p;
             }
         }
@@ -113,9 +127,9 @@ pub fn run(phase: []const u8, arg_agent: ?[]const u8, origin_app: plat.OriginApp
 
     var posts: [2]PostJob = undefined;
     var post_count: usize = 0;
-    var body_buf: [1536]u8 = undefined;
+    var body_buf: [post_body_cap]u8 = undefined;
     if (text.len > 0) {
-        const body = bubbleBodyWithMetadata(&body_buf, text, title, busy, agent, session_id, source_app, source_tty, source_cwd, herdr_pane, state);
+        const body = bubbleBodyFull(&body_buf, text, title, busy, agent, session_id, source_app, source_tty, source_cwd, herdr_pane, state, settings);
         if (body) |b| {
             if (startPost("/bubble", b, token)) |post| {
                 posts[post_count] = post;
@@ -227,6 +241,25 @@ pub fn bubbleBody(out: []u8, text: []const u8, title: []const u8, busy: bool, ag
 /// hooks already compute (failed, review, waiting) have to travel here to
 /// survive. Senders that pass null keep the previous body byte for byte.
 pub fn bubbleBodyWithMetadata(out: []u8, text: []const u8, title: []const u8, busy: bool, agent: []const u8, session_id: ?[]const u8, source_app: []const u8, source_tty: []const u8, source_cwd: []const u8, herdr_pane: []const u8, agent_state: ?[]const u8) ?[]const u8 {
+    return bubbleBodyFull(out, text, title, busy, agent, session_id, source_app, source_tty, source_cwd, herdr_pane, agent_state, .{});
+}
+
+/// The model and reasoning effort a session runs with, when the agent says.
+pub const Settings = struct { model: []const u8 = "", effort: []const u8 = "" };
+
+/// bubbleBodyWithMetadata plus the model and effort, appended last and only
+/// when known: without them the body is byte for byte the one above.
+pub fn bubbleBodyFull(out: []u8, text: []const u8, title: []const u8, busy: bool, agent: []const u8, session_id: ?[]const u8, source_app: []const u8, source_tty: []const u8, source_cwd: []const u8, herdr_pane: []const u8, agent_state: ?[]const u8, settings: Settings) ?[]const u8 {
+    var model_buf: [72]u8 = undefined;
+    const model_part: []const u8 = if (settings.model.len > 0)
+        (std.fmt.bufPrint(&model_buf, ",\"model\":\"{s}\"", .{settings.model}) catch return null)
+    else
+        "";
+    var effort_buf: [40]u8 = undefined;
+    const effort_part: []const u8 = if (settings.effort.len > 0)
+        (std.fmt.bufPrint(&effort_buf, ",\"effort\":\"{s}\"", .{settings.effort}) catch return null)
+    else
+        "";
     var title_buf: [256]u8 = undefined;
     const title_part: []const u8 = if (title.len > 0)
         (std.fmt.bufPrint(&title_buf, ",\"title\":\"{s}\"", .{title}) catch return null)
@@ -247,7 +280,65 @@ pub fn bubbleBodyWithMetadata(out: []u8, text: []const u8, title: []const u8, bu
         (std.fmt.bufPrint(&state_buf, ",\"agent_state\":\"{s}\"", .{st}) catch return null)
     else
         "";
-    return std.fmt.bufPrint(out, "{{\"text\":\"{s}\"{s},\"busy\":{},\"agent_source\":\"{s}\"{s}{s}{s}}}", .{ text, title_part, busy, agent, session_part, metadata, state_part }) catch null;
+    return std.fmt.bufPrint(out, "{{\"text\":\"{s}\"{s},\"busy\":{},\"agent_source\":\"{s}\"{s}{s}{s}{s}{s}}}", .{ text, title_part, busy, agent, session_part, metadata, state_part, model_part, effort_part }) catch null;
+}
+
+/// Codex puts `model` in every hook payload; neither agent puts the effort
+/// there as a string, so both fall back to the transcript. Claude Code's
+/// newest assistant line carries `message.model` and a top-level `effort`;
+/// Codex's newest `turn_context` line carries `payload.model` and
+/// `payload.effort`. At these phases the payload has no `tool_input`, so
+/// its first "model" key is the agent's own.
+///
+/// Claude Code's assistant line sits near the end, so the 64 KiB tail
+/// finds it. Codex's turn context can lie megabytes back after a long
+/// turn; only then is a 4 MiB tail read, on the heap (a stack that size
+/// would overflow Windows' default 1 MiB), and the values copied out
+/// before it is freed.
+fn modelSettings(payload: []const u8, scan_buf: []u8, model_out: *[48]u8, effort_out: *[16]u8) Settings {
+    const from_payload: Settings = .{ .model = safeToken(jsonString(payload, "model"), 48) orelse "" };
+    const path = jsonString(payload, "transcript_path") orelse return from_payload;
+    if (plat.lastLineMatching(path, scan_buf, carriesSettings)) |line| {
+        return copySettings(settingsFromLine(line, from_payload), model_out, effort_out);
+    }
+    const big = std.heap.page_allocator.alloc(u8, settings_scan_back) catch return from_payload;
+    defer std.heap.page_allocator.free(big);
+    const line = plat.lastLineMatching(path, big, carriesSettings) orelse return from_payload;
+    return copySettings(settingsFromLine(line, from_payload), model_out, effort_out);
+}
+
+fn copySettings(settings: Settings, model_out: *[48]u8, effort_out: *[16]u8) Settings {
+    @memcpy(model_out[0..settings.model.len], settings.model);
+    @memcpy(effort_out[0..settings.effort.len], settings.effort);
+    return .{ .model = model_out[0..settings.model.len], .effort = effort_out[0..settings.effort.len] };
+}
+
+/// A transcript line the settings can be read from. Claude Code writes the
+/// model "<synthetic>" on lines it makes up itself (an interruption, an API
+/// error); those name no model and fail the token check.
+pub fn carriesSettings(line: []const u8) bool {
+    if (std.mem.indexOf(u8, line, "\"type\":\"assistant\"") == null and
+        std.mem.indexOf(u8, line, "\"type\":\"turn_context\"") == null) return false;
+    return safeToken(jsonString(line, "model"), 48) != null;
+}
+
+pub fn settingsFromLine(line: []const u8, from_payload: Settings) Settings {
+    return .{
+        .model = if (from_payload.model.len > 0) from_payload.model else safeToken(jsonString(line, "model"), 48) orelse "",
+        .effort = safeToken(jsonString(line, "effort"), 16) orelse "",
+    };
+}
+
+/// A short identifier safe to embed in a JSON string as it is: letters,
+/// digits and the marks model names use ("claude-opus-5", "opus[1m]").
+fn safeToken(raw: ?[]const u8, max: usize) ?[]const u8 {
+    const value = raw orelse return null;
+    if (value.len == 0 or value.len > max) return null;
+    for (value) |c| {
+        const ok = std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == ':' or c == '/' or c == '[' or c == ']' or c == '@';
+        if (!ok) return null;
+    }
+    return value;
 }
 
 /// The /state request body. Extracted and pure for one reason: `run()` reaches
@@ -401,14 +492,39 @@ fn clipRaw(text: []const u8, max: usize) []const u8 {
 /// sequences for whitespace (\n, \t, \r) become spaces, runs of
 /// spaces collapse, and the cut lands on a safe boundary.
 pub fn clipEscaped(text: []const u8, max: usize, buf: []u8) ?[]const u8 {
+    return clipEscapedMode(text, max, buf, false);
+}
+
+/// clipEscaped keeping line breaks, one `\n` per run of them, so a preview
+/// shows its first lines rather than one run-on line.
+pub fn clipEscapedLines(text: []const u8, max: usize, buf: []u8) ?[]const u8 {
+    return clipEscapedMode(text, max, buf, true);
+}
+
+fn clipEscapedMode(text: []const u8, max: usize, buf: []u8, keep_lines: bool) ?[]const u8 {
     var w: usize = 0;
     var i: usize = 0;
     var last_space = true;
+    var last_break = true;
     while (i < text.len and w < buf.len) {
         var ch = text[i];
         var advance: usize = 1;
         if (ch == '\\' and i + 1 < text.len) {
             const esc = text[i + 1];
+            if (keep_lines and esc == 'n') {
+                if (!last_break) {
+                    // The break replaces the space before it.
+                    if (w > 0 and buf[w - 1] == ' ') w -= 1;
+                    if (w + 2 > buf.len) break;
+                    buf[w] = '\\';
+                    buf[w + 1] = 'n';
+                    w += 2;
+                }
+                last_space = true;
+                last_break = true;
+                i += 2;
+                continue;
+            }
             if (esc == 'n' or esc == 't' or esc == 'r') {
                 ch = ' ';
                 advance = 2;
@@ -420,6 +536,7 @@ pub fn clipEscaped(text: []const u8, max: usize, buf: []u8) ?[]const u8 {
                 w += 2;
                 i += 2;
                 last_space = false;
+                last_break = false;
                 continue;
             }
         }
@@ -433,23 +550,33 @@ pub fn clipEscaped(text: []const u8, max: usize, buf: []u8) ?[]const u8 {
             buf[w] = ch;
             w += 1;
             last_space = false;
+            last_break = false;
         }
         i += advance;
     }
     var result = std.mem.trim(u8, buf[0..w], " ");
     if (result.len > max) result = result[0..safeBoundary(result, max)];
+    // A cut can leave a break or a space at the end.
+    while (keep_lines) {
+        if (endsWithBreak(result)) {
+            result = result[0 .. result.len - 2];
+        } else if (std.mem.endsWith(u8, result, " ")) {
+            result = result[0 .. result.len - 1];
+        } else break;
+    }
     return result;
 }
 
-/// Largest cut <= max that neither splits a UTF-8 sequence nor a JSON
-/// escape (an odd run of trailing backslashes).
-fn safeBoundary(text: []const u8, max: usize) usize {
-    var cut = @min(max, text.len);
-    while (cut > 0 and (text[cut] & 0xC0) == 0x80) cut -= 1;
+/// Ends in the escape `\n`, not in an escaped backslash followed by `n`.
+fn endsWithBreak(text: []const u8) bool {
+    if (!std.mem.endsWith(u8, text, "\\n")) return false;
     var backslashes: usize = 0;
-    while (cut > backslashes and text[cut - 1 - backslashes] == '\\') backslashes += 1;
-    if (backslashes % 2 == 1) cut -= 1;
-    return cut;
+    while (backslashes < text.len - 1 and text[text.len - 2 - backslashes] == '\\') backslashes += 1;
+    return backslashes % 2 == 1;
+}
+
+fn safeBoundary(text: []const u8, max: usize) usize {
+    return hook_server.escapedCut(text, max);
 }
 
 fn firstWord(text: []const u8, max: usize) []const u8 {
@@ -622,7 +749,7 @@ const PostTask = struct {
     done: std.atomic.Value(bool) = .init(false),
     path: [16]u8 = undefined,
     path_len: usize = 0,
-    body: [1024]u8 = undefined,
+    body: [post_body_cap]u8 = undefined,
     body_len: usize = 0,
     token: [128]u8 = undefined,
     token_len: usize = 0,
@@ -645,7 +772,7 @@ const PostJob = struct {
 /// Start a localhost POST on a private worker. Every byte is copied into the
 /// task so the worker remains valid even when the hook's stack frame returns.
 fn startPost(path: []const u8, body: []const u8, token: []const u8) ?PostJob {
-    if (path.len > 16 or body.len > 1024 or token.len > 128) return null;
+    if (path.len > 16 or body.len > post_body_cap or token.len > 128) return null;
     const task = std.heap.page_allocator.create(PostTask) catch return null;
     task.* = .{};
     @memcpy(task.path[0..path.len], path);
@@ -706,7 +833,7 @@ fn postLocalhostBlocking(path: []const u8, body: []const u8, token: []const u8) 
     // with connection refused when no app listens.
     var stream = addr.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return;
     defer stream.close(io);
-    var req_buf: [1600]u8 = undefined;
+    var req_buf: [post_body_cap + 256]u8 = undefined;
     const req = std.fmt.bufPrint(&req_buf, "POST {s} HTTP/1.1\r\nhost: 127.0.0.1\r\nx-petdex-update-token: {s}\r\ncontent-type: application/json\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n{s}", .{ path, token, body.len, body }) catch return;
     var write_buf: [64]u8 = undefined;
     var writer = stream.writer(io, &write_buf);
@@ -976,6 +1103,50 @@ test "clipEscaped cuts on a safe boundary" {
     const clipped = clipEscaped(&long, 110, &buf).?;
     try t.expect(clipped.len <= 110);
     try t.expect(clipped[clipped.len - 1] != '\\');
+}
+
+test "the model and effort ride the bubble last, and only when known" {
+    var a: [post_body_cap]u8 = undefined;
+    var b: [post_body_cap]u8 = undefined;
+    const plain = bubbleBodyWithMetadata(&a, "t", "", true, "codex", "s1", "", "", "", "", null).?;
+    try t.expectEqualStrings(plain, bubbleBodyFull(&b, "t", "", true, "codex", "s1", "", "", "", "", null, .{}).?);
+    const full = bubbleBodyFull(&b, "t", "", true, "codex", "s1", "", "", "", "", null, .{ .model = "gpt-6-astra", .effort = "xhigh" }).?;
+    try t.expect(std.mem.endsWith(u8, full, ",\"model\":\"gpt-6-astra\",\"effort\":\"xhigh\"}"));
+    try t.expectEqualStrings("gpt-6-astra", hook_server.jsonStringPub(full, "model").?);
+}
+
+test "settings come from Claude's assistant line and Codex's turn context" {
+    const claude = "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-opus-5\",\"content\":[{\"type\":\"text\",\"text\":\"say \\\"model\\\" twice\"}]},\"effort\":\"high\"}";
+    try t.expect(carriesSettings(claude));
+    const from_claude = settingsFromLine(claude, .{});
+    try t.expectEqualStrings("claude-opus-5", from_claude.model);
+    try t.expectEqualStrings("high", from_claude.effort);
+    const codex = "{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-6-astra\",\"effort\":\"xhigh\",\"collaboration_mode\":{\"settings\":{\"reasoning_effort\":\"low\"}}}}";
+    try t.expectEqualStrings("xhigh", settingsFromLine(codex, .{}).effort);
+    // The payload's own model wins over the transcript's.
+    try t.expectEqualStrings("gpt-6", settingsFromLine(codex, .{ .model = "gpt-6" }).model);
+    // Lines Claude Code makes up itself name no model, and user lines are
+    // not the agent's.
+    try t.expect(!carriesSettings("{\"type\":\"assistant\",\"message\":{\"model\":\"<synthetic>\"}}"));
+    try t.expect(!carriesSettings("{\"type\":\"user\",\"message\":{\"model\":\"claude-opus-5\"}}"));
+}
+
+test "a preview keeps its first lines" {
+    var buf: [512]u8 = undefined;
+    try t.expectEqualStrings("Fixed the test.\\nRan it twice.", clipEscapedLines("  Fixed the test.  \\n\\n\\n Ran it twice.\\n", 190, &buf).?);
+    // A cut never leaves a break or half an escape at the end.
+    try t.expectEqualStrings("ab", clipEscapedLines("ab\\ncd", 3, &buf).?);
+    // The title keeps flattening.
+    try t.expectEqualStrings("a b", clipEscaped("a\\nb", 60, &buf).?);
+}
+
+test "the longest bubble body fits one POST" {
+    var buf: [post_body_cap]u8 = undefined;
+    const cwd = "/" ++ ("d" ** 510);
+    const body = bubbleBodyFull(&buf, "x" ** 190, "t" ** 60, true, "claude-code", "a" ** 64, "Apple_Terminal", "/dev/ttys000", cwd, "p" ** 64, "waiting", .{ .model = "m" ** 48, .effort = "e" ** 16 }).?;
+    // Past the old 1 KiB cap that dropped such a bubble without a word.
+    try t.expect(body.len > 1024);
+    try t.expect(body.len <= post_body_cap);
 }
 
 test "a bubble without a reported state is byte-identical to before" {

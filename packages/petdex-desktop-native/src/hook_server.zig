@@ -102,7 +102,21 @@ pub const Bubble = struct {
     /// not say, and readers fall back to `busy`.
     agent_state: [16]u8 = @splat(0),
     agent_state_len: usize = 0,
+    /// The model and reasoning effort, when the sender knows them. They
+    /// arrive on some events only (a prompt, a turn's end), so a later
+    /// update of the same conversation keeps them.
+    model: [48]u8 = @splat(0),
+    model_len: usize = 0,
+    effort: [16]u8 = @splat(0),
+    effort_len: usize = 0,
     counter: u64 = 0,
+
+    pub fn modelSlice(self: *const Bubble) []const u8 {
+        return self.model[0..self.model_len];
+    }
+    pub fn effortSlice(self: *const Bubble) []const u8 {
+        return self.effort[0..self.effort_len];
+    }
 
     pub fn sessionSlice(self: *const Bubble) []const u8 {
         return self.session[0..self.session_len];
@@ -120,6 +134,28 @@ pub const Bubble = struct {
         return self.agent_state[0..self.agent_state_len];
     }
 };
+
+/// Byte length of escaped JSON string content cut to at most `max` without
+/// splitting a UTF-8 sequence or an escape: an odd run of trailing
+/// backslashes, or a `\uXXXX` short of its four digits.
+pub fn escapedCut(text: []const u8, max: usize) usize {
+    if (text.len <= max) return text.len;
+    var cut = max;
+    while (cut > 0 and (text[cut] & 0xC0) == 0x80) cut -= 1;
+    var backslashes: usize = 0;
+    while (cut > backslashes and text[cut - 1 - backslashes] == '\\') backslashes += 1;
+    if (backslashes % 2 == 1) return cut - 1;
+    // A `\u` escape whose digits straddle the cut goes whole.
+    var back: usize = 1;
+    while (back <= 5 and back < cut) : (back += 1) {
+        const at = cut - back - 1;
+        if (text[at] != '\\' or text[at + 1] != 'u') continue;
+        var slashes: usize = 0;
+        while (at > slashes and text[at - 1 - slashes] == '\\') slashes += 1;
+        if (slashes % 2 == 0 and at + 6 > cut) return at;
+    }
+    return cut;
+}
 
 /// How many conversations can narrate at once, and float as bubbles over
 /// the pet. Fixed because the mailbox holds them inline: no allocator runs
@@ -228,9 +264,13 @@ pub const Mailbox = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        var reused = false;
         const slot = blk: {
             for (self.bubbles[0..self.bubbles_len]) |*b| {
-                if (std.mem.eql(u8, b.sessionSlice(), session)) break :blk b;
+                if (std.mem.eql(u8, b.sessionSlice(), session)) {
+                    reused = true;
+                    break :blk b;
+                }
             }
             if (self.bubbles_len < max_bubbles) {
                 const b = &self.bubbles[self.bubbles_len];
@@ -244,7 +284,19 @@ pub const Mailbox = struct {
             break :blk oldest;
         };
 
+        // The model and effort come on some events only; the same
+        // conversation keeps them across the updates in between.
+        const model = slot.model;
+        const model_len = slot.model_len;
+        const effort = slot.effort;
+        const effort_len = slot.effort_len;
         slot.* = .{};
+        if (reused) {
+            slot.model = model;
+            slot.model_len = model_len;
+            slot.effort = effort;
+            slot.effort_len = effort_len;
+        }
         const sn = @min(session.len, slot.session.len);
         @memcpy(slot.session[0..sn], session[0..sn]);
         slot.session_len = sn;
@@ -289,6 +341,29 @@ pub const Mailbox = struct {
             @memcpy(b.agent_state[0..n], state[0..n]);
             @memset(b.agent_state[n..], 0);
             b.agent_state_len = n;
+            self.bubbles_dirty = true;
+            return;
+        }
+    }
+
+    /// Record the model and effort for a session that already has a slot,
+    /// the way setBubbleAgentState records attention. An empty value
+    /// leaves the one already known.
+    pub fn setBubbleModel(self: *Mailbox, session: []const u8, model: []const u8, effort: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.bubbles[0..self.bubbles_len]) |*b| {
+            if (!std.mem.eql(u8, b.sessionSlice(), session)) continue;
+            if (model.len > 0) {
+                const n = @min(model.len, b.model.len);
+                @memcpy(b.model[0..n], model[0..n]);
+                b.model_len = n;
+            }
+            if (effort.len > 0) {
+                const n = @min(effort.len, b.effort.len);
+                @memcpy(b.effort[0..n], effort[0..n]);
+                b.effort_len = n;
+            }
             self.bubbles_dirty = true;
             return;
         }
@@ -859,7 +934,7 @@ fn route(server: *Server, conn: *Conn, method: []const u8, target: []const u8, p
         if (!server.rateLimitOk()) return respond(conn, 429, "{\"ok\":false,\"error\":\"rate_limited\"}");
         const text = jsonString(body, "text") orelse
             return respond(conn, 400, "{\"ok\":false,\"error\":\"missing_text\"}");
-        const capped = text[0..@min(text.len, 200)];
+        const capped = text[0..escapedCut(text, 200)];
         const agent = jsonString(body, "agent_source") orelse "";
         const title = jsonString(body, "title") orelse "";
         const origin_app = plat.OriginApplication.fromTermProgram(jsonString(body, "source_app"));
@@ -885,6 +960,11 @@ fn route(server: *Server, conn: *Conn, method: []const u8, target: []const u8, p
         // here. Older senders omit it and keep the busy-only behaviour.
         if (jsonString(body, "agent_state")) |state| {
             mailbox.setBubbleAgentState(session, state[0..@min(state.len, 16)]);
+        }
+        const model = jsonString(body, "model") orelse "";
+        const effort = jsonString(body, "effort") orelse "";
+        if (model.len > 0 or effort.len > 0) {
+            mailbox.setBubbleModel(session, model[0..escapedCut(model, 48)], effort[0..escapedCut(effort, 16)]);
         }
         mirrorBubble(server, capped, counter, title[0..@min(title.len, 96)], agent[0..@min(agent.len, 24)], busy) catch {};
         const out = std.fmt.bufPrint(&scratch, "{{\"ok\":true,\"counter\":{d}}}", .{counter}) catch return;
@@ -1249,6 +1329,33 @@ test "a full set evicts the least recently updated session" {
     }
     try std.testing.expect(!saw_s0);
     try std.testing.expect(saw_new);
+}
+
+test "a conversation keeps its model and effort across updates, and a new one starts blank" {
+    var mb: Mailbox = .{};
+    _ = mb.setBubble("s1", "Thinking…", "claude", "", true);
+    mb.setBubbleModel("s1", "claude-opus-5", "high");
+    _ = mb.setBubble("s1", "Reading main.zig", "claude", "", true);
+    try std.testing.expectEqualStrings("claude-opus-5", mb.bubbles[0].modelSlice());
+    try std.testing.expectEqualStrings("high", mb.bubbles[0].effortSlice());
+    // An empty value leaves the one already known.
+    mb.setBubbleModel("s1", "", "max");
+    try std.testing.expectEqualStrings("claude-opus-5", mb.bubbles[0].modelSlice());
+    try std.testing.expectEqualStrings("max", mb.bubbles[0].effortSlice());
+    _ = mb.setBubble("s2", "Thinking…", "codex", "", true);
+    try std.testing.expectEqualStrings("", mb.bubbles[1].modelSlice());
+}
+
+test "text is cut without splitting a character or an escape" {
+    try std.testing.expectEqual(@as(usize, 5), escapedCut("abcde", 9));
+    try std.testing.expectEqual(@as(usize, 3), escapedCut("abcdef", 3));
+    // An odd backslash at the cut is half an escape.
+    try std.testing.expectEqual(@as(usize, 2), escapedCut("ab\\n", 3));
+    // "é" is two bytes; the cut backs off to before it.
+    try std.testing.expectEqual(@as(usize, 1), escapedCut("a\xc3\xa9", 2));
+    // A \u escape straddling the cut goes whole, one inside it stays.
+    try std.testing.expectEqual(@as(usize, 2), escapedCut("ab\\u00e9cd", 6));
+    try std.testing.expectEqual(@as(usize, 8), escapedCut("ab\\u00e9cd", 8));
 }
 
 test "takeBubbles only reports a set that changed" {
