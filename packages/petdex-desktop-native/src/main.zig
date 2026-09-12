@@ -3257,6 +3257,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // On Linux this also computes the side before the popup is
             // declared, so its first frame matches the compositor anchor.
             syncBubbleWindow(model, fx);
+            // With the clock asleep over resting bubbles, the hover that
+            // lets a click through to them is kept here.
+            if (!model.hook_ticking and bubbleActive(model)) model.hook_hover = hookUnderCursor(model, fx) != null;
             if (model.waiting_sound and shouldEscalate(model.state, model.waiting_since_ms, model.waiting_escalated, now)) {
                 model.waiting_escalated = true;
                 playWaitingChime(fx);
@@ -3645,11 +3648,11 @@ fn syncHookSim(model: *Model) void {
     model.hook_sim.sync(entries[0..n], hookLayout(model));
 }
 
-/// Start the simulation's clock when a bubble appears. The pet's own
+/// Start the simulation's clock when something moves. The pet's own
 /// frames stop while it sits still, so the bubbles keep their own;
-/// tickHookBubbles stops it once the last bubble has popped.
+/// tickHookBubbles stops it once everything is at rest.
 fn startHookTicks(model: *Model, fx: *Effects) void {
-    if (model.hook_ticking or !model.hook_sim.anyLive()) return;
+    if (model.hook_ticking or !model.hook_sim.restless()) return;
     model.hook_ticking = true;
     model.hook_last_tick_ms = fx.wallMs();
     fx.startTimer(.{
@@ -3676,6 +3679,12 @@ fn tickHookBubbles(model: *Model, fx: *Effects) void {
     // The window takes clicks only while a bubble is under the cursor, so
     // the gaps between bubbles stay the desktop's.
     model.hook_hover = hookUnderCursor(model, fx) != null;
+    // Only finished and failed bubbles, settled: the clock sleeps until
+    // something moves again, and the poll keeps the hover current.
+    if (!model.hook_sim.restless()) {
+        fx.cancelTimer(hook_tick_key);
+        model.hook_ticking = false;
+    }
 }
 
 /// The body under the global cursor, which the bubble window reports
@@ -3700,6 +3709,8 @@ fn pressHookBubble(model: *Model, fx: *Effects) void {
     const index = model.hook_sim.hit(hookLayout(model), at[0], at[1]) orelse return;
     model.hook_sim.toggle(index);
     syncBubbleWindow(model, fx);
+    // The card swells open or shut on the clock.
+    startHookTicks(model, fx);
 }
 
 /// The most recently updated bubble, or null when there is none.
@@ -4284,7 +4295,12 @@ fn hookBubble(ui: *AppUi, model: *const Model, index: usize, layout: bubble_sim.
                 parts[len] = hookBadge(ui, model, s, red);
                 len += 1;
             },
-            .working, .done => {},
+            .done => {
+                const green = if (model.dark) canvas.Color.rgb8(48, 209, 88) else canvas.Color.rgb8(52, 199, 89);
+                parts[len] = doneBadge(ui, model, s, green);
+                len += 1;
+            },
+            .working => {},
         }
     }
     var group = ui.el(.stack, .{ .width = s.w, .height = s.h }, @as([]const AppUi.Node, parts[0..len]));
@@ -4344,6 +4360,35 @@ fn hookBadge(ui: *AppUi, model: *const Model, s: bubble_sim.Shape, color: canvas
     point.widget.style.radius = 1;
     point.widget.transform = canvas.Affine.translate(hook_badge / 2 - 1, 10);
     var badge = ui.el(.stack, .{ .width = hook_badge, .height = hook_badge }, .{ circle, bar, point });
+    badge.widget.transform = canvas.Affine.translate(s.w * 0.854 - hook_badge / 2, s.h * 0.146 - hook_badge / 2);
+    return badge;
+}
+
+/// A white stroke from `from` to `to`, 2 pt wide with round ends: a bar
+/// turned to the segment's angle. The SDK's Affine has no rotation
+/// constructor, so the matrix is written out.
+fn stroke(ui: *AppUi, from: [2]f32, to: [2]f32) AppUi.Node {
+    const dx = to[0] - from[0];
+    const dy = to[1] - from[1];
+    const len = @sqrt(dx * dx + dy * dy);
+    var bar = ui.el(.panel, .{ .width = len, .height = 2 }, .{});
+    bar.widget.style.background = canvas.Color.rgb8(255, 255, 255);
+    bar.widget.style.radius = 1;
+    const turn: canvas.Affine = .{ .a = dx / len, .b = dy / len, .c = -dy / len, .d = dx / len };
+    bar.widget.transform = canvas.Affine.translate(from[0], from[1]).multiply(turn).multiply(canvas.Affine.translate(0, -1));
+    return bar;
+}
+
+/// The finished badge: a green rim mark with a check drawn from two
+/// strokes. The bubble stays, its card and terminal still a click away.
+fn doneBadge(ui: *AppUi, model: *const Model, s: bubble_sim.Shape, color: canvas.Color) AppUi.Node {
+    var circle = rimMark(ui, model, s, hook_badge, color);
+    circle.widget.transform = canvas.Affine.identity();
+    var badge = ui.el(.stack, .{ .width = hook_badge, .height = hook_badge }, .{
+        circle,
+        stroke(ui, .{ 3.6, 7.2 }, .{ 6.3, 9.9 }),
+        stroke(ui, .{ 5.7, 10.3 }, .{ 10.6, 4.6 }),
+    });
     badge.widget.transform = canvas.Affine.translate(s.w * 0.854 - hook_badge / 2, s.h * 0.146 - hook_badge / 2);
     return badge;
 }
@@ -5901,6 +5946,9 @@ test "an error wears a badge, and waiting on the user glows, still or not" {
     try std.testing.expectEqual(@as(usize, 3), hookBubble(&ui, &model, 0, layout).nodes.len);
     model.hook_sim.bodies[0].status = .working;
     try std.testing.expectEqual(@as(usize, 1), hookBubble(&ui, &model, 0, layout).nodes.len);
+    // A finished one keeps its place, with a check.
+    model.hook_sim.bodies[0].status = .done;
+    try std.testing.expectEqual(@as(usize, 2), hookBubble(&ui, &model, 0, layout).nodes.len);
 }
 
 test "an open card offers the agent's Warp pane or Terminal tab" {

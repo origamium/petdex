@@ -27,9 +27,9 @@ const damping: f32 = 7;
 const rise_speed: f32 = 160;
 const grow_s: f32 = 0.35;
 const open_s: f32 = 0.22;
-/// A finished bubble stays this long, so the user sees it finish.
-pub const linger_s: f32 = 1.5;
 const pop_s: f32 = 0.25;
+/// Below this speed (points per second) a resting bubble counts as still.
+const settle_speed: f32 = 0.5;
 /// A stall or a sleeping machine must not teleport anything.
 const max_dt: f32 = 0.05;
 
@@ -59,13 +59,17 @@ pub const Body = struct {
     born: f32 = 0,
     open: f32 = 0,
     pop: f32 = 0,
-    /// Seconds spent done; the pop starts at `linger_s`.
-    done_s: f32 = 0,
     /// Its conversation left the list: it pops now.
     leaving: bool = false,
 
     pub fn live(self: Body) bool {
         return self.id != 0;
+    }
+
+    /// Working and waiting bubbles sway; finished and failed ones rest,
+    /// their badge saying enough.
+    fn sways(self: Body) bool {
+        return self.status == .working or self.status == .waiting;
     }
 
     /// Holds a place in the cluster (not on its way out).
@@ -147,8 +151,7 @@ pub const Sim = struct {
     height: f32 = 0,
 
     /// Match the conversation list to the bodies by id. New conversations
-    /// rise out of the pet; ones that left pop. A conversation that is
-    /// already done is never born, so a popped one does not come back.
+    /// rise out of the pet, finished ones too; ones that left pop.
     pub fn sync(self: *Sim, entries: []const Entry, layout: Layout) void {
         for (&self.bodies) |*b| {
             if (!b.live()) continue;
@@ -156,17 +159,14 @@ pub const Sim = struct {
                 b.leaving = true;
                 continue;
             };
-            // A new turn on a finished conversation keeps its bubble.
-            if (e.status != .done) {
-                b.done_s = 0;
-                b.pop = 0;
-            }
+            // A conversation that comes back mid-pop keeps its bubble.
+            b.pop = 0;
             b.status = e.status;
             b.icon = e.icon;
             b.leaving = false;
         }
         for (entries) |e| {
-            if (e.id == 0 or e.status == .done or self.indexOf(e.id) != null) continue;
+            if (e.id == 0 or self.indexOf(e.id) != null) continue;
             const slot = self.free() orelse return;
             self.seq +%= 1;
             self.bodies[slot] = .{
@@ -200,15 +200,14 @@ pub const Sim = struct {
             b.born = @min(1, b.born + dt / grow_s);
             const opening = b.id == self.open_id and b.staying();
             b.open = approach(b.open, if (opening) 1 else 0, dt / open_s);
-            if (b.status == .done and !b.leaving) b.done_s += dt;
-            if (b.leaving or b.done_s >= linger_s) b.pop += dt / pop_s;
+            if (b.leaving) b.pop += dt / pop_s;
             if (b.pop >= 1) {
                 b.* = .{};
                 continue;
             }
             var home = homes[i];
-            // The card holds still to be read; bubbles sway.
-            if (b.open == 0) {
+            // The card holds still to be read, and so do resting bubbles.
+            if (b.open == 0 and b.sways()) {
                 const seed: f32 = @floatFromInt(b.id % 997);
                 const period = 3 + @mod(seed, 20) / 10;
                 const phase = seed * 0.37;
@@ -265,6 +264,21 @@ pub const Sim = struct {
             if (b.staying()) n += 1;
         }
         return n;
+    }
+
+    /// Something still moves: a bubble that sways or waits (its light
+    /// breathes), grows in, pops, opens or closes, or has not come to rest.
+    /// When nothing does, the caller can stop stepping until something
+    /// changes.
+    pub fn restless(self: *const Sim) bool {
+        for (self.bodies) |b| {
+            if (!b.live()) continue;
+            if (b.sways() or b.leaving or b.pop > 0 or b.born < 1) return true;
+            const target: f32 = if (b.id == self.open_id) 1 else 0;
+            if (b.open != target) return true;
+            if (@abs(b.vx) > settle_speed or @abs(b.vy) > settle_speed) return true;
+        }
+        return false;
     }
 
     /// Anything still on screen, popping ones included.
@@ -548,21 +562,34 @@ test "an open card pushes the other bubbles out of its way" {
     try t.expectEqual(@as(?usize, null), sim.openIndex());
 }
 
-test "a finished bubble lingers, pops, and does not come back" {
+test "a finished bubble stays and rests, and pops only when its conversation leaves" {
     var sim: Sim = .{};
     run(&sim, &.{.{ .id = 7, .status = .working }}, 0.5);
     try t.expectEqual(@as(f32, 1), sim.bodies[0].born);
+    try t.expect(sim.restless());
     const done = [_]Entry{.{ .id = 7, .status = .done }};
-    run(&sim, &done, linger_s - 0.1);
+    run(&sim, &done, 5);
     try t.expect(sim.bodies[0].live());
     try t.expectEqual(@as(f32, 0), sim.bodies[0].pop);
-    run(&sim, &done, 0.5);
-    try t.expect(!sim.anyLive());
-    run(&sim, &done, 1);
-    try t.expect(!sim.anyLive());
-    // A new turn brings it back.
-    run(&sim, &.{.{ .id = 7, .status = .working }}, 0.1);
-    try t.expect(sim.anyLive());
+    // Nothing moves any more, so there is nothing to step.
+    try t.expect(!sim.restless());
+    // A conversation first seen finished still gets its bubble.
+    run(&sim, &.{ .{ .id = 7, .status = .done }, .{ .id = 8, .status = .done } }, 0.2);
+    try t.expect(sim.indexOf(8) != null);
+    try t.expect(sim.restless());
+    // Leaving pops it.
+    run(&sim, &.{.{ .id = 8, .status = .done }}, 0.5);
+    try t.expect(sim.indexOf(7) == null);
+}
+
+test "working and waiting bubbles keep the clock running" {
+    var sim: Sim = .{};
+    run(&sim, &.{.{ .id = 1, .status = .working }}, 5);
+    try t.expect(sim.restless());
+    run(&sim, &.{.{ .id = 1, .status = .waiting }}, 1);
+    try t.expect(sim.restless());
+    run(&sim, &.{.{ .id = 1, .status = .failed }}, 5);
+    try t.expect(!sim.restless());
 }
 
 test "a conversation that leaves pops at once, and closes its card" {
