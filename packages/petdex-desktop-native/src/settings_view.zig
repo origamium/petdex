@@ -23,10 +23,6 @@ const AppUi = app.AppUi;
 const custom_font_active = &app.custom_font_active;
 const bubble_text_min_px = app.bubble_text_min_px;
 const bubble_text_max_px = app.bubble_text_max_px;
-const bubble_columns_min = app.bubble_columns_min;
-const bubble_columns_max = app.bubble_columns_max;
-const bubble_answer_lines_min = app.bubble_answer_lines_min;
-const bubble_answer_lines_max = app.bubble_answer_lines_max;
 const catalog_mod = @import("catalog.zig");
 const catalog = &catalog_mod.catalog;
 const catalog_len = &catalog_mod.catalog_len;
@@ -581,36 +577,6 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
                     mutedParagraph(ui, "Size of the bubble text"),
                 }),
                 ui.el(.slider, .{ .width = 150, .value = bubble_text_fraction, .on_value = AppUi.valueMsg(.set_bubble_text_size), .semantics = .{ .label = "Bubble text size" } }, .{}),
-            }),
-        }),
-        ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
-            ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
-                ui.column(.{ .grow = 1 }, .{
-                    ui.text(.{}, "Characters per line"),
-                    mutedParagraph(ui, "8–120; maximum characters before wrapping"),
-                }),
-                ui.el(.input, .{
-                    .width = 72,
-                    .height = 34,
-                    .text = model.bubble_columns_text[0..model.bubble_columns_text_len],
-                    .on_input = AppUi.inputMsg(.bubble_columns_input),
-                    .semantics = .{ .label = "Characters per line" },
-                }, .{}),
-            }),
-        }),
-        ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
-            ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
-                ui.column(.{ .grow = 1 }, .{
-                    ui.text(.{}, "Answer lines"),
-                    mutedParagraph(ui, "1–8 answer rows; title uses one additional row"),
-                }),
-                ui.el(.input, .{
-                    .width = 72,
-                    .height = 34,
-                    .text = model.bubble_answer_lines_text[0..model.bubble_answer_lines_text_len],
-                    .on_input = AppUi.inputMsg(.bubble_answer_lines_input),
-                    .semantics = .{ .label = "Answer lines" },
-                }, .{}),
             }),
         }),
         ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{

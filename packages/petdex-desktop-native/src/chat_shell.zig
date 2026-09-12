@@ -263,6 +263,12 @@ fn open(model: *Model, fx: *Effects) void {
     st.open = true;
 }
 
+/// The chat bubble is up beside the pet, where the hook stack must not
+/// cover it (main.bubbleWantX).
+pub fn besidePet(st: *const State) bool {
+    return st.open and chat_view.bubble and st.place.placed();
+}
+
 /// A tap on the pet opens the chat, or leaves it open.
 fn show(model: *Model, fx: *Effects) void {
     if (!model.chat.open) open(model, fx);
