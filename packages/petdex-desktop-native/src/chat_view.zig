@@ -474,6 +474,17 @@ pub fn settingsSection(ui: *AppUi, model: *const Model) AppUi.Node {
             }),
             chatterPicker(ui, st),
         })),
+        panel(ui, ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
+            ui.column(.{ .grow = 1 }, .{
+                ui.text(.{}, i18n.t("Speak up when an agent needs you", "対応が必要なとき声をかける")),
+                muted(ui, i18n.t("Your pet tells you once when a coding agent waits on you", "エージェントが待っているとき、ペットが一度だけ知らせます")),
+            }),
+            ui.el(.switch_control, .{
+                .selected = st.nudge,
+                .on_toggle = .toggle_nudge,
+                .semantics = .{ .label = i18n.t("Speak up when an agent needs you", "対応が必要なとき声をかける") },
+            }, .{}),
+        })),
     });
 }
 

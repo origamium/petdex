@@ -186,6 +186,7 @@ pub const Msg = union(enum) {
     set_language: u32,
     set_theme: u32,
     set_chatter: u32,
+    toggle_nudge,
     chat_model_input: canvas.TextInputEvent,
     chat_url_input: canvas.TextInputEvent,
     chat_detect_models,
@@ -252,6 +253,10 @@ pub const Model = struct {
     /// When the card of something the pet said unprompted shuts itself;
     /// 0 when none is on its timer.
     speak_close_at_ms: i64 = 0,
+    /// Conversations the pet already spoke up about in their current
+    /// waiting spell, oldest first.
+    nudged: [hook_server.max_bubbles]u64 = @splat(0),
+    nudged_len: usize = 0,
     // Drag + momentum, the old desktop's "Codex parity" physics: the
     // frame clock samples the window origin and the primary button
     // through fx.moveWindow(0,0); a down->up edge computes the release
@@ -2766,6 +2771,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .set_chat_provider,
         .set_chat_stack,
         .set_chatter,
+        .toggle_nudge,
         .chat_model_input,
         .chat_url_input,
         .chat_detect_models,
@@ -3331,6 +3337,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             _ = expireBubbles(model, now);
             syncHookSim(model);
             showSpokenCard(model, now);
+            nudgeWaiting(model, fx);
             startHookTicks(model, fx);
             // Place the bubble on the poll clock too, not only on presented
             // frames: the pet stops presenting while it sits still, and a
@@ -3862,6 +3869,94 @@ fn showSpokenCard(model: *Model, now: i64) void {
         const index = petBubbleIndex(model) orelse return;
         if (model.hook_sim.isOpen(index)) model.hook_sim.toggle(index);
     }
+}
+
+/// Speak up once per waiting spell (Settings → Chat): when a conversation
+/// starts waiting on the user, the pet tells them, every conversation
+/// waiting at that moment in one line. Checked on each poll tick, since a
+/// sender without per-agent state waits through the pet's global state.
+fn nudgeWaiting(model: *Model, fx: *Effects) void {
+    if (!model.chat.nudge) {
+        model.nudged_len = 0;
+        return;
+    }
+    var waiting_ids: [hook_server.max_bubbles]u64 = undefined;
+    var waiting: [hook_server.max_bubbles]*const hook_server.Bubble = undefined;
+    var calm_ids: [hook_server.max_bubbles]u64 = undefined;
+    var n: usize = 0;
+    var calm: usize = 0;
+    for (model.bubbles[0..model.bubbles_len], 0..) |*bubble, i| {
+        if (isPetBubble(bubble)) continue;
+        if (bubbleState(model, i) == .waiting) {
+            waiting_ids[n] = hookId(bubble);
+            waiting[n] = bubble;
+            n += 1;
+        } else {
+            calm_ids[calm] = hookId(bubble);
+            calm += 1;
+        }
+    }
+    model.nudged_len = forgetNudged(model.nudged[0..model.nudged_len], calm_ids[0..calm]);
+    if (!nudgeNews(model.nudged[0..model.nudged_len], waiting_ids[0..n])) return;
+    // With the chat open the user is already there, so it counts as said.
+    // Otherwise a request still on the wire leaves it for a later tick.
+    if (!model.chat.open and !chat_shell.nudge(model, waiting[0..n], fx)) return;
+    rememberNudged(&model.nudged, &model.nudged_len, waiting_ids[0..n]);
+}
+
+/// Forget, in place, the conversations seen not waiting: their next prompt
+/// is news again. One missing from the list stays remembered: with one
+/// bubble at a time, the pet's own reply takes its place, and forgetting
+/// it there would have the pet speak up again at every re-post.
+fn forgetNudged(nudged: []u64, calm: []const u64) usize {
+    var kept: usize = 0;
+    for (nudged) |id| {
+        if (std.mem.indexOfScalar(u64, calm, id) != null) continue;
+        nudged[kept] = id;
+        kept += 1;
+    }
+    return kept;
+}
+
+fn nudgeNews(nudged: []const u64, waiting: []const u64) bool {
+    for (waiting) |id| {
+        if (std.mem.indexOfScalar(u64, nudged, id) == null) return true;
+    }
+    return false;
+}
+
+/// Add `ids`, the oldest making way once the list is full.
+fn rememberNudged(nudged: *[hook_server.max_bubbles]u64, len: *usize, ids: []const u64) void {
+    for (ids) |id| {
+        if (std.mem.indexOfScalar(u64, nudged[0..len.*], id) != null) continue;
+        if (len.* == nudged.len) {
+            std.mem.copyForwards(u64, nudged[0 .. len.* - 1], nudged[1..len.*]);
+            len.* -= 1;
+        }
+        nudged[len.*] = id;
+        len.* += 1;
+    }
+}
+
+test "the pet speaks up once per waiting spell" {
+    var nudged: [hook_server.max_bubbles]u64 = @splat(0);
+    var len: usize = 0;
+    try std.testing.expect(nudgeNews(nudged[0..len], &.{ 1, 2 }));
+    rememberNudged(&nudged, &len, &.{ 1, 2 });
+    // Still waiting, or gone from the list: nothing new to say.
+    try std.testing.expect(!nudgeNews(nudged[0..len], &.{1}));
+    len = forgetNudged(nudged[0..len], &.{});
+    try std.testing.expectEqual(@as(usize, 2), len);
+    // 2 was answered; when it waits again, that is news.
+    len = forgetNudged(nudged[0..len], &.{2});
+    try std.testing.expectEqual(@as(usize, 1), len);
+    try std.testing.expect(nudgeNews(nudged[0..len], &.{ 1, 2 }));
+    // A full list lets the oldest go.
+    len = 0;
+    rememberNudged(&nudged, &len, &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 });
+    try std.testing.expectEqual(nudged.len, len);
+    try std.testing.expectEqual(@as(u64, 2), nudged[0]);
+    try std.testing.expectEqual(@as(u64, 11), nudged[len - 1]);
 }
 
 /// The chat's own bubble: what the pet said while the chat was shut.

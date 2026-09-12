@@ -32,6 +32,8 @@ pub const Prompt = enum {
     briefing,
     /// Unprompted small talk, on the chatter clock.
     chatter,
+    /// A coding agent started waiting on the user.
+    nudge,
 };
 
 pub const Action = enum {
@@ -173,7 +175,7 @@ pub const Session = struct {
 
     /// Nothing on screen asked for this request: the pet spoke unprompted.
     pub fn proactive(self: *const Session) bool {
-        return self.prompt == .chatter;
+        return self.prompt == .chatter or self.prompt == .nudge;
     }
 
     /// Let a failed unprompted request pass as if it never went out: no

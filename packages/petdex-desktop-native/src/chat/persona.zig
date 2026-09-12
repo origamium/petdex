@@ -87,14 +87,38 @@ pub fn briefing(out: []u8, notes: []const Note) []const u8 {
         w.writeAll("No coding agent has anything to report right now.") catch {};
     } else {
         w.writeAll("Their coding agents right now:") catch {};
-        for (notes) |n| {
-            w.print("\n- {s}, {s}", .{ n.agent, n.state }) catch {};
-            if (n.project.len > 0) w.print(", in {s}", .{n.project}) catch {};
-            if (n.title.len > 0) w.print(": {s}", .{n.title}) catch {};
-            if (n.text.len > 0) w.print(" — {s}", .{n.text}) catch {};
-        }
+        for (notes) |n| writeNote(&w, n);
     }
     return domain.utf8Floor(w.buffered(), out.len);
+}
+
+fn writeNote(w: *std.Io.Writer, n: Note) void {
+    w.print("\n- {s}, {s}", .{ n.agent, n.state }) catch {};
+    if (n.project.len > 0) w.print(", in {s}", .{n.project}) catch {};
+    if (n.title.len > 0) w.print(": {s}", .{n.title}) catch {};
+    if (n.text.len > 0) w.print(" — {s}", .{n.text}) catch {};
+}
+
+/// A coding agent started waiting on the user: the pet tells them, once,
+/// in its own voice. Light like small talk: the only turn, with the pet's
+/// last lines quoted.
+pub fn nudge(out: []u8, notes: []const Note, recent: []const []const u8) []const u8 {
+    var w: std.Io.Writer = .fixed(out);
+    w.writeAll("(From the app, not the user.) A coding agent of theirs is waiting on them. " ++
+        "In character, tell them in one short sentence, so they go and take a look. " ++
+        "Plain text, in the language of your last lines below, " ++
+        "or of your description if there are none.\nWaiting now:") catch {};
+    for (notes) |n| writeNote(&w, n);
+    lastLines(&w, recent);
+    return domain.utf8Floor(w.buffered(), out.len);
+}
+
+test "a nudge names what waits before the pet's last lines" {
+    const t = std.testing;
+    var out: [1024]u8 = undefined;
+    const n = nudge(&out, &.{.{ .agent = "claude", .state = "waiting", .title = "Allow Bash?", .project = "petdex" }}, &.{"眠い…"});
+    try t.expect(std.mem.startsWith(u8, n, "(From the app, not the user.)"));
+    try t.expect(std.mem.endsWith(u8, n, "Waiting now:\n- claude, waiting, in petdex: Allow Bash?\nYour last lines, not to repeat:\n- 眠い…"));
 }
 
 /// Unprompted small talk: one line out of nowhere, in the pet's voice.

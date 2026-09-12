@@ -128,6 +128,8 @@ pub const State = struct {
     /// Something the pet said unprompted just went to its bubble; main
     /// opens that bubble as a card on its next drain.
     speak_pending: bool = false,
+    /// Speak up when a coding agent starts waiting on the user (Settings).
+    nudge: bool = false,
 
     pub fn petSlug(self: *const State) []const u8 {
         return self.pet[0..self.pet_len];
@@ -237,6 +239,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             st.chatter_minutes = @intCast(@min(raw, chatter_choices[chatter_choices.len - 1]));
             // The clock restarts from the new interval.
             st.next_chatter_ms = 0;
+            saveConfig(st);
+        },
+        .toggle_nudge => {
+            st.nudge = !st.nudge;
             saveConfig(st);
         },
         .set_chat_provider => |raw| {
@@ -390,16 +396,35 @@ fn briefingPrompt(model: *const Model) []const u8 {
         const agent = b.agent[0..b.agent_len];
         // The chat's own reply excerpts are not news.
         if (std.mem.eql(u8, agent, "petdex")) continue;
-        notes[n] = .{
-            .agent = agent,
-            .state = if (b.agent_state_len > 0) b.agentStateSlice() else if (b.busy) "working" else "finished",
-            .title = b.title[0..b.title_len],
-            .text = b.text[0..b.text_len],
-            .project = std.fs.path.basename(b.cwdSlice()),
-        };
+        notes[n] = noteFor(b, if (b.agent_state_len > 0) b.agentStateSlice() else if (b.busy) "working" else "finished");
         n += 1;
     }
     return persona.briefing(&brief_buf, notes[0..n]);
+}
+
+fn noteFor(b: *const hook_server.Bubble, state: []const u8) persona.Note {
+    return .{
+        .agent = b.agent[0..b.agent_len],
+        .state = state,
+        .title = b.title[0..b.title_len],
+        .text = b.text[0..b.text_len],
+        .project = std.fs.path.basename(b.cwdSlice()),
+    };
+}
+
+var nudge_buf: [4096]u8 = undefined;
+var nudge_len: usize = 0;
+
+/// Coding agents started waiting on the user: the pet says so, once, the
+/// way it makes small talk. The prompt is built now, from `waiting`,
+/// because a credential refresh may come before the request.
+pub fn nudge(model: *Model, waiting: []const *const hook_server.Bubble, fx: *Effects) bool {
+    var notes: [hook_server.max_bubbles]persona.Note = undefined;
+    const n = @min(waiting.len, notes.len);
+    for (waiting[0..n], notes[0..n]) |b, *note| note.* = noteFor(b, "waiting");
+    var lines: [3][]const u8 = undefined;
+    nudge_len = persona.nudge(&nudge_buf, notes[0..n], lastLines(&model.chat, &lines)).len;
+    return speak(model, .nudge, fx);
 }
 
 const Pet = struct { x: f64, y: f64, w: f64, h: f64 };
@@ -602,7 +627,7 @@ fn startRequest(model: *Model, fx: *Effects) void {
     var context: [session.context_messages]domain.Message = undefined;
     const recent = st.session.context(&context);
     // The pet speaking first ends the context with the app's prompt, never
-    // stored. Small talk is light: that prompt alone, no history.
+    // stored. Small talk and nudges are light: that prompt alone, no history.
     var with_prompt: [session.context_messages + 1]domain.Message = undefined;
     const turns: []const domain.Message = switch (st.session.prompt) {
         .none => recent,
@@ -613,6 +638,10 @@ fn startRequest(model: *Model, fx: *Effects) void {
         },
         .chatter => blk: {
             with_prompt[0] = .{ .role = .user, .text = chatterPrompt(st) };
+            break :blk with_prompt[0..1];
+        },
+        .nudge => blk: {
+            with_prompt[0] = .{ .role = .user, .text = nudge_buf[0..nudge_len] };
             break :blk with_prompt[0..1];
         },
     };
@@ -892,12 +921,13 @@ fn loadConfig(st: *State) void {
     st.bubble_excerpt = cfg.bubble_excerpt;
     st.stack = std.math.clamp(cfg.stack, 1, max_stack);
     st.chatter_minutes = @min(cfg.chatter_minutes, chatter_choices[chatter_choices.len - 1]);
+    st.nudge = cfg.nudge;
 }
 
 fn saveConfig(st: *const State) void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    var cfg: config.Config = .{ .provider = st.kind, .bubble_excerpt = st.bubble_excerpt, .stack = st.stack, .chatter_minutes = st.chatter_minutes };
+    var cfg: config.Config = .{ .provider = st.kind, .bubble_excerpt = st.bubble_excerpt, .stack = st.stack, .chatter_minutes = st.chatter_minutes, .nudge = st.nudge };
     cfg.codex.model = st.codexModel();
     cfg.openai_compat.base_url = st.localUrl();
     cfg.openai_compat.model = st.localModel();
