@@ -128,7 +128,7 @@ async function postJson(url, body, token) {
   }
 }
 
-async function notify({ state, duration, text, title, busy, sessionId }) {
+async function notify({ state, duration, text, title, busy, sessionId, model, agentState }) {
   // Killswitch: users toggle this with /petdex inside their agent
   // (or 'petdex hooks toggle' from a shell). Bail before the token
   // read so the disabled state has zero filesystem cost beyond the
@@ -155,6 +155,10 @@ async function notify({ state, duration, text, title, busy, sessionId }) {
   }
   if (title) bubbleBody.title = title;
   if (busy !== undefined) bubbleBody.busy = busy;
+  // The card shows the model; a failed session keeps its bubble, marked,
+  // instead of popping as done.
+  if (model) bubbleBody.model = model;
+  if (agentState) bubbleBody.agent_state = agentState;
   await Promise.all([
     postJson(HOOK_SERVER_URL, stateBody, token),
     text ? postJson(HOOK_SERVER_BUBBLE_URL, bubbleBody, token) : Promise.resolve(),
@@ -166,6 +170,9 @@ async function notify({ state, duration, text, title, busy, sessionId }) {
 // us opencode's own LLM-generated session titles for the bubble.
 const PetdexPlugin = async ({ client }) => {
   const titleCache = new Map();
+  // The model each session's assistant last answered with, from its
+  // message.updated events.
+  const modelCache = new Map();
   async function sessionTitle(sessionID) {
     if (!sessionID || !client) return titleCache.get(sessionID) || null;
     try {
@@ -186,6 +193,7 @@ const PetdexPlugin = async ({ client }) => {
       title: await sessionTitle(input.sessionID),
       busy: true,
       sessionId: input.sessionID,
+      model: modelCache.get(input.sessionID),
     }),
     "tool.execute.after": async (input) => notify({
       state: "idle",
@@ -193,8 +201,18 @@ const PetdexPlugin = async ({ client }) => {
       title: await sessionTitle(input.sessionID),
       busy: true,
       sessionId: input.sessionID,
+      model: modelCache.get(input.sessionID),
     }),
     event: async ({ event }) => {
+      // A message event carries its session inside `info`, not as
+      // properties.sessionID, so it is handled before that check.
+      if (event?.type === "message.updated") {
+        const info = event.properties?.info;
+        if (info?.role === "assistant" && typeof info.sessionID === "string" && typeof info.modelID === "string") {
+          modelCache.set(info.sessionID, info.modelID);
+        }
+        return;
+      }
       const sessionId = event?.properties?.sessionID;
       if (typeof sessionId !== "string" || sessionId.length === 0) return;
       if (event.type === "session.idle") {
@@ -205,6 +223,7 @@ const PetdexPlugin = async ({ client }) => {
           title: await sessionTitle(sessionId),
           busy: false,
           sessionId,
+          model: modelCache.get(sessionId),
         });
       } else if (event.type === "session.error") {
         await notify({
@@ -214,6 +233,8 @@ const PetdexPlugin = async ({ client }) => {
           title: await sessionTitle(sessionId),
           busy: false,
           sessionId,
+          model: modelCache.get(sessionId),
+          agentState: "failed",
         });
       }
     },
