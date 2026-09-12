@@ -493,7 +493,8 @@ pub const InstallState = struct {
     ext_png: bool = false,
     /// Last failure, shown in Settings until dismissed. Empty means the
     /// install either succeeded or never ran.
-    error_text: [96]u8 = @splat(0),
+    /// Sized for Japanese, three bytes a character.
+    error_text: [192]u8 = @splat(0),
     error_len: usize = 0,
     /// The compact endpoint is preferred. A failed request gets one
     /// retry against the legacy endpoint for older mirrors.
@@ -559,8 +560,8 @@ pub const InstallState = struct {
         self.queued -= 1;
     }
 
-    pub fn setError(self: *InstallState, comptime fmt: []const u8, args: anytype) void {
-        const written = std.fmt.bufPrint(&self.error_text, fmt, args) catch {
+    pub fn setError(self: *InstallState, comptime en: []const u8, comptime ja: []const u8, args: anytype) void {
+        const written = i18n.bufPrint(&self.error_text, en, ja, args) catch {
             self.error_len = 0;
             return;
         };
@@ -602,7 +603,7 @@ fn startInstallQueue(model: *Model, fx: *Effects) void {
     if (model.install.busy() or model.install.queued == 0) return;
     if (installer.detect() == null) {
         std.debug.print("{s}", .{installer.missing_downloader_note});
-        model.install.setError("No downloader: install curl", .{});
+        model.install.setError("No downloader: install curl", "ダウンローダーがありません。curlをインストールしてください。", .{});
         model.install.queued = 0;
         return;
     }
@@ -636,28 +637,28 @@ fn beginCurrentPet(model: *Model, fx: *Effects) bool {
     var path_buf: [512]u8 = undefined;
     const manifest_path = manifestTmpPath(&path_buf) orelse return false;
     const manifest = plat.readFileAlloc(boot_allocator, manifest_path, max_manifest_bytes) orelse {
-        model.install.setError("Manifest download failed", .{});
+        model.install.setError("Manifest download failed", "マニフェストをダウンロードできませんでした。", .{});
         return false;
     };
     defer boot_allocator.free(manifest);
 
     const urls = installer.findPetUrls(manifest, slug) orelse {
-        model.install.setError("{s} is not in the catalog", .{slug});
+        model.install.setError("{s} is not in the catalog", "{s}はカタログにありません。", .{slug});
         return false;
     };
     const pet_json = urls.resolvePetJson(model.install.asset_url_buffers[0][0..]) orelse {
-        model.install.setError("{s} has an invalid pet.json URL", .{slug});
+        model.install.setError("{s} has an invalid pet.json URL", "{s}のpet.jsonのURLが正しくありません。", .{slug});
         return false;
     };
     const spritesheet = urls.resolveSpritesheet(model.install.asset_url_buffers[1][0..]) orelse {
-        model.install.setError("{s} has an invalid spritesheet URL", .{slug});
+        model.install.setError("{s} has an invalid spritesheet URL", "{s}のスプライトシートのURLが正しくありません。", .{slug});
         return false;
     };
     // The host check happens before a single byte is requested: an
     // approved-but-stale row could carry a URL off the asset origin,
     // and the app must not write those bytes to a pet directory.
     if (!installer.isTrustedAssetUrl(pet_json) or !installer.isTrustedAssetUrl(spritesheet)) {
-        model.install.setError("{s} has an untrusted asset host", .{slug});
+        model.install.setError("{s} has an untrusted asset host", "{s}のアセットのホストは信頼できません。", .{slug});
         return false;
     }
     model.install.ext_png = std.mem.eql(u8, urls.spritesheetExt(), "png");
@@ -982,13 +983,13 @@ fn saveAuthSession(model: *const Model, fx: *Effects) void {
 
 fn fetchAuthLibrary(model: *Model, fx: *Effects) void {
     if (model.auth.access_token_len == 0) {
-        model.auth.setError("Your Petdex session is missing an access token");
+        model.auth.setError(i18n.t("Your Petdex session is missing an access token", "Petdexのセッションにアクセストークンがありません。"));
         return;
     }
     model.auth.phase = .syncing;
     var config_buf: [9000]u8 = undefined;
     const config = std.fmt.bufPrint(&config_buf, "url = \"{s}\"\nheader = \"Authorization: Bearer {s}\"\nsilent\nshow-error\nwrite-out = \"\\n%{{http_code}}\"\n", .{ env_auth_library_url, model.auth.accessToken() }) catch {
-        model.auth.setError("Your Petdex session token is too large");
+        model.auth.setError(i18n.t("Your Petdex session token is too large", "Petdexのセッショントークンが大きすぎます。"));
         return;
     };
     const argv = [_][]const u8{ "/usr/bin/curl", "--max-time", "15", "--config", "-" };
@@ -1005,7 +1006,7 @@ fn requestAuthTokens(model: *Model, code: ?[]const u8, fx: *Effects) void {
     var body_buf: [10000]u8 = undefined;
     const body = if (code) |value| desktop_auth.tokenBody(&model.auth, value, &body_buf) else desktop_auth.refreshBody(&model.auth, &body_buf);
     const payload = body orelse {
-        model.auth.setError("Could not prepare the Petdex sign-in request");
+        model.auth.setError(i18n.t("Could not prepare the Petdex sign-in request", "Petdexのサインイン要求を準備できませんでした。"));
         return;
     };
     model.auth.refreshing = code == null;
@@ -2393,7 +2394,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     model.install.manifest_fallback_attempted = true;
                     var path_buf: [512]u8 = undefined;
                     const path = manifestTmpPath(&path_buf) orelse {
-                        model.install.setError("Could not reach petdex.dev", .{});
+                        model.install.setError("Could not reach petdex.dev", "petdex.devに接続できませんでした。", .{});
                         model.install.phase = .idle;
                         model.install.queued = 0;
                         return;
@@ -2408,7 +2409,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     });
                     return;
                 }
-                model.install.setError("Could not reach petdex.dev", .{});
+                model.install.setError("Could not reach petdex.dev", "petdex.devに接続できませんでした。", .{});
                 model.install.phase = .idle;
                 model.install.queued = 0;
                 return;
@@ -2419,12 +2420,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .pet_json_done => |exit| {
             if (model.install.phase != .pet_json) return;
             if (exit.reason != .exited or exit.code != 0) {
-                model.install.setError("{s}: pet.json download failed", .{model.install.currentSlug()});
+                model.install.setError("{s}: pet.json download failed", "{s}：pet.jsonをダウンロードできませんでした。", .{model.install.currentSlug()});
                 advanceInstallQueue(model, fx);
                 return;
             }
             if (!beginSpritesheet(model, fx)) {
-                model.install.setError("{s}: spritesheet unavailable", .{model.install.currentSlug()});
+                model.install.setError("{s}: spritesheet unavailable", "{s}：スプライトシートを取得できません。", .{model.install.currentSlug()});
                 advanceInstallQueue(model, fx);
             }
         },
@@ -2432,12 +2433,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (model.install.phase != .spritesheet) return;
             const slug = model.install.currentSlug();
             if (exit.reason != .exited or exit.code != 0) {
-                model.install.setError("{s}: spritesheet download failed", .{slug});
+                model.install.setError("{s}: spritesheet download failed", "{s}：スプライトシートをダウンロードできませんでした。", .{slug});
                 advanceInstallQueue(model, fx);
                 return;
             }
             if (!mirrorToCodexRoot(slug, model.install.ext_png)) {
-                model.install.setError("{s}: failed to mirror into Codex pets", .{slug});
+                model.install.setError("{s}: failed to mirror into Codex pets", "{s}：Codexのペットにコピーできませんでした。", .{slug});
                 advanceInstallQueue(model, fx);
                 return;
             }
@@ -2576,7 +2577,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (!desktop_auth.available or model.auth.phase == .authorizing or model.auth.phase == .exchanging) return;
             var url_buf: [1024]u8 = undefined;
             const url = desktop_auth.begin(&model.auth, &url_buf) orelse {
-                model.auth.setError("Could not start Petdex sign-in");
+                model.auth.setError(i18n.t("Could not start Petdex sign-in", "Petdexのサインインを開始できませんでした。"));
                 return;
             };
             plat.openExternal(url);
@@ -2650,7 +2651,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .auth_token_response => |response| {
             if (response.outcome != .ok or response.status != 200 or response.truncated or !desktop_auth.applyTokenResponse(&model.auth, boot_allocator, response.body)) {
                 model.auth.refreshing = false;
-                model.auth.setError("Petdex sign-in could not complete");
+                model.auth.setError(i18n.t("Petdex sign-in could not complete", "Petdexのサインインを完了できませんでした。"));
                 return;
             }
             saveAuthSession(model, fx);
@@ -2673,7 +2674,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
             if (exit.reason != .exited or exit.code != 0 or exit.output_truncated or status != 200 or !desktop_auth.applyLibrary(&model.auth, boot_allocator, body)) {
                 model.auth.refreshing = false;
-                model.auth.setError("Could not sync your My Petdex library");
+                model.auth.setError(i18n.t("Could not sync your My Petdex library", "マイPetdexのライブラリを同期できませんでした。"));
                 return;
             }
             model.auth.refreshing = false;
@@ -3226,13 +3227,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (hook_server.auth_mailbox.take()) |callback| {
                 if (model.auth.phase == .authorizing) {
                     if (!std.mem.eql(u8, callback.stateSlice(), model.auth.oauthState())) {
-                        model.auth.setError("Petdex rejected the sign-in callback");
+                        model.auth.setError(i18n.t("Petdex rejected the sign-in callback", "Petdexがサインインの応答を受け付けませんでした。"));
                     } else if (callback.error_len > 0) {
                         model.auth.setError(callback.errorSlice());
                     } else if (callback.code_len > 0) {
                         requestAuthTokens(model, callback.codeSlice(), fx);
                     } else {
-                        model.auth.setError("Petdex rejected the sign-in callback");
+                        model.auth.setError(i18n.t("Petdex rejected the sign-in callback", "Petdexがサインインの応答を受け付けませんでした。"));
                     }
                 }
             }
@@ -3376,18 +3377,26 @@ pub fn onCommand(name: []const u8) ?Msg {
 
 pub const AppUi = canvas.Ui(Msg);
 
-const pet_menu = [_]AppUi.ContextMenuItem{
-    .{ .label = "Open Settings", .msg = .open_settings },
-    .{ .label = "Open Flock", .msg = .toggle_flock_window },
-    .{ .label = "View Pet on Petdex", .msg = .open_active_pet_page },
-    .{ .label = "Chat", .msg = .open_chat },
-    .{ .label = "Clear Notifications", .msg = .clear_notifications },
-    .{ .label = "Close Pet", .msg = .close_pet },
-};
+fn petMenu(comptime lang: i18n.Lang) [6]AppUi.ContextMenuItem {
+    return .{
+        .{ .label = i18n.pick(lang, "Open Settings", "設定…"), .msg = .open_settings },
+        .{ .label = i18n.pick(lang, "Open Flock", "フロックを開く"), .msg = .toggle_flock_window },
+        .{ .label = i18n.pick(lang, "View Pet on Petdex", "Petdexでペットを見る"), .msg = .open_active_pet_page },
+        .{ .label = i18n.pick(lang, "Chat", "チャット"), .msg = .open_chat },
+        .{ .label = i18n.pick(lang, "Clear Notifications", "通知を消去"), .msg = .clear_notifications },
+        .{ .label = i18n.pick(lang, "Close Pet", "ペットを閉じる"), .msg = .close_pet },
+    };
+}
+const pet_menu_en = petMenu(.en);
+const pet_menu_ja = petMenu(.ja);
+
+fn petMenuFor() *const [6]AppUi.ContextMenuItem {
+    return if (i18n.current == .ja) &pet_menu_ja else &pet_menu_en;
+}
 
 test "pet context menu opens the flock" {
-    try std.testing.expectEqualStrings("Open Flock", pet_menu[1].label);
-    const msg = pet_menu[1].msg orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("Open Flock", pet_menu_en[1].label);
+    const msg = pet_menu_en[1].msg orelse return error.TestUnexpectedResult;
     switch (msg) {
         .toggle_flock_window => {},
         else => return error.TestUnexpectedResult,
@@ -3491,10 +3500,10 @@ fn bubbleStatus(model: *const Model, slot: usize) []const u8 {
     const bubble = &model.bubbles[slot];
     const state = bubble.agentStateSlice();
     const newest = slot + 1 == model.bubbles_len;
-    if (std.mem.eql(u8, state, "waiting") or (state.len == 0 and newest and model.state == .waiting)) return "Action Required";
-    if (std.mem.eql(u8, state, "failed")) return "Failed";
-    if (bubble.busy) return "Working";
-    return "Done";
+    if (std.mem.eql(u8, state, "waiting") or (state.len == 0 and newest and model.state == .waiting)) return i18n.t("Action Required", "対応が必要");
+    if (std.mem.eql(u8, state, "failed")) return i18n.t("Failed", "失敗");
+    if (bubble.busy) return i18n.t("Working", "作業中");
+    return i18n.t("Done", "完了");
 }
 
 /// Height a card is drawn at.
@@ -4246,19 +4255,22 @@ fn bubbleShouldFlip(model: *const Model, space_above: f64, needed: f64) bool {
 /// Ubuntu ships none for webp, so every pet fails while sitting right
 /// there on disk. Offering that user a download sends them in exactly
 /// the wrong direction.
+/// The pet window is 192pt wide, so these have to fit a narrow column
+/// rather than a sentence's worth of room: the first attempt read
+/// "Pets found, none could be drawn. Linux needs webp-pixbuf-loader."
+/// and rendered as an ellipsis. Newlines rather than one long line,
+/// since the label truncates instead of wrapping.
+fn emptyStateCopy(os: std.Target.Os.Tag, has_pets: bool) []const u8 {
+    if (!has_pets) return i18n.t("No pet yet", "まだペットが\nいません");
+    return if (os == .linux)
+        i18n.t("Pets found,\nnone could\nbe drawn.\n\nLinux needs\nwebp-pixbuf-\nloader.", "ペットは\nありますが、\n表示できません\n\nLinuxでは\nwebp-pixbuf-\nloaderが必要")
+    else
+        i18n.t("Pets found,\nnone could\nbe drawn.\n\nThe sheet may\nbe corrupt.", "ペットは\nありますが、\n表示できません\n\nシートが\n壊れている\nかもしれません");
+}
+
 fn emptyStateView(ui: *AppUi, model: *const Model) AppUi.Node {
     const has_pets = catalog_mod.catalog_len > 0;
-    // The pet window is 192pt wide, so these have to fit a narrow column
-    // rather than a sentence's worth of room: the first attempt read
-    // "Pets found, none could be drawn. Linux needs webp-pixbuf-loader."
-    // and rendered as an ellipsis. Newlines rather than one long line,
-    // since the label truncates instead of wrapping.
-    const body = if (!has_pets)
-        "No pet yet"
-    else if (builtin.os.tag == .linux)
-        "Pets found,\nnone could\nbe drawn.\n\nLinux needs\nwebp-pixbuf-\nloader."
-    else
-        "Pets found,\nnone could\nbe drawn.\n\nThe sheet may\nbe corrupt.";
+    const body = emptyStateCopy(builtin.os.tag, has_pets);
 
     // style_tokens rather than a literal colour: the muted token already
     // tracks the theme, which is the same reason the settings rows use it.
@@ -4277,7 +4289,7 @@ fn emptyStateView(ui: *AppUi, model: *const Model) AppUi.Node {
             .size = .sm,
             .variant = .primary,
             .on_press = Msg.install_first_pet,
-        }, if (model.install.busy()) "Downloading..." else "Get a pet");
+        }, if (model.install.busy()) i18n.t("Downloading...", "ダウンロード中…") else i18n.t("Get a pet", "ペットを入手"));
         count += 1;
     }
     if (model.install.error_len > 0) {
@@ -4294,7 +4306,7 @@ fn emptyStateView(ui: *AppUi, model: *const Model) AppUi.Node {
         .width = frame_w,
         .height = frame_h,
         .padding = 16,
-        .semantics = .{ .label = "No pet installed" },
+        .semantics = .{ .label = i18n.t("No pet installed", "ペットがインストールされていません") },
     }, .{ui.column(.{ .grow = 1, .main = .center, .cross = .center, .gap = 10 }, children[0..count])});
 }
 
@@ -4306,7 +4318,7 @@ pub fn rootView(ui: *AppUi, model: *const Model) AppUi.Node {
         .width = w,
         .height = h,
         .image = @intCast(model.frame_index + 1),
-        .semantics = .{ .label = "Petdex pet" },
+        .semantics = .{ .label = i18n.t("Petdex pet", "Petdexのペット") },
     });
     node.widget.image_fit = .stretch;
     node.widget.image_sampling = .nearest;
@@ -4316,15 +4328,15 @@ pub fn rootView(ui: *AppUi, model: *const Model) AppUi.Node {
         // Bind the menu to the sprite itself, not only its layout parent.
         // Linux resolves the deepest context-menu node on the right-click
         // hit route before mounting the canvas fallback menu.
-        node.context_menu = &pet_menu;
-        return ui.column(.{ .grow = 1, .main = .end, .cross = .center, .window_drag = true, .context_menu = &pet_menu }, .{
+        node.context_menu = petMenuFor();
+        return ui.column(.{ .grow = 1, .main = .end, .cross = .center, .window_drag = true, .context_menu = petMenuFor() }, .{
             node,
             ui.el(.stack, .{ .width = 1, .height = pet_edge_pad }, .{}),
         });
     }
     // Win/mac keep the upstream sprite-only root and app-owned drag path;
     // their bubble is a separate companion window.
-    return ui.column(.{ .grow = 1, .main = .end, .cross = .center, .on_press = .noop, .context_menu = &pet_menu }, .{node});
+    return ui.column(.{ .grow = 1, .main = .end, .cross = .center, .on_press = .noop, .context_menu = petMenuFor() }, .{node});
 }
 
 // ----------------------------------------------------------- bubble
@@ -4372,7 +4384,7 @@ fn bubbleCard(ui: *AppUi, model: *const Model, slot: usize) AppUi.Node {
             .width = bubble_avatar_width,
             .height = bubble_avatar_width,
             .image = if (avatar_ready) avatar_image_id else 0,
-            .semantics = .{ .label = "Agent avatar" },
+            .semantics = .{ .label = i18n.t("Agent avatar", "エージェントのアバター") },
         });
         img.widget.image_fit = .contain;
         break :blk img;
@@ -4381,7 +4393,7 @@ fn bubbleCard(ui: *AppUi, model: *const Model, slot: usize) AppUi.Node {
             .width = bubble_avatar_width,
             .height = bubble_avatar_width,
             .image = agent_icon_atlas_id,
-            .semantics = .{ .label = "Agent avatar" },
+            .semantics = .{ .label = i18n.t("Agent avatar", "エージェントのアバター") },
         });
         img.widget.image_src = agentIconRect(agentIconIndex(agent_name));
         img.widget.image_fit = .contain;
@@ -4533,7 +4545,7 @@ fn flockView(ui: *AppUi, model: *const Model) AppUi.Node {
         var root = ui.column(.{ .grow = 1 }, .{
             ui.el(.stack, .{ .height = companion_header_h, .window_drag = true }, .{}),
             ui.column(.{ .grow = 1, .main = .center, .cross = .center }, .{
-                ui.text(.{ .size = .sm, .text_alignment = .center }, "No agents running"),
+                ui.text(.{ .size = .sm, .text_alignment = .center }, i18n.t("No agents running", "実行中のエージェントはありません")),
             }),
         });
         root.widget.style.background = settingsBackground(model);
@@ -4564,12 +4576,12 @@ fn flockView(ui: *AppUi, model: *const Model) AppUi.Node {
 
 fn flockSemanticLabel(state: State) []const u8 {
     return switch (state) {
-        .waiting => "Agent blocked",
-        .running, .@"running-right", .@"running-left" => "Agent working",
-        .failed => "Agent failed",
-        .review => "Agent reading",
-        .waving, .jumping => "Agent finished",
-        else => "Agent idle",
+        .waiting => i18n.t("Agent blocked", "エージェントが入力待ち"),
+        .running, .@"running-right", .@"running-left" => i18n.t("Agent working", "エージェントが作業中"),
+        .failed => i18n.t("Agent failed", "エージェントが失敗"),
+        .review => i18n.t("Agent reading", "エージェントが確認中"),
+        .waving, .jumping => i18n.t("Agent finished", "エージェントが完了"),
+        else => i18n.t("Agent idle", "エージェントは待機中"),
     };
 }
 
@@ -4696,7 +4708,7 @@ fn petdexWindows(model: *const Model, scratch: *PetdexApp.WindowsScratch) []cons
         scratch.windows[count] = .{
             .label = flock_window_label,
             .canvas_label = flock_canvas_label,
-            .title = "Petdex Flock",
+            .title = i18n.t("Petdex Flock", "Petdexフロック"),
             .width = size.w,
             .height = size.h + companion_header_h,
             .resizable = false,
@@ -4709,7 +4721,7 @@ fn petdexWindows(model: *const Model, scratch: *PetdexApp.WindowsScratch) []cons
         scratch.windows[count] = .{
             .label = settings_window_label,
             .canvas_label = settings_canvas_label,
-            .title = "Petdex Settings",
+            .title = i18n.t("Petdex Settings", "Petdex設定"),
             .width = 420,
             .height = 680,
             .resizable = false,
@@ -4722,7 +4734,7 @@ fn petdexWindows(model: *const Model, scratch: *PetdexApp.WindowsScratch) []cons
         scratch.windows[count] = .{
             .label = chat_shell.window_label,
             .canvas_label = chat_shell.canvas_label,
-            .title = "Chat",
+            .title = i18n.t("Chat", "チャット"),
             // macOS: a speech bubble beside the pet. Not an overlay panel
             // like the hook bubble, which never becomes key: the composer
             // needs the keyboard. Elsewhere a titled window (Windows'
@@ -4847,32 +4859,32 @@ fn refreshHookEntry(argv0: []const u8) void {
 /// its state in the label; the static options keep icon and tooltip.
 fn petdexStatusItem(model: *const Model, scratch: *PetdexApp.StatusItemScratch) PetdexApp.StatusItemState {
     const update_label = switch (model.update_phase) {
-        .checking => "Checking for Updates…",
-        .available => std.fmt.bufPrint(&scratch.title_buffer, "Update to Petdex {s}…", .{model.latest_version[0..model.latest_version_len]}) catch "Update Petdex…",
-        .current => std.fmt.bufPrint(&scratch.title_buffer, "Petdex is up to date · {s}", .{updates.current_version}) catch "Petdex is up to date",
-        .idle, .failed => std.fmt.bufPrint(&scratch.title_buffer, "Check for Updates… · {s}", .{updates.current_version}) catch "Check for Updates…",
+        .checking => i18n.t("Checking for Updates…", "アップデートを確認中…"),
+        .available => i18n.bufPrint(&scratch.title_buffer, "Update to Petdex {s}…", "Petdex {s}にアップデート…", .{model.latest_version[0..model.latest_version_len]}) catch i18n.t("Update Petdex…", "Petdexをアップデート…"),
+        .current => i18n.bufPrint(&scratch.title_buffer, "Petdex is up to date · {s}", "Petdexは最新です · {s}", .{updates.current_version}) catch i18n.t("Petdex is up to date", "Petdexは最新です"),
+        .idle, .failed => i18n.bufPrint(&scratch.title_buffer, "Check for Updates… · {s}", "アップデートを確認… · {s}", .{updates.current_version}) catch i18n.t("Check for Updates…", "アップデートを確認…"),
     };
-    scratch.items[0] = .{ .id = 1, .label = "Open Settings", .command = "petdex.settings" };
-    scratch.items[1] = .{ .id = 12, .label = "Chat…", .command = "petdex.chat" };
-    scratch.items[2] = .{ .id = 2, .label = "Open petdex.dev", .command = "petdex.website" };
+    scratch.items[0] = .{ .id = 1, .label = i18n.t("Open Settings", "設定…"), .command = "petdex.settings" };
+    scratch.items[1] = .{ .id = 12, .label = i18n.t("Chat…", "チャット…"), .command = "petdex.chat" };
+    scratch.items[2] = .{ .id = 2, .label = i18n.t("Open petdex.dev", "petdex.devを開く"), .command = "petdex.website" };
     scratch.items[3] = .{ .id = 3, .separator = true };
     scratch.items[4] = .{
         .id = 4,
-        .label = if (model.focus_mode) "Focus Mode: On" else "Focus Mode: Off",
+        .label = if (model.focus_mode) i18n.t("Focus Mode: On", "集中モード：オン") else i18n.t("Focus Mode: Off", "集中モード：オフ"),
         .command = "petdex.focus",
     };
-    scratch.items[5] = .{ .id = 13, .label = "Clear Notifications", .command = "petdex.clear-notifications", .enabled = model.bubbles_len > 0 };
-    scratch.items[6] = .{ .id = 5, .label = "Shuffle Pet", .command = "petdex.shuffle" };
+    scratch.items[5] = .{ .id = 13, .label = i18n.t("Clear Notifications", "通知を消去"), .command = "petdex.clear-notifications", .enabled = model.bubbles_len > 0 };
+    scratch.items[6] = .{ .id = 5, .label = i18n.t("Shuffle Pet", "ペットをシャッフル"), .command = "petdex.shuffle" };
     scratch.items[7] = .{
         .id = 6,
-        .label = if (model.flock.open) "Hide Flock" else "Show Flock",
+        .label = if (model.flock.open) i18n.t("Hide Flock", "フロックを隠す") else i18n.t("Show Flock", "フロックを表示"),
         .command = "petdex.flock",
     };
-    scratch.items[8] = .{ .id = 7, .label = "View Pet on Petdex", .command = "petdex.pet-page" };
+    scratch.items[8] = .{ .id = 7, .label = i18n.t("View Pet on Petdex", "Petdexでペットを見る"), .command = "petdex.pet-page" };
     scratch.items[9] = .{ .id = 8, .separator = true };
     scratch.items[10] = .{ .id = 9, .label = update_label, .command = "petdex.updates", .enabled = model.update_phase != .checking };
     scratch.items[11] = .{ .id = 10, .separator = true };
-    scratch.items[12] = .{ .id = 11, .label = "Quit Petdex", .command = "petdex.quit" };
+    scratch.items[12] = .{ .id = 11, .label = i18n.t("Quit Petdex", "Petdexを終了"), .command = "petdex.quit" };
     return .{ .items = scratch.items[0..13] };
 }
 
@@ -4899,15 +4911,20 @@ fn materializeTrayIcon() void {
     if (plat.writeFile(path, tray_icon_png)) tray_icon_path = path;
 }
 
-const app_menus = [_]native_sdk.platform.Menu{.{
-    .title = "Pet",
-    .items = &.{
-        .{ .label = "Settings...", .command = "petdex.settings", .key = ",", .modifiers = .{ .primary = true } },
-        .{ .label = "Chat...", .command = "petdex.chat", .key = "k", .modifiers = .{ .primary = true } },
-        .{ .separator = true },
-        .{ .label = "Close Pet", .command = "petdex.close", .key = "w", .modifiers = .{ .primary = true } },
-    },
-}};
+/// Built once at launch, so a language change reaches it after a restart.
+fn appMenus(comptime lang: i18n.Lang) [1]native_sdk.platform.Menu {
+    return .{.{
+        .title = i18n.pick(lang, "Pet", "ペット"),
+        .items = &.{
+            .{ .label = i18n.pick(lang, "Settings...", "設定…"), .command = "petdex.settings", .key = ",", .modifiers = .{ .primary = true } },
+            .{ .label = i18n.pick(lang, "Chat...", "チャット…"), .command = "petdex.chat", .key = "k", .modifiers = .{ .primary = true } },
+            .{ .separator = true },
+            .{ .label = i18n.pick(lang, "Close Pet", "ペットを閉じる"), .command = "petdex.close", .key = "w", .modifiers = .{ .primary = true } },
+        },
+    }};
+}
+const app_menus_en = appMenus(.en);
+const app_menus_ja = appMenus(.ja);
 
 const PetdexApp = native_sdk.UiApp(Model, Msg);
 
@@ -5044,7 +5061,7 @@ pub fn main(init: std.process.Init) !void {
         // chromeless desktop pet that looks like a titlebar and also
         // steals vertical space; Linux already exposes these commands
         // through the pet's context menu.
-        .menus = if (builtin.target.os.tag == .linux) &.{} else &app_menus,
+        .menus = if (builtin.target.os.tag == .linux) &.{} else if (i18n.current == .ja) &app_menus_ja else &app_menus_en,
         .security = .{
             .permissions = &app_permissions,
             .navigation = .{ .allowed_origins = &.{ "zero://inline", "zero://app" } },
@@ -5290,12 +5307,56 @@ test "install queue keeps activation per pet" {
 test "empty-state copy fits the pet window" {
     // The label truncates rather than wrapping, and the window is 192pt,
     // so a sentence renders as an ellipsis (which is how the first
-    // attempt shipped). Every line has to stand alone.
-    const longest = "Pets found,\nnone could\nbe drawn.\n\nLinux needs\nwebp-pixbuf-\nloader.";
-    var it = std.mem.splitScalar(u8, longest, '\n');
-    while (it.next()) |line| {
-        try std.testing.expect(line.len <= 14);
+    // attempt shipped). Every line has to stand alone; a full-width
+    // character takes two columns.
+    defer i18n.current = .en;
+    for ([_]i18n.Lang{ .en, .ja }) |lang| {
+        i18n.current = lang;
+        for ([_]std.Target.Os.Tag{ .linux, .macos }) |os| {
+            for ([_]bool{ false, true }) |has_pets| {
+                var it = std.mem.splitScalar(u8, emptyStateCopy(os, has_pets), '\n');
+                while (it.next()) |line| {
+                    var columns: usize = 0;
+                    var codepoints = (try std.unicode.Utf8View.init(line)).iterator();
+                    while (codepoints.nextCodepoint()) |cp| columns += if (cp < 0x80) 1 else 2;
+                    try std.testing.expect(columns <= 14);
+                }
+            }
+        }
     }
+}
+
+test "menus fit the SDK's label limits in both languages" {
+    for ([_][6]AppUi.ContextMenuItem{ pet_menu_en, pet_menu_ja }) |menu| {
+        for (menu) |item| try std.testing.expect(item.label.len <= 128);
+    }
+    for ([_][1]native_sdk.platform.Menu{ app_menus_en, app_menus_ja }) |menus| {
+        try std.testing.expect(menus[0].title.len <= 64);
+        for (menus[0].items) |item| try std.testing.expect(item.label.len <= 128);
+    }
+}
+
+test "the tray speaks Japanese and keeps the version in its update label" {
+    i18n.current = .ja;
+    defer i18n.current = .en;
+    var model: Model = .{};
+    var scratch: PetdexApp.StatusItemScratch = undefined;
+    const tray = petdexStatusItem(&model, &scratch);
+    try std.testing.expectEqualStrings("設定…", tray.items[0].label);
+    var buf: [96]u8 = undefined;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "アップデートを確認… · {s}", .{updates.current_version}), tray.items[10].label);
+    for (tray.items) |item| try std.testing.expect(item.label.len <= 128);
+}
+
+test "hook cards and install errors in Japanese" {
+    i18n.current = .ja;
+    defer i18n.current = .en;
+    var model: Model = .{};
+    testPushBubble(&model, "alpha", "Refactored the parser.", true, -1);
+    try std.testing.expectEqualStrings("作業中", bubbleStatus(&model, 0));
+    // The longest install error, with a slug at the length limit.
+    model.install.setError("{s}: spritesheet download failed", "{s}：スプライトシートをダウンロードできませんでした。", .{"a" ** 64});
+    try std.testing.expect(model.install.error_len > 0);
 }
 
 test "update checks stay daily across a long-lived process" {
