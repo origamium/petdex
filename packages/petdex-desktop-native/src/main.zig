@@ -47,7 +47,11 @@ const geometry = native_sdk.geometry;
 const canvas_label = "pet-canvas";
 pub const frame_w: f32 = 192;
 pub const frame_h: f32 = 208;
-const max_scale: f32 = 1.2;
+/// The Pet size slider's range. The startup window in app.zon is the
+/// frame at max_scale; on a 1x display even that range's old top of 1.2
+/// read small.
+pub const min_scale: f32 = 0.4;
+pub const max_scale: f32 = 2.0;
 const pet_edge_pad: f32 = 8;
 const win_w: f32 = frame_w * max_scale;
 // Linux keeps the startup canvas fixed instead of resizing it to the sprite.
@@ -271,8 +275,8 @@ pub const Model = struct {
     press_ms: i64 = 0,
     pat_flip: bool = false,
     settings_open: bool = false,
-    /// Sprite scale, persisted. Codex parity: the settings slider maps
-    /// 0.4..1.2 over this.
+    /// Sprite scale, persisted. The settings slider maps min_scale..
+    /// max_scale over this.
     scale: f32 = 0.7,
     language: i18n.Pref = .auto,
     active_pet: u32 = 0,
@@ -1864,7 +1868,7 @@ fn resolveInitialPet(io: std.Io, allocator: std.mem.Allocator, environ_map: *std
         if (cReadFile(path, &settings_buf)) |json| {
             if (hook_server.jsonStringPub(json, "active_pet")) |v| wanted = v;
             if (hook_server.jsonNumberPub(json, "scale")) |v| {
-                if (v >= 0.3 and v <= 1.5) initial_scale = @floatCast(v);
+                if (v >= 0.3 and v <= max_scale) initial_scale = @floatCast(v);
             }
             if (hook_server.jsonNumberPub(json, "bubble_text")) |v| {
                 if (v >= bubble_text_min_px and v <= bubble_text_max_px) initial_bubble_text_px = @floatCast(v);
@@ -2956,7 +2960,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .shuffle_pet => advancePet(model, fx),
         .quit_app => plat.requestQuit(),
         .set_scale => |fraction| {
-            model.scale = 0.4 + fraction * 0.8;
+            model.scale = min_scale + fraction * (max_scale - min_scale);
             _ = fitWindow(model, fx);
             saveSettings(model);
         },

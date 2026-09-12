@@ -563,7 +563,7 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
             shown += 1;
         }
     }
-    const scale_fraction: f32 = (model.scale - 0.4) / 0.8;
+    const scale_fraction: f32 = (model.scale - app.min_scale) / (app.max_scale - app.min_scale);
     const bubble_text_fraction: f32 = (model.bubble_text_px - bubble_text_min_px) / (bubble_text_max_px - bubble_text_min_px);
     // One scrollable page: the root scroll takes the window frame and
     // everything - full pet catalog included - flows inside it. No

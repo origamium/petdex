@@ -30,8 +30,8 @@
             .{
                 .label = "main",
                 .title = "Petdex",
-                .width = 231,
-                .height = 250,
+                .width = 384,
+                .height = 416,
                 .resizable = false,
                 .titlebar = "chromeless",
                 .floating = true,
