@@ -3485,19 +3485,22 @@ fn cardButtonRect(model: *const Model, slot: usize) HookRect {
     };
 }
 
-/// The slot whose card button is under a window-local point, once its
-/// card is fully open.
+/// The slot whose card button is under a window-local point, among the
+/// cards that are fully open.
 fn cardButtonHit(model: *const Model, x: f32, y: f32) ?usize {
-    const index = model.hook_sim.openIndex() orelse return null;
-    const slot = hookSlot(model, model.hook_sim.bodies[index].id) orelse return null;
-    if (bubbleDestination(&model.bubbles[slot]) == .none) return null;
-    const s = bubble_sim.shape(model.hook_sim.bodies[index], hookLayout(model));
-    if (s.open < 0.99) return null;
-    const r = cardButtonRect(model, slot);
-    const left = s.x - s.w / 2 + r.x;
-    const top = s.y - s.h / 2 + r.y;
-    if (x < left or x > left + r.w or y < top or y > top + r.h) return null;
-    return slot;
+    const layout = hookLayout(model);
+    for (model.hook_sim.bodies, 0..) |body, index| {
+        if (!model.hook_sim.isOpen(index)) continue;
+        const slot = hookSlot(model, body.id) orelse continue;
+        if (bubbleDestination(&model.bubbles[slot]) == .none) continue;
+        const s = model.hook_sim.shapeAt(index, layout);
+        if (s.open < 0.99) continue;
+        const r = cardButtonRect(model, slot);
+        const left = s.x - s.w / 2 + r.x;
+        const top = s.y - s.h / 2 + r.y;
+        if (x >= left and x <= left + r.w and y >= top and y <= top + r.h) return slot;
+    }
+    return null;
 }
 
 /// How many lines the card for `slot` holds: the project and the status,
@@ -3528,11 +3531,6 @@ fn bubbleSettingsLine(ui: *AppUi, bubble: *const hook_server.Bubble) ?[]const u8
     return null;
 }
 
-/// The mailbox slot of the bubble open as a card, if any.
-fn openSlot(model: *const Model) ?usize {
-    const index = model.hook_sim.openIndex() orelse return null;
-    return hookSlot(model, model.hook_sim.bodies[index].id);
-}
 
 /// The card's first line: the project the agent works in (the last part
 /// of its cwd), else the session title, else the agent.
@@ -3573,10 +3571,10 @@ fn bubbleStatus(model: *const Model, slot: usize) []const u8 {
     };
 }
 
-/// The window holds the bubbles that keep a place, and the card when one
-/// is open. It changes only when those do, never per frame of motion.
+/// The window holds the bubbles that keep a place, and every open card.
+/// It changes only when those do, never per frame of motion.
 fn bubbleWindowHeight(model: *const Model) f32 {
-    return bubble_sim.contentHeight(model.hook_sim.stayingCount(), model.hook_sim.openIndex() != null, bubbleCardHeight(model, openSlot(model)));
+    return model.hook_sim.contentHeightFor(hookCardHeights(model));
 }
 
 fn bubbleFontSize(model: *const Model) f32 {
@@ -3603,14 +3601,26 @@ fn bubbleActive(model: *const Model) bool {
 }
 
 fn hookLayout(model: *const Model) bubble_sim.Layout {
+    const heights = hookCardHeights(model);
     return .{
         .width = bubble_window_width,
-        .height = bubbleWindowHeight(model),
+        .height = model.hook_sim.contentHeightFor(heights),
         .flipped = model.bubble_flipped,
         .card_w = bubble_card_width,
-        .card_h = bubbleCardHeight(model, openSlot(model)),
+        .card_heights = heights,
         .card_radius = bubble_card_radius,
     };
+}
+
+/// Each body's card height. Only a card that is open, or on its way open
+/// or shut, is measured; the rest never show theirs.
+fn hookCardHeights(model: *const Model) [bubble_sim.capacity]f32 {
+    var heights: [bubble_sim.capacity]f32 = @splat(bubbleCardHeight(model, null));
+    for (model.hook_sim.bodies, 0..) |body, i| {
+        if (!body.live() or (!body.opened and body.open == 0)) continue;
+        if (hookSlot(model, body.id)) |slot| heights[i] = bubbleCardHeight(model, slot);
+    }
+    return heights;
 }
 
 /// A conversation's identity in the simulation: its agent and session.
@@ -4251,7 +4261,7 @@ fn agentLogo(ui: *AppUi, index: usize, size: f32) AppUi.Node {
 /// when opened.
 fn hookBubble(ui: *AppUi, model: *const Model, index: usize, layout: bubble_sim.Layout) AppUi.Node {
     const body = model.hook_sim.bodies[index];
-    const s = bubble_sim.shape(body, layout);
+    const s = model.hook_sim.shapeAt(index, layout);
     const slot = hookSlot(model, body.id);
     // Past halfway into the card, the text takes over from the lone logo.
     const show_card = s.open > 0.5 and slot != null;
@@ -4418,18 +4428,13 @@ fn bubbleView(ui: *AppUi, model: *const Model) AppUi.Node {
     const layout = hookLayout(model);
     var nodes: [bubble_sim.capacity]AppUi.Node = undefined;
     var count: usize = 0;
-    const open = model.hook_sim.openIndex();
-    for (model.hook_sim.bodies, 0..) |body, i| {
-        if (!body.live()) continue;
-        if (open) |o| {
-            if (o == i) continue;
+    // Bubbles first, open cards over them.
+    for ([_]bool{ false, true }) |cards| {
+        for (model.hook_sim.bodies, 0..) |body, i| {
+            if (!body.live() or body.opened != cards) continue;
+            nodes[count] = hookBubble(ui, model, i, layout);
+            count += 1;
         }
-        nodes[count] = hookBubble(ui, model, i, layout);
-        count += 1;
-    }
-    if (open) |i| {
-        nodes[count] = hookBubble(ui, model, i, layout);
-        count += 1;
     }
     var root = ui.el(.stack, .{ .grow = 1, .on_press = .hook_press }, @as([]const AppUi.Node, nodes[0..count]));
     // A new window opens where the platform puts it (screen center on
@@ -5430,7 +5435,7 @@ test "the bubble window holds a row whatever the text, and grows by the card whe
     testPushBubble(&model, "alpha", "a much longer line of bubble text than any card could hold on one line", true, -1);
     syncHookSim(&model);
     const closed = bubbleWindowHeight(&model);
-    try std.testing.expectEqual(bubble_sim.contentHeight(1, false, 0), closed);
+    try std.testing.expectEqual(bubble_sim.contentHeight(1, &.{}), closed);
     model.hook_sim.toggle(0);
     const open = bubbleWindowHeight(&model);
     try std.testing.expect(open > closed);
@@ -5984,14 +5989,29 @@ test "a press on the open card's button belongs to the button" {
     model.hook_sim.toggle(0);
     // The button answers once the card has finished opening.
     for (0..30) |_| model.hook_sim.step(1.0 / 30.0, hookLayout(&model));
-    const index = model.hook_sim.openIndex().?;
-    const s = bubble_sim.shape(model.hook_sim.bodies[index], hookLayout(&model));
+    try std.testing.expect(model.hook_sim.isOpen(0));
+    const s = model.hook_sim.shapeAt(0, hookLayout(&model));
     const r = cardButtonRect(&model, 0);
     const left = s.x - s.w / 2;
     const top = s.y - s.h / 2;
     try std.testing.expectEqual(@as(?usize, 0), cardButtonHit(&model, left + r.x + r.w / 2, top + r.y + r.h / 2));
     // The title line above it is the card's.
     try std.testing.expectEqual(@as(?usize, null), cardButtonHit(&model, left + r.x + 4, top + bubble_card_padding + 2));
+}
+
+test "several cards can be open at once, and the window holds them all" {
+    var model: Model = .{};
+    testPushBubble(&model, "a", "one", true, -1);
+    testPushBubble(&model, "b", "two", true, -1);
+    syncHookSim(&model);
+    const closed = bubbleWindowHeight(&model);
+    model.hook_sim.toggle(0);
+    const one = bubbleWindowHeight(&model);
+    model.hook_sim.toggle(1);
+    const two = bubbleWindowHeight(&model);
+    try std.testing.expect(one > closed);
+    try std.testing.expect(two > one);
+    try std.testing.expect(model.hook_sim.isOpen(0) and model.hook_sim.isOpen(1));
 }
 
 test "a seventh conversation starts a second row of bubbles" {

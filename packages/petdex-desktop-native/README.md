@@ -53,7 +53,7 @@ the agent and its status, the model and reasoning effort when the agent
 reports them (Claude Code, Codex, OpenCode), and the first lines of what it is
 doing or last said. When the agent runs in Warp (2026.05 or later) or in
 Terminal, the card also brings its pane or tab to the front. Click again to
-close it. A finished bubble stays with a green check, its card and terminal
+close it. Any number can be open; the cards stack without overlapping. A finished bubble stays with a green check, its card and terminal
 still a click away, until you clear the bubbles from the pet's menu or the
 tray, or its lifetime in Settings runs out. Up to ten conversations float at
 once; past that, the one idle longest makes way.
