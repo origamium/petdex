@@ -188,24 +188,30 @@ fn textWidth(model: *const Model, text: []const u8) f32 {
     return canvas.measureTextWidthForFont(tokens.text_measure, font, text, tokens.typography.body_size);
 }
 
-const Fit = struct { lines: usize, cut: usize };
+pub const Fit = struct { lines: usize, cut: usize };
 
 /// How `text` wraps at `width` in body text, up to `max` lines: the line
 /// count and the byte where the text must be cut to stay within them.
 /// Uses the SDK's own line breaker with the tokens' measurement, so it
 /// matches the paragraph painted from it.
 fn fit(model: *const Model, text: []const u8, width: f32, comptime max: usize) Fit {
+    return fitSized(model, text, width, app.petdexTokens(model).typography.body_size, lineHeight(model), max);
+}
+
+/// fit at any text size: the hook bubble's card measures its text at the
+/// bubble text size.
+pub fn fitSized(model: *const Model, text: []const u8, width: f32, size: f32, line_height: f32, comptime max: usize) Fit {
     const tokens = app.petdexTokens(model);
     var lines: [max + 1]canvas.TextLine = undefined;
     const count = if (canvas.layoutTextRun(.{
         .font_id = canvas.textSpanFontId(.{ .text = "" }, tokens.typography),
-        .size = tokens.typography.body_size,
+        .size = size,
         .origin = .{ .x = 0, .y = 0 },
         .color = tokens.colors.text,
         .text = text,
     }, .{
         .max_width = width,
-        .line_height = lineHeight(model),
+        .line_height = line_height,
         .measure = tokens.text_measure,
     }, &lines)) |layout| layout.lineCount() else |_| lines.len;
     if (count <= max) return .{ .lines = @max(1, count), .cut = text.len };
@@ -216,7 +222,7 @@ fn fit(model: *const Model, text: []const u8, width: f32, comptime max: usize) F
 }
 
 /// `text` cut to fit, an ellipsis standing in for the rest.
-fn clipped(ui: *AppUi, text: []const u8, f: Fit) []const u8 {
+pub fn clipped(ui: *AppUi, text: []const u8, f: Fit) []const u8 {
     if (f.cut >= text.len) return text;
     // Two characters back, so the ellipsis stays on the last line.
     var cut = f.cut;

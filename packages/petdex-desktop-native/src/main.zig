@@ -3368,9 +3368,17 @@ const bubble_card_padding: f32 = 12;
 pub const bubble_card_radius: f32 = 18;
 const bubble_line_gap: f32 = 2;
 const bubble_canvas_margin: f32 = bubble_sim.margin;
-/// The logo inside a bubble, and its status dot.
+/// The logo inside a bubble, its waiting dot, and its error badge.
 const hook_bubble_icon: f32 = 22;
 const hook_dot: f32 = 9;
+const hook_badge: f32 = 14;
+/// The light behind a bubble waiting on the user: how far it reaches past
+/// the bubble, and one breath in seconds.
+const hook_glow_spread: f32 = 4;
+const hook_glow_period_s: f32 = 1.6;
+/// The card's text column, and how many lines of the bubble's text it shows.
+const bubble_text_width: f32 = bubble_card_width - bubble_card_padding * 2 - bubble_avatar_width - bubble_content_gap;
+const bubble_text_max_lines = 3;
 /// The simulation's clock, running only while a bubble is on screen.
 const hook_tick_key: u64 = 0xb0bb1e;
 const hook_tick_interval_ms: u32 = 33;
@@ -3413,14 +3421,53 @@ fn bubbleLifetimeExpired(deadline_ms: i64, now_ms: i64, state: State) bool {
 fn bubbleContentHeight(model: *const Model, row_count: usize) f32 {
     if (row_count == 0) return 0;
     const rows = @as(f32, @floatFromInt(row_count));
-    return rows * bubbleFontSize(model) * 1.35 + @as(f32, @floatFromInt(row_count - 1)) * bubble_line_gap;
+    return rows * bubbleLineHeight(model) + @as(f32, @floatFromInt(row_count - 1)) * bubble_line_gap;
+}
+
+fn bubbleLineHeight(model: *const Model) f32 {
+    return bubbleFontSize(model) * 1.35;
 }
 
 /// Every card holds the same two lines: the project, then the agent and
 /// what it needs.
-fn bubbleCardHeight(model: *const Model) f32 {
-    const inner = @max(bubbleContentHeight(model, 2), bubble_avatar_width);
+fn bubbleCardHeight(model: *const Model, slot: ?usize) f32 {
+    const lines = if (slot) |s| bubbleCardLines(model, s) else 2;
+    const inner = @max(bubbleContentHeight(model, lines), bubble_avatar_width);
     return @ceil(inner + bubble_card_padding * 2);
+}
+
+/// How many lines the card for `slot` holds: the project and the status,
+/// the model line when known, and the text's first lines, three at most.
+fn bubbleCardLines(model: *const Model, slot: usize) usize {
+    const bubble = &model.bubbles[slot];
+    var lines: usize = 2;
+    if (bubble.model_len > 0 or bubble.effort_len > 0) lines += 1;
+    var buf: [256]u8 = undefined;
+    const text = bubbleCardText(bubble, &buf);
+    if (text.len > 0) lines += chat_view.fitSized(model, text, bubble_text_width, bubbleFontSize(model), bubbleLineHeight(model), bubble_text_max_lines).lines;
+    return lines;
+}
+
+/// The bubble's text as the card shows it. It arrives JSON-escaped.
+fn bubbleCardText(bubble: *const hook_server.Bubble, buf: *[256]u8) []const u8 {
+    const text = jsonUnescapeString(bubble.text[0..bubble.text_len], buf) orelse return "";
+    return std.mem.trim(u8, text, " \n");
+}
+
+/// "claude-opus-5 · high", or whichever of the two is known.
+fn bubbleSettingsLine(ui: *AppUi, bubble: *const hook_server.Bubble) ?[]const u8 {
+    const name = bubble.modelSlice();
+    const effort = bubble.effortSlice();
+    if (name.len > 0 and effort.len > 0) return ui.fmt("{s} · {s}", .{ name, effort });
+    if (name.len > 0) return name;
+    if (effort.len > 0) return effort;
+    return null;
+}
+
+/// The mailbox slot of the bubble open as a card, if any.
+fn openSlot(model: *const Model) ?usize {
+    const index = model.hook_sim.openIndex() orelse return null;
+    return hookSlot(model, model.hook_sim.bodies[index].id);
 }
 
 /// The card's first line: the project the agent works in (the last part
@@ -3465,7 +3512,7 @@ fn bubbleStatus(model: *const Model, slot: usize) []const u8 {
 /// The window holds the bubbles that keep a place, and the card when one
 /// is open. It changes only when those do, never per frame of motion.
 fn bubbleWindowHeight(model: *const Model) f32 {
-    return bubble_sim.contentHeight(model.hook_sim.stayingCount(), model.hook_sim.openIndex() != null, bubbleCardHeight(model));
+    return bubble_sim.contentHeight(model.hook_sim.stayingCount(), model.hook_sim.openIndex() != null, bubbleCardHeight(model, openSlot(model)));
 }
 
 fn bubbleFontSize(model: *const Model) f32 {
@@ -3497,7 +3544,7 @@ fn hookLayout(model: *const Model) bubble_sim.Layout {
         .height = bubbleWindowHeight(model),
         .flipped = model.bubble_flipped,
         .card_w = bubble_card_width,
-        .card_h = bubbleCardHeight(model),
+        .card_h = bubbleCardHeight(model, openSlot(model)),
         .card_radius = bubble_card_radius,
     };
 }
@@ -4069,19 +4116,39 @@ pub fn styleSpeechCard(node: *AppUi.Node, dark: bool) void {
     }
 }
 
-/// An opened bubble's content: the agent's logo, then the project and
-/// "<Agent> - <Status>", one line each.
+/// An opened bubble's content: the agent's logo beside the project,
+/// "<Agent> - <Status>", the model and effort when known, and the first
+/// lines of what the agent said or is doing.
 fn bubbleCard(ui: *AppUi, model: *const Model, slot: usize) AppUi.Node {
     const bubble = &model.bubbles[slot];
     const title_fg = if (model.dark) canvas.Color.rgb8(237, 237, 238) else canvas.Color.rgb8(17, 17, 17);
     const muted_fg = if (model.dark) canvas.Color.rgb8(156, 158, 168) else canvas.Color.rgb8(88, 92, 106);
+    var rows: [4]AppUi.Node = undefined;
     var project = ui.paragraph(.{ .size = .heading, .wrap = false }, &.{.{ .text = bubbleProject(bubble), .weight = .bold }});
     project.widget.style.foreground = title_fg;
+    rows[0] = project;
     var status = ui.text(.{ .size = .heading }, ui.fmt("{s} - {s}", .{ bubbleAgentName(bubble), bubbleStatus(model, slot) }));
     status.widget.style.foreground = muted_fg;
-    return ui.row(.{ .gap = bubble_content_gap, .cross = .center }, .{
+    rows[1] = status;
+    var count: usize = 2;
+    if (bubbleSettingsLine(ui, bubble)) |line| {
+        var settings = ui.text(.{ .size = .heading }, line);
+        settings.widget.style.foreground = muted_fg;
+        rows[count] = settings;
+        count += 1;
+    }
+    var buf: [256]u8 = undefined;
+    const text = bubbleCardText(bubble, &buf);
+    if (text.len > 0) {
+        const f = chat_view.fitSized(model, text, bubble_text_width, bubbleFontSize(model), bubbleLineHeight(model), bubble_text_max_lines);
+        var said = ui.paragraph(.{ .size = .heading }, &.{.{ .text = chat_view.clipped(ui, text, f) }});
+        said.widget.style.foreground = muted_fg;
+        rows[count] = said;
+        count += 1;
+    }
+    return ui.row(.{ .gap = bubble_content_gap, .cross = .start }, .{
         agentLogo(ui, agentIconIndex(bubble.agent[0..bubble.agent_len]), bubble_avatar_width),
-        ui.column(.{ .grow = 1, .height = bubbleContentHeight(model, 2), .gap = bubble_line_gap, .main = .start, .cross = .start }, .{ project, status }),
+        ui.column(.{ .grow = 1, .height = bubbleContentHeight(model, bubbleCardLines(model, slot)), .gap = bubble_line_gap, .main = .start, .cross = .start }, @as([]const AppUi.Node, rows[0..count])),
     });
 }
 
@@ -4119,25 +4186,30 @@ fn hookBubble(ui: *AppUi, model: *const Model, index: usize, layout: bubble_sim.
     panel.widget.style.radius = s.radius;
     if (slot) |i| panel.widget.semantics.label = ui.fmt("{s} - {s}", .{ bubbleAgentName(&model.bubbles[i]), bubbleStatus(model, i) });
 
-    var parts: [2]AppUi.Node = .{ panel, undefined };
-    var len: usize = 1;
-    const dot_color: ?canvas.Color = switch (body.status) {
-        .waiting => if (model.dark) canvas.Color.rgb8(255, 159, 10) else canvas.Color.rgb8(255, 149, 0),
-        .failed => if (model.dark) canvas.Color.rgb8(255, 69, 58) else canvas.Color.rgb8(255, 59, 48),
-        .working, .done => null,
-    };
-    if (dot_color) |color| {
-        if (!show_card) {
-            var dot = ui.el(.panel, .{ .width = hook_dot, .height = hook_dot }, .{});
-            dot.widget.style.background = color;
-            dot.widget.style.radius = hook_dot / 2;
-            // A ring of the bubble's own face parts the dot from its edge.
-            dot.widget.style.stroke_width = 1.5;
-            dot.widget.style.border = if (model.dark) canvas.Color.rgb8(25, 25, 28) else canvas.Color.rgb8(255, 255, 255);
-            // On the circle's rim, up and to the right.
-            dot.widget.transform = canvas.Affine.translate(s.w * 0.854 - hook_dot / 2, s.h * 0.146 - hook_dot / 2);
-            parts[1] = dot;
-            len = 2;
+    // Behind the bubble, the light of one waiting on the user; on its rim,
+    // an orange dot for the same, or a red badge with "!" for an error.
+    // An open card says it in words instead.
+    var parts: [3]AppUi.Node = undefined;
+    var len: usize = 0;
+    const orange = if (model.dark) canvas.Color.rgb8(255, 159, 10) else canvas.Color.rgb8(255, 149, 0);
+    const red = if (model.dark) canvas.Color.rgb8(255, 69, 58) else canvas.Color.rgb8(255, 59, 48);
+    if (body.status == .waiting and !show_card) {
+        parts[len] = hookGlow(ui, model, s, orange);
+        len += 1;
+    }
+    parts[len] = panel;
+    len += 1;
+    if (!show_card) {
+        switch (body.status) {
+            .waiting => {
+                parts[len] = rimMark(ui, model, s, hook_dot, orange);
+                len += 1;
+            },
+            .failed => {
+                parts[len] = hookBadge(ui, model, s, red);
+                len += 1;
+            },
+            .working, .done => {},
         }
     }
     var group = ui.el(.stack, .{ .width = s.w, .height = s.h }, @as([]const AppUi.Node, parts[0..len]));
@@ -4149,6 +4221,54 @@ fn hookBubble(ui: *AppUi, model: *const Model, index: usize, layout: bubble_sim.
         .multiply(canvas.Affine.translate(-s.w / 2, -s.h / 2));
     group.widget.opacity = s.alpha;
     return group;
+}
+
+/// A round mark of `size` on the bubble's rim, up and to the right, ringed
+/// in the bubble's own face so it parts from the edge.
+fn rimMark(ui: *AppUi, model: *const Model, s: bubble_sim.Shape, size: f32, color: canvas.Color) AppUi.Node {
+    var mark = ui.el(.panel, .{ .width = size, .height = size }, .{});
+    mark.widget.style.background = color;
+    mark.widget.style.radius = size / 2;
+    mark.widget.style.stroke_width = 1.5;
+    mark.widget.style.border = if (model.dark) canvas.Color.rgb8(25, 25, 28) else canvas.Color.rgb8(255, 255, 255);
+    mark.widget.transform = canvas.Affine.translate(s.w * 0.854 - size / 2, s.h * 0.146 - size / 2);
+    return mark;
+}
+
+/// The error badge: a red rim mark with an exclamation point drawn from
+/// two white strokes, so it reads at any text size.
+fn hookBadge(ui: *AppUi, model: *const Model, s: bubble_sim.Shape, color: canvas.Color) AppUi.Node {
+    var circle = rimMark(ui, model, s, hook_badge, color);
+    circle.widget.transform = canvas.Affine.identity();
+    const white = canvas.Color.rgb8(255, 255, 255);
+    var bar = ui.el(.panel, .{ .width = 2, .height = 6 }, .{});
+    bar.widget.style.background = white;
+    bar.widget.style.radius = 1;
+    bar.widget.transform = canvas.Affine.translate(hook_badge / 2 - 1, 3);
+    var point = ui.el(.panel, .{ .width = 2, .height = 2 }, .{});
+    point.widget.style.background = white;
+    point.widget.style.radius = 1;
+    point.widget.transform = canvas.Affine.translate(hook_badge / 2 - 1, 10);
+    var badge = ui.el(.stack, .{ .width = hook_badge, .height = hook_badge }, .{ circle, bar, point });
+    badge.widget.transform = canvas.Affine.translate(s.w * 0.854 - hook_badge / 2, s.h * 0.146 - hook_badge / 2);
+    return badge;
+}
+
+/// The light behind a bubble waiting on the user: it swells and fades on
+/// the simulation's clock, and holds still under Reduce Motion.
+fn hookGlow(ui: *AppUi, model: *const Model, s: bubble_sim.Shape, color: canvas.Color) AppUi.Node {
+    const breath: f32 = if (model.reduce_motion) 0.5 else 0.5 + 0.5 * @sin(model.hook_sim.t * std.math.tau / hook_glow_period_s);
+    const size = s.w + hook_glow_spread * 2;
+    var glow = ui.el(.panel, .{ .width = size, .height = size }, .{});
+    glow.widget.style.background = color;
+    glow.widget.style.radius = size / 2;
+    glow.widget.opacity = 0.15 + 0.3 * breath;
+    // Centered on the bubble and scaled about that center.
+    const scale = 1 + 0.15 * breath;
+    glow.widget.transform = canvas.Affine.translate(s.w / 2, s.h / 2)
+        .multiply(canvas.Affine.scale(scale, scale))
+        .multiply(canvas.Affine.translate(-size / 2, -size / 2));
+    return glow;
 }
 
 /// The hook bubbles, floating where bubble_sim has them, the open card
@@ -4884,7 +5004,7 @@ test "bubble title and status stay in one compact text block" {
     var ui = AppUi.init(arena.allocator());
     const card = bubbleCard(&ui, &model, 0);
     const text_column = card.nodes[1].widget;
-    try std.testing.expectEqual(bubbleContentHeight(&model, 2), text_column.layout.min_size.height);
+    try std.testing.expectEqual(bubbleContentHeight(&model, bubbleCardLines(&model, 0)), text_column.layout.min_size.height);
     try std.testing.expectEqual(text_column.layout.min_size.height, text_column.layout.max_size.height);
 }
 
@@ -5651,6 +5771,42 @@ test "closing the pet clears its bubble and closes both windows" {
     try std.testing.expectEqualStrings("bubble", close_pet_window_labels[0]);
     try std.testing.expectEqualStrings("main", close_pet_window_labels[1]);
     try std.testing.expectEqualStrings("main", fx.windowActionState().lastLabel());
+}
+
+test "the card grows by the model line and the text's first lines" {
+    var model: Model = .{};
+    testPushBubble(&model, "alpha", "", true, -1);
+    try std.testing.expectEqual(@as(usize, 2), bubbleCardLines(&model, 0));
+    const bare = bubbleCardHeight(&model, 0);
+    const name = "claude-opus-5";
+    @memcpy(model.bubbles[0].model[0..name.len], name);
+    model.bubbles[0].model_len = name.len;
+    const with_model = bubbleCardHeight(&model, 0);
+    try std.testing.expect(with_model > bare);
+    // Four lines of text: the card shows three.
+    const text = "one\\ntwo\\nthree\\nfour";
+    @memcpy(model.bubbles[0].text[0..text.len], text);
+    model.bubbles[0].text_len = text.len;
+    try std.testing.expectEqual(@as(usize, 2 + 1 + bubble_text_max_lines), bubbleCardLines(&model, 0));
+    try std.testing.expect(bubbleCardHeight(&model, 0) > with_model);
+}
+
+test "an error wears a badge, and waiting on the user glows, still or not" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ui = AppUi.init(arena.allocator());
+    var model: Model = .{};
+    model.hook_sim.bodies[0] = .{ .id = 1, .status = .failed, .born = 1 };
+    const layout = hookLayout(&model);
+    // The bubble and its badge.
+    try std.testing.expectEqual(@as(usize, 2), hookBubble(&ui, &model, 0, layout).nodes.len);
+    // The light, the bubble and its dot.
+    model.hook_sim.bodies[0].status = .waiting;
+    try std.testing.expectEqual(@as(usize, 3), hookBubble(&ui, &model, 0, layout).nodes.len);
+    model.reduce_motion = true;
+    try std.testing.expectEqual(@as(usize, 3), hookBubble(&ui, &model, 0, layout).nodes.len);
+    model.hook_sim.bodies[0].status = .working;
+    try std.testing.expectEqual(@as(usize, 1), hookBubble(&ui, &model, 0, layout).nodes.len);
 }
 
 test "a seventh conversation starts a second row of bubbles" {
