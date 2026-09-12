@@ -51,8 +51,11 @@ agents and your last conversation, in its own voice. Cmd+K, the tray and the
 pet's menu toggle the chat. Choose ChatGPT or a local OpenAI-compatible server
 (LM Studio, Ollama) under Settings → Chat.
 
-The persona comes from the pet's `pet.json` (`displayName`, `description`);
-`~/.petdex/personas/<slug>.md` replaces it. Until a reply's first words arrive,
+The persona comes from the pet's `pet.json` (`displayName`, `description`). A
+`persona.md` next to `pet.json` describes the character in more depth, and
+`~/.petdex/personas/<slug>.md` overrides it for your own copy; either stands in
+for the description. The app keeps the framing: a desktop pet that answers in
+one to three short sentences of plain text. Until a reply's first words arrive,
 the chat shows one of the pet's `thinking` lines, picked at random, or
 "Thinking…" when it has none:
 

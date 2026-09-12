@@ -1,6 +1,7 @@
 //! The character's system prompt. Built from the pet's own pet.json
-//! (displayName, description); `~/.petdex/personas/<slug>.md`, when the
-//! shell finds one, replaces it wholesale.
+//! (displayName, description); a persona.md beside it, or the user's
+//! `~/.petdex/personas/<slug>.md`, describes the character instead. The
+//! app's framing and reply rules always apply.
 
 const std = @import("std");
 const domain = @import("domain.zig");
@@ -45,16 +46,20 @@ fn nonEmpty(value: ?[]const u8) ?[]const u8 {
     return if (v.len == 0) null else v;
 }
 
-pub fn build(out: *[max_bytes]u8, slug: []const u8, info: PetInfo, override: ?[]const u8) []const u8 {
-    if (nonEmpty(override)) |text| {
-        const kept = domain.utf8Floor(text, out.len);
-        @memcpy(out[0..kept.len], kept);
-        return out[0..kept.len];
-    }
+/// The system prompt. `character` is a character sheet in its author's
+/// own words (the pet's persona.md, or the user's override) and stands in
+/// for pet.json's description. The framing and the reply rules stay the
+/// app's, because the bubble shows a few lines of plain text; they come
+/// first, so a sheet cut at the budget never costs them.
+pub fn build(out: *[max_bytes]u8, slug: []const u8, info: PetInfo, character: ?[]const u8) []const u8 {
     var w: std.Io.Writer = .fixed(out);
     w.print("You are {s}, a small desktop pet who lives on the user's screen next to their work.\n", .{info.name orelse slug}) catch {};
-    if (info.description) |d| w.print("About you: {s}\n", .{domain.utf8Floor(d, max_description_bytes)}) catch {};
     w.writeAll("Stay in character. Reply in the language the user writes in, in one to three short sentences of plain text without markdown.") catch {};
+    if (nonEmpty(character)) |sheet| {
+        w.print("\n\nYour character:\n{s}", .{sheet}) catch {};
+    } else if (info.description) |d| {
+        w.print("\nAbout you: {s}", .{domain.utf8Floor(d, max_description_bytes)}) catch {};
+    }
     return domain.utf8Floor(w.buffered(), out.len);
 }
 
@@ -151,18 +156,25 @@ test "the default prompt names the pet and carries its description" {
     var out: [max_bytes]u8 = undefined;
     const prompt = build(&out, "kozeki-ui", .{ .name = "古関ウイ", .description = "古書館の司書。" }, null);
     try t.expect(std.mem.startsWith(u8, prompt, "You are 古関ウイ,"));
-    try t.expect(std.mem.indexOf(u8, prompt, "About you: 古書館の司書。\n") != null);
-    try t.expect(std.mem.endsWith(u8, prompt, "without markdown."));
+    try t.expect(std.mem.indexOf(u8, prompt, "without markdown.") != null);
+    try t.expect(std.mem.endsWith(u8, prompt, "About you: 古書館の司書。"));
 }
 
-test "an override replaces the prompt and is cut on a UTF-8 boundary" {
+test "a character sheet stands in for the description, under the app's rules" {
     const t = std.testing;
     var out: [max_bytes]u8 = undefined;
-    try t.expectEqualStrings("You are a grumpy cat.", build(&out, "boba", .{ .name = "Boba" }, "\nYou are a grumpy cat.\n"));
-    try t.expect(std.mem.startsWith(u8, build(&out, "boba", .{}, "   "), "You are boba"));
+    const prompt = build(&out, "boba", .{ .name = "Boba", .description = "A cat." }, "\n# Boba\nA grumpy cat.\n");
+    try t.expect(std.mem.startsWith(u8, prompt, "You are Boba,"));
+    try t.expect(std.mem.indexOf(u8, prompt, "without markdown.") != null);
+    try t.expect(std.mem.endsWith(u8, prompt, "Your character:\n# Boba\nA grumpy cat."));
+    try t.expect(std.mem.indexOf(u8, prompt, "A cat.") == null);
+    // A blank sheet leaves pet.json's description.
+    try t.expect(std.mem.endsWith(u8, build(&out, "boba", .{ .description = "A cat." }, "   "), "About you: A cat."));
 
+    // A sheet past the budget is cut on a UTF-8 boundary; the rules stay.
     const long = "あ" ** (max_bytes / 3 + 1);
     const cut = build(&out, "boba", .{}, long);
     try t.expect(cut.len <= max_bytes);
     try t.expect(std.unicode.utf8ValidateSlice(cut));
+    try t.expect(std.mem.indexOf(u8, cut, "without markdown.") != null);
 }

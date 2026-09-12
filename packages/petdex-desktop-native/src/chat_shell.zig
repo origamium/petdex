@@ -163,7 +163,7 @@ pub const State = struct {
 var bufs: provider.Bufs = .{};
 var parse_scratch: [32 * 1024]u8 = undefined;
 var file_buf: [64 * 1024]u8 = undefined;
-var override_buf: [persona.max_bytes]u8 = undefined;
+var character_buf: [persona.max_bytes]u8 = undefined;
 var persona_buf: [persona.max_bytes]u8 = undefined;
 var persona_len: usize = 0;
 /// The active pet's `thinking` lines, copied out of the parse scratch.
@@ -411,7 +411,7 @@ fn syncPet(model: *Model, fx: *Effects) void {
 
 fn buildPersona(st: *State, root: []const u8) void {
     var info: persona.PetInfo = .{};
-    var override: ?[]const u8 = null;
+    var character: ?[]const u8 = null;
     thinking_count = 0;
     if (app.env_home) |home| {
         var path_buf: [640]u8 = undefined;
@@ -422,11 +422,18 @@ fn buildPersona(st: *State, root: []const u8) void {
                 keepThinking(persona.thinkingLines(json, parse_scratch[half..]));
             }
         } else |_| {}
+        // The character sheet: the user's override, else the pet's own
+        // persona.md beside pet.json.
         if (std.fmt.bufPrint(&path_buf, "{s}/.petdex/personas/{s}.md", .{ home, st.petSlug() })) |path| {
-            override = plat.readFile(path, &override_buf);
+            character = plat.readFile(path, &character_buf);
         } else |_| {}
+        if (character == null) {
+            if (std.fmt.bufPrint(&path_buf, "{s}/{s}/{s}/persona.md", .{ home, root, st.petSlug() })) |path| {
+                character = plat.readFile(path, &character_buf);
+            } else |_| {}
+        }
     }
-    persona_len = persona.build(&persona_buf, st.petSlug(), info, override).len;
+    persona_len = persona.build(&persona_buf, st.petSlug(), info, character).len;
     setField(&st.pet_name, &st.pet_name_len, info.name orelse st.petSlug());
 }
 
