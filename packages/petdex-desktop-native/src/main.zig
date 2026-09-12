@@ -1569,7 +1569,7 @@ fn agentIconRect(index: usize) geometry.RectF {
 /// cannot go missing from a bundle or resolve against the wrong cwd.
 /// opencode ships light and dark glyphs; the rest read on both.
 const AgentArt = struct { light: []const u8, dark: []const u8 };
-const agent_art = [agent_hooks.agent_count + 2]AgentArt{
+const installable_art = [agent_hooks.agent_count + 2]AgentArt{
     .{ .light = @embedFile("assets/agents/claude-code.png"), .dark = @embedFile("assets/agents/claude-code.png") },
     .{ .light = @embedFile("assets/agents/codex.png"), .dark = @embedFile("assets/agents/codex.png") },
     .{ .light = @embedFile("assets/agents/gemini.png"), .dark = @embedFile("assets/agents/gemini.png") },
@@ -1586,6 +1586,40 @@ const agent_art = [agent_hooks.agent_count + 2]AgentArt{
 };
 pub const herdr_icon_index = agent_hooks.agent_count;
 const agent_fallback_index = agent_hooks.agent_count + 1;
+
+/// Agents with no hook installer of their own, which reach the pet
+/// through Herdr: the names they arrive under (Herdr's, normalized), the
+/// name a card shows, and their logo. Their cells follow the fallback's
+/// in the strip, in this order, so append rather than insert.
+const ExtraAgent = struct { names: []const []const u8, display: []const u8, art: []const u8 };
+const extra_agents = [_]ExtraAgent{
+    .{ .names = &.{"antigravity"}, .display = "Antigravity", .art = @embedFile("assets/agents/antigravity.png") },
+    .{ .names = &.{ "cursor", "cursor-agent" }, .display = "Cursor", .art = @embedFile("assets/agents/cursor.png") },
+    .{ .names = &.{"junie"}, .display = "Junie", .art = @embedFile("assets/agents/junie.png") },
+    .{ .names = &.{"devin"}, .display = "Devin", .art = @embedFile("assets/agents/devin.png") },
+    .{ .names = &.{"droid"}, .display = "Droid", .art = @embedFile("assets/agents/droid.png") },
+    .{ .names = &.{ "kilo", "kilocode", "kilo-code" }, .display = "Kilo Code", .art = @embedFile("assets/agents/kilo.png") },
+    .{ .names = &.{"grok"}, .display = "Grok", .art = @embedFile("assets/agents/grok.png") },
+    .{ .names = &.{ "mastracode", "mastra" }, .display = "Mastra Code", .art = @embedFile("assets/agents/mastracode.png") },
+};
+const extra_icon_base = agent_fallback_index + 1;
+
+/// Every logo the strip packs: the installable agents, Herdr and the
+/// fallback, then the agents Herdr relays.
+const agent_art = installable_art ++ blk: {
+    var art: [extra_agents.len]AgentArt = undefined;
+    for (extra_agents, 0..) |agent, i| art[i] = .{ .light = agent.art, .dark = agent.art };
+    break :blk art;
+};
+
+fn extraAgentIndex(agent: []const u8) ?usize {
+    for (extra_agents, 0..) |extra, i| {
+        for (extra.names) |name| {
+            if (std.mem.eql(u8, name, agent)) return i;
+        }
+    }
+    return null;
+}
 
 /// Pack every settings agent logo into one registry slot, themed like the
 /// bubble avatar and rebuilt on appearance flips. Each logo decodes
@@ -1711,6 +1745,7 @@ pub fn chatTail(ui: *AppUi, point_left: bool, x: f32, y: f32) AppUi.Node {
 fn agentIconIndex(agent: []const u8) usize {
     if (std.mem.eql(u8, agent, "herdr")) return herdr_icon_index;
     if (agentKindForName(agent)) |kind| return @intFromEnum(kind);
+    if (extraAgentIndex(agent)) |i| return extra_icon_base + i;
     return agent_fallback_index;
 }
 
@@ -3399,7 +3434,9 @@ fn bubbleProject(bubble: *const hook_server.Bubble) []const u8 {
 
 fn bubbleAgentName(bubble: *const hook_server.Bubble) []const u8 {
     const agent = bubble.agent[0..bubble.agent_len];
-    return if (agentKindForName(agent)) |kind| kind.displayName() else agent;
+    if (agentKindForName(agent)) |kind| return kind.displayName();
+    if (extraAgentIndex(agent)) |i| return extra_agents[i].display;
+    return agent;
 }
 
 /// What the agent needs. A sender that does not report per-agent state
@@ -4792,7 +4829,22 @@ test "flock states use distinct cells in one atlas" {
 test "one image slot covers every agent" {
     // agent_art is what loadAgentsAtlas walks, so a new AgentKind without
     // artwork would pack short and leave the last agent blank.
-    try std.testing.expectEqual(agent_hooks.agent_count + 2, agent_art.len);
+    try std.testing.expectEqual(agent_hooks.agent_count + 2, installable_art.len);
+    try std.testing.expectEqual(installable_art.len + extra_agents.len, agent_art.len);
+    for (extra_agents) |extra| try std.testing.expect(std.mem.startsWith(u8, extra.art, "\x89PNG"));
+}
+
+test "agents Herdr relays get their own logo and name" {
+    try std.testing.expectEqual(extra_icon_base + 1, agentIconIndex("cursor"));
+    try std.testing.expectEqual(agentIconIndex("cursor"), agentIconIndex("cursor-agent"));
+    try std.testing.expectEqual(extra_icon_base, agentIconIndex("antigravity"));
+    try std.testing.expectEqual(agent_fallback_index, agentIconIndex("copilot"));
+    var bubble: hook_server.Bubble = .{};
+    @memcpy(bubble.agent[0.."junie".len], "junie");
+    bubble.agent_len = "junie".len;
+    try std.testing.expectEqualStrings("Junie", bubbleAgentName(&bubble));
+    // The strip still fits one registered image.
+    try std.testing.expect(agent_art.len * agent_icon_px * agent_icon_px * 4 <= 1024 * 1024);
 }
 
 test "the bubble window lets clicks through, except over a bubble on macOS" {
