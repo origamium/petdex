@@ -29,6 +29,7 @@ const remote_writeback = @import("remote_writeback.zig");
 const remote_runtime = @import("remote_runtime.zig");
 const herdr_status = @import("herdr_status.zig");
 const sdk_log = @import("sdk_log.zig");
+const i18n = @import("i18n.zig");
 const chat = @import("chat/chat.zig");
 const chat_history = @import("chat_history.zig");
 const chat_shell = @import("chat_shell.zig");
@@ -5367,6 +5368,7 @@ test {
     _ = desktop_auth;
     _ = hook_runner;
     _ = hook_server;
+    _ = i18n;
     _ = installer;
     _ = plat;
     _ = remote_agents;
