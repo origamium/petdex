@@ -404,6 +404,7 @@ fn petdexThemeTokens(model: *const Model) canvas.DesignTokens {
     // preference remains available on the untouched Win/mac SDK too.
     tokens.typography.heading_size = model.bubble_text_px;
     if (custom_font_active) tokens.typography.font_id = custom_font_id;
+    tokens.text_measure = text_measure;
     // Linux's software presenter needs an alpha-zero clear all the way
     // into GTK's ARGB surface. Win32 and AppKit retain their upstream
     // platform-owned transparency paths and ordinary theme tokens.
@@ -433,6 +434,12 @@ fn petdexThemeTokens(model: *const Model) canvas.DesignTokens {
     }
     return tokens.withOverrides(canvas.accentOverrides(c.accent, scheme));
 }
+
+/// The runtime's text measurement (CoreText on macOS), captured from
+/// Effects on poll ticks. App-side layout (bubble widths, the chat's line
+/// counts) then wraps exactly as the runtime paints; null, as under
+/// tests, keeps the SDK's estimator.
+pub var text_measure: ?*const canvas.TextMeasureProvider = null;
 
 pub fn petdexTokens(model: *const Model) canvas.DesignTokens {
     var tokens = petdexThemeTokens(model);
@@ -3219,6 +3226,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .poll_tick => |timer| {
             if (timer.outcome != .fired) return;
+            text_measure = fx.textMeasure();
             if (hook_server.auth_mailbox.take()) |callback| {
                 if (model.auth.phase == .authorizing) {
                     if (!std.mem.eql(u8, callback.stateSlice(), model.auth.oauthState())) {
@@ -3362,7 +3370,8 @@ pub fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "petdex.pet-page")) return .open_active_pet_page;
     if (std.mem.eql(u8, name, "petdex.updates")) return .check_updates;
     if (std.mem.eql(u8, name, "petdex.flock")) return .toggle_flock_window;
-    if (std.mem.eql(u8, name, "petdex.chat")) return .open_chat;    return null;
+    if (std.mem.eql(u8, name, "petdex.chat")) return .open_chat;
+    return null;
 }
 
 // ------------------------------------------------------------------- view

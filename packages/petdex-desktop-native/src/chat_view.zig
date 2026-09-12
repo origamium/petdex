@@ -110,7 +110,7 @@ fn stacked(model: *const Model) Stack {
     if (st.history) return .{ .from = 0, .to = 0, .top = 0 };
     const tr = &st.session.transcript;
     var to = tr.len();
-    if (st.session.lastReply() != null) to -= 1;
+    if (st.session.currentReply() != null) to -= 1;
     // Each exchange opens on a user turn.
     var from = to;
     var left: usize = st.stack;
@@ -242,7 +242,10 @@ const speech_buf_len = 192;
 fn speech(st: *const State, buf: []u8) Speech {
     const s = &st.session;
     if (s.phase == .failed) return .{ .text = s.errorText(), .tone = .failure, .action = .chat_retry, .action_label = "Retry" };
-    if (s.phase == .refreshing) return .{ .text = "Reconnecting to ChatGPT…" };
+    // From the moment a request starts (a send, a retry, a briefing,
+    // a credential refresh) until its first words: the thinking line.
+    const reply = s.currentReply() orelse "";
+    if (s.busy() and reply.len == 0) return .{ .text = st.thinkingText() };
     if (!st.ready()) return .{
         .text = if (st.kind == .codex)
             std.fmt.bufPrint(buf, "Sign in to ChatGPT in Settings to talk to {s}.", .{st.petName()}) catch "Sign in to ChatGPT in Settings."
@@ -251,10 +254,7 @@ fn speech(st: *const State, buf: []u8) Speech {
         .action = .open_settings,
         .action_label = "Open Settings",
     };
-    if (s.lastReply()) |reply| {
-        if (reply.len > 0) return .{ .text = reply, .tone = .speech };
-    }
-    if (s.busy()) return .{ .text = "…" };
+    if (reply.len > 0) return .{ .text = reply, .tone = .speech };
     if (s.lost_text) return .{ .text = "Part of this reply was lost." };
     return .{ .text = std.fmt.bufPrint(buf, "Say hello to {s}.", .{st.petName()}) catch "Say hello." };
 }
@@ -360,8 +360,7 @@ fn statusRow(ui: *AppUi, st: *const State) AppUi.Node {
             }),
         });
     }
-    if (s.phase == .refreshing) return ui.column(.{ .padding = 8 }, .{muted(ui, "Reconnecting to ChatGPT…")});
-    if (s.thinking()) return ui.column(.{ .padding = 8 }, .{muted(ui, "…")});
+    if (s.thinking()) return ui.column(.{ .padding = 8 }, .{muted(ui, st.thinkingText())});
     return ui.column(.{ .padding = 8 }, .{muted(ui, "Part of this reply was lost.")});
 }
 
@@ -622,6 +621,31 @@ test "stacked bubbles cut long text at their line cap" {
     const short = fit(&model, "hey", text_w, older_max_lines);
     try std.testing.expectEqual(@as(usize, 1), short.lines);
     try std.testing.expectEqual(@as(usize, 3), short.cut);
+}
+
+test "the reply card thinks until the first words, a briefing included" {
+    var model: Model = .{};
+    model.chat.local_url.set("http://localhost:1234/v1");
+    const st = &model.chat;
+    const s = &st.session;
+    s.transcript.append(.user, "hi");
+    s.transcript.append(.assistant, "hey");
+    var buf: [speech_buf_len]u8 = undefined;
+    try std.testing.expectEqualStrings("hey", speech(st, &buf).text);
+    // A briefing adds no user turn: the old reply joins the stack and
+    // the card thinks.
+    try std.testing.expectEqual(chat.session.Action.request, s.brief(false));
+    try std.testing.expectEqualStrings(st.thinkingText(), speech(st, &buf).text);
+    try std.testing.expectEqual(@as(usize, 2), stacked(&model).to);
+    // The first words replace the thinking line; the old reply stays stacked.
+    var scratch: [4096]u8 = undefined;
+    s.onLine(.openai_compat, s.streamKey(), "data: {\"choices\":[{\"delta\":{\"content\":\"Claude waits.\"}}]}", false, false, &scratch);
+    try std.testing.expectEqualStrings("Claude waits.", speech(st, &buf).text);
+    try std.testing.expectEqual(@as(usize, 2), stacked(&model).to);
+    // A plain send thinks the same way.
+    try std.testing.expectEqual(chat.session.Action.done, s.onResponse(.openai_compat, s.streamKey(), 200, null));
+    try std.testing.expectEqual(chat.session.Action.request, s.submit("more?", false));
+    try std.testing.expectEqualStrings(st.thinkingText(), speech(st, &buf).text);
 }
 
 test "an unconfigured chat bubble points at Settings" {

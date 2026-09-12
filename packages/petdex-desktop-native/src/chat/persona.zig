@@ -27,6 +27,19 @@ pub fn petInfo(pet_json: []const u8, scratch: []u8) PetInfo {
     return .{ .name = nonEmpty(parsed.displayName), .description = nonEmpty(parsed.description) };
 }
 
+const ThinkingJson = struct {
+    thinking: ?[]const []const u8 = null,
+};
+
+/// pet.json's `thinking`: lines the pet shows while a reply is on its
+/// way. Parsed apart from petInfo, so a malformed list costs only
+/// itself. Strings live in `scratch`.
+pub fn thinkingLines(pet_json: []const u8, scratch: []u8) []const []const u8 {
+    var fba = std.heap.FixedBufferAllocator.init(scratch);
+    const parsed = std.json.parseFromSliceLeaky(ThinkingJson, fba.allocator(), pet_json, .{ .ignore_unknown_fields = true }) catch return &.{};
+    return parsed.thinking orelse &.{};
+}
+
 fn nonEmpty(value: ?[]const u8) ?[]const u8 {
     const v = std.mem.trim(u8, value orelse return null, " \t\r\n");
     return if (v.len == 0) null else v;
@@ -96,6 +109,20 @@ test "a briefing lists each agent after the request" {
     const cut = briefing(&small, &.{.{ .agent = "claude", .state = "waiting", .text = "あ" ** 200 }});
     try t.expect(std.mem.indexOf(u8, cut, "what you two last talked about") != null);
     try t.expect(std.unicode.utf8ValidateSlice(cut));
+}
+
+test "thinking lines come from pet.json, and a bad list costs nothing else" {
+    const t = std.testing;
+    var scratch: [1024]u8 = undefined;
+    const lines = thinkingLines("{\"displayName\":\"Ui\",\"thinking\":[\"眠いなあ…\",\"先生、何考えてるんだろう…\"]}", &scratch);
+    try t.expectEqual(@as(usize, 2), lines.len);
+    try t.expectEqualStrings("眠いなあ…", lines[0]);
+    try t.expectEqualStrings("先生、何考えてるんだろう…", lines[1]);
+    try t.expectEqual(@as(usize, 0), thinkingLines("{\"displayName\":\"Ui\"}", &scratch).len);
+
+    const broken = "{\"displayName\":\"Ui\",\"thinking\":\"not a list\"}";
+    try t.expectEqual(@as(usize, 0), thinkingLines(broken, &scratch).len);
+    try t.expectEqualStrings("Ui", petInfo(broken, &scratch).name.?);
 }
 
 test "pet.json strings are decoded, including escapes" {

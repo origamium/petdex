@@ -98,6 +98,10 @@ pub const State = struct {
     bubble_excerpt: bool = true,
     /// Recent exchanges stacked above the reply, 1 to max_stack.
     stack: u8 = 3,
+    /// The line shown until the reply's first words, picked per request
+    /// from the pet's `thinking` lines.
+    thinking: [192]u8 = undefined,
+    thinking_len: usize = 0,
     creds: codex.Credentials = .{},
     chatgpt: ChatgptPhase = .signed_out,
     verifier: [pkce.verifier_len]u8 = undefined,
@@ -139,6 +143,10 @@ pub const State = struct {
         return self.codex_model.text();
     }
 
+    pub fn thinkingText(self: *const State) []const u8 {
+        return if (self.thinking_len > 0) self.thinking[0..self.thinking_len] else "Thinking…";
+    }
+
     pub fn noteText(self: *const State) []const u8 {
         return self.note[0..self.note_len];
     }
@@ -158,6 +166,10 @@ var file_buf: [64 * 1024]u8 = undefined;
 var override_buf: [persona.max_bytes]u8 = undefined;
 var persona_buf: [persona.max_bytes]u8 = undefined;
 var persona_len: usize = 0;
+/// The active pet's `thinking` lines, copied out of the parse scratch.
+var thinking_pool: [2048]u8 = undefined;
+var thinking_lines: [16][]const u8 = undefined;
+var thinking_count: usize = 0;
 var history: ?chat_history.History = null;
 var history_tried = false;
 /// CODEX_HOME, read in main(): where Codex CLI keeps auth.json.
@@ -198,7 +210,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .chat_submit => submit(model, fx),
         .chat_stop => stop(model, fx),
         .chat_clear => clear(model, fx),
-        .chat_retry => run(model, st.session.retry(needsRefresh(st, fx)), fx),
+        .chat_retry => begin(model, st.session.retry(needsRefresh(st, fx)), fx),
         .chat_toggle_history => {
             st.history = !st.history;
             st.scroll = 0;
@@ -267,8 +279,7 @@ fn brief(model: *Model, fx: *Effects) void {
     if (action == .none) return;
     st.history = false;
     st.scroll = 0;
-    app.applyState(model, .review, 0, fx);
-    run(model, action, fx);
+    begin(model, action, fx);
 }
 
 var brief_buf: [4096]u8 = undefined;
@@ -395,10 +406,15 @@ fn syncPet(model: *Model, fx: *Effects) void {
 fn buildPersona(st: *State, root: []const u8) void {
     var info: persona.PetInfo = .{};
     var override: ?[]const u8 = null;
+    thinking_count = 0;
     if (app.env_home) |home| {
         var path_buf: [640]u8 = undefined;
         if (std.fmt.bufPrint(&path_buf, "{s}/{s}/{s}/pet.json", .{ home, root, st.petSlug() })) |path| {
-            if (plat.readFile(path, &file_buf)) |json| info = persona.petInfo(json, &parse_scratch);
+            if (plat.readFile(path, &file_buf)) |json| {
+                const half = parse_scratch.len / 2;
+                info = persona.petInfo(json, parse_scratch[0..half]);
+                keepThinking(persona.thinkingLines(json, parse_scratch[half..]));
+            }
         } else |_| {}
         if (std.fmt.bufPrint(&path_buf, "{s}/.petdex/personas/{s}.md", .{ home, st.petSlug() })) |path| {
             override = plat.readFile(path, &override_buf);
@@ -406,6 +422,33 @@ fn buildPersona(st: *State, root: []const u8) void {
     }
     persona_len = persona.build(&persona_buf, st.petSlug(), info, override).len;
     setField(&st.pet_name, &st.pet_name_len, info.name orelse st.petSlug());
+}
+
+/// Copy the pet's thinking lines out of the parse scratch, which the
+/// next streamed reply reuses.
+fn keepThinking(lines: []const []const u8) void {
+    var used: usize = 0;
+    for (lines) |raw| {
+        if (thinking_count == thinking_lines.len) break;
+        const line = std.mem.trim(u8, raw, " \t\r\n");
+        if (line.len == 0) continue;
+        const kept = domain.utf8Floor(line, @min(@sizeOf(@FieldType(State, "thinking")), thinking_pool.len - used));
+        if (kept.len == 0) break;
+        @memcpy(thinking_pool[used..][0..kept.len], kept);
+        thinking_lines[thinking_count] = thinking_pool[used..][0..kept.len];
+        thinking_count += 1;
+        used += kept.len;
+    }
+}
+
+/// One of the pet's thinking lines for this request, at random; none
+/// leaves the default.
+fn pickThinking(st: *State) void {
+    st.thinking_len = 0;
+    if (thinking_count == 0) return;
+    var seed: [8]u8 = @splat(0);
+    plat.fillRandom(&seed) catch {};
+    setField(&st.thinking, &st.thinking_len, thinking_lines[std.mem.readInt(u64, &seed, .little) % thinking_count]);
 }
 
 // ── Conversation ──────────────────────────────────────────────────────
@@ -426,6 +469,15 @@ fn submit(model: *Model, fx: *Effects) void {
     if (st.session.transcript.last()) |m| {
         if (ensureHistory()) |h| _ = h.append(st.petSlug(), .user, m.text, st.kind, fx.wallMs());
     }
+    begin(model, action, fx);
+}
+
+/// Every request starts here (a send, a retry, a briefing): the pet
+/// looks busy, and one thinking line holds until the first words, a
+/// credential refresh on the way included.
+fn begin(model: *Model, action: session.Action, fx: *Effects) void {
+    if (action == .none) return;
+    pickThinking(&model.chat);
     app.applyState(model, .review, 0, fx);
     run(model, action, fx);
 }

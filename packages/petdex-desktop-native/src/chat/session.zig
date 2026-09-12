@@ -169,6 +169,14 @@ pub const Session = struct {
         return if (m.role == .assistant) m.text else null;
     }
 
+    /// The reply the pet is saying now: the one streaming, or the last
+    /// one once idle. None while a request waits for its first words
+    /// (a briefing leaves the previous reply newest) or after a failure.
+    pub fn currentReply(self: *const Session) ?[]const u8 {
+        if (self.phase == .failed or self.thinking()) return null;
+        return self.lastReply();
+    }
+
     /// Replace the transcript (history restored, pet switched).
     pub fn load(self: *Session, messages: []const Message) void {
         self.* = .{ .request_id = self.request_id +% 1 };
@@ -323,6 +331,19 @@ fn newSession() *Session {
     const s = t.allocator.create(Session) catch unreachable;
     s.* = .{};
     return s;
+}
+
+test "the current reply is the one being said, none while thinking or failed" {
+    const s = newSession();
+    defer t.allocator.destroy(s);
+    s.transcript.append(.user, "hi");
+    s.transcript.append(.assistant, "hey");
+    try t.expectEqualStrings("hey", s.currentReply().?);
+    _ = s.brief(false);
+    try t.expect(s.currentReply() == null);
+    _ = s.onResponse(.openai_compat, s.streamKey(), 0, "down");
+    try t.expect(s.currentReply() == null);
+    try t.expectEqualStrings("hey", s.lastReply().?);
 }
 
 test "a briefing streams a reply without a user turn and can be retried" {

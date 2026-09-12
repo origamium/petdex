@@ -44,6 +44,24 @@ Builds pass `-Dtrace=off`. Without it the SDK appends a trace record per frame
 and timer to `native-sdk.jsonl` in the platform log directory (#714); the app
 deletes that file once it passes 32 MB.
 
+## Chat
+
+Click the pet to talk to it; double-click it for a catch-up on your coding
+agents and your last conversation, in its own voice. Cmd+K, the tray and the
+pet's menu toggle the chat. Choose ChatGPT or a local OpenAI-compatible server
+(LM Studio, Ollama) under Settings → Chat.
+
+The persona comes from the pet's `pet.json` (`displayName`, `description`);
+`~/.petdex/personas/<slug>.md` replaces it. Until a reply's first words arrive,
+the chat shows one of the pet's `thinking` lines, picked at random, or
+"Thinking…" when it has none:
+
+```json
+{ "displayName": "古関ウイ", "thinking": ["眠いなあ…", "先生、何考えてるんだろう…"] }
+```
+
+History lives in `~/.petdex/petdex.db`, up to 400 messages per pet.
+
 ## Herdr
 
 The local Herdr plugin mirrors agent attention from Herdr into Petdex and
