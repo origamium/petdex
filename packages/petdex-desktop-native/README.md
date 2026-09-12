@@ -65,6 +65,15 @@ the chat shows one of the pet's `thinking` lines, picked at random, or
 
 History lives in `~/.petdex/petdex.db`, up to 400 messages per pet.
 
+## Language
+
+The app speaks English or Japanese. Settings → Appearance → Language offers
+Auto, English and 日本語. Auto follows the macOS preferred languages, the Windows
+display language, or `LC_ALL`, `LC_MESSAGES` and `LANG` on Linux. Windows and
+Linux draw Japanese only with a Japanese font set under Custom font file, so
+Auto stays English there without one. The menu bar changes after a restart;
+everything else changes at once. Prompts sent to the model stay English.
+
 ## Herdr
 
 The local Herdr plugin mirrors agent attention from Herdr into Petdex and
