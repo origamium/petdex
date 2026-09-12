@@ -44,8 +44,6 @@ The plugin listens only to official session lifecycle events. It forwards a stri
 
 Events are ordered per source session. Duplicate or stale sequence numbers are ignored, replaceable progress updates may be coalesced, and intervention or final turn events remain prioritized.
 
-Clicking the pet activates the currently running macOS default browser. It does not identify the browser or tab that owns a DSH session, navigate to a session URL, or create a new tab.
-
 ## Remove
 
 Select Remove from the same Petdex Settings row. The command removes only `@petdex/dsh-plugin` from the DSH `web` profile. It does not modify DSH profiles, sessions, models, or other plugins.
@@ -57,7 +55,6 @@ Restart DSH Web after removal so the running process unloads the plugin.
 - If DSH is not detected, confirm that the `web` profile exists under `$DSH_HOME/profiles/web` or `~/.dsh/profiles/web`.
 - If installation fails, confirm that `npx` is available to a macOS login shell and that the npm registry is reachable. Installing global `pnpm` should not be necessary.
 - If Petdex still requests a restart, restart DSH Web and generate a real session event. Opening DSH Web without task activity does not complete the handshake.
-- If clicking the pet activates a different browser or tab than expected, this is the current fallback behavior; exact DSH session targeting is not available.
 
 ## Local development
 

@@ -164,16 +164,20 @@ pub const Msg = union(enum) {
     auth_library_done: native_sdk.EffectExit,
     // Pet chat (chat_shell.zig).
     open_chat,
+    show_chat,
+    chat_brief,
     chat_closed,
     chat_input: canvas.TextInputEvent,
     chat_submit,
     chat_stop,
     chat_clear,
     chat_retry,
+    chat_toggle_history,
     chat_scrolled: canvas.ScrollState,
     chat_line: native_sdk.EffectLine,
     chat_response: native_sdk.EffectResponse,
     set_chat_provider: u32,
+    set_chat_stack: u32,
     chat_model_input: canvas.TextInputEvent,
     chat_url_input: canvas.TextInputEvent,
     chat_detect_models,
@@ -430,7 +434,7 @@ fn petdexThemeTokens(model: *const Model) canvas.DesignTokens {
     return tokens.withOverrides(canvas.accentOverrides(c.accent, scheme));
 }
 
-fn petdexTokens(model: *const Model) canvas.DesignTokens {
+pub fn petdexTokens(model: *const Model) canvas.DesignTokens {
     var tokens = petdexThemeTokens(model);
     // Transparent pet and bubble windows must clear to zero alpha. The
     // settings window paints its own opaque page background below.
@@ -1520,6 +1524,7 @@ var initial_pet_y: ?f64 = null;
 const avatar_image_id: u64 = 13;
 const tail_image_id: u64 = 14;
 const auth_avatar_image_id: u64 = 15;
+const chat_tail_image_id: u64 = 17;
 const auth_preview_atlas_id: u64 = 16;
 const auth_preview_cell: usize = 48;
 const auth_preview_columns: usize = 6;
@@ -1623,18 +1628,23 @@ fn loadAgentsAtlas(dark: bool, fx: *Effects) void {
     agents_icons_dark = dark;
     agents_icons_ready = true;
 }
-const tail_w: usize = 18;
-const tail_h: usize = 9;
+pub const tail_w: usize = 18;
+pub const tail_h: usize = 9;
 const tail_atlas_h: usize = tail_h * 2;
+/// The chat's side tail image: two cells, each tail_h wide.
+const side_tail_w: usize = tail_h * 2;
 var tail_dark: bool = false;
 var tail_ready: bool = false;
 
 /// Register both speech-bubble tail directions in one image slot. The
 /// upper atlas cell points down for a bubble above the pet; the lower
-/// cell points up for a bubble that has flipped below it.
-fn registerTail(dark: bool, fx: *Effects) void {
+/// cell points up for a bubble that has flipped below it. The chat
+/// bubble beside the pet gets the same triangle turned sideways, in its
+/// own image.
+pub fn registerTail(dark: bool, fx: *Effects) void {
     if (tail_ready and tail_dark == dark) return;
     var pixels: [tail_w * tail_atlas_h * 4]u8 = @splat(0);
+    var side: [side_tail_w * tail_w * 4]u8 = @splat(0);
     const cr: u8 = if (dark) 25 else 255;
     const cg: u8 = if (dark) 25 else 255;
     const cb: u8 = if (dark) 28 else 255;
@@ -1666,10 +1676,16 @@ fn registerTail(dark: bool, fx: *Effects) void {
                 const mirror_y = tail_atlas_h - y - 1;
                 const mirror_i = (mirror_y * tail_w + x) * 4;
                 @memcpy(pixels[mirror_i..][0..4], pixels[i..][0..4]);
+                // Transposed for the chat: the left cell points left and
+                // the right one right, each with its plain base column
+                // against the card.
+                @memcpy(side[(x * side_tail_w + (tail_h - 1 - y)) * 4 ..][0..4], pixels[i..][0..4]);
+                @memcpy(side[(x * side_tail_w + (tail_h + y)) * 4 ..][0..4], pixels[i..][0..4]);
             }
         }
     }
     fx.registerImage(tail_image_id, tail_w, tail_atlas_h, &pixels) catch return;
+    fx.registerImage(chat_tail_image_id, side_tail_w, tail_w, &side) catch return;
     tail_dark = dark;
     tail_ready = true;
 }
@@ -1685,6 +1701,26 @@ fn tailSourceRect(flipped: bool) geometry.RectF {
         @floatFromInt(tail_w),
         @floatFromInt(tail_h),
     );
+}
+
+/// The chat tail's cell: `point_left` for a bubble right of the pet.
+/// Both cells span the full height, so the vertical origin flip that
+/// tailSourceRect minds does not arise.
+fn chatTailRect(point_left: bool) geometry.RectF {
+    return geometry.RectF.init(if (point_left) 0 else @floatFromInt(tail_h), 0, @floatFromInt(tail_h), @floatFromInt(tail_w));
+}
+
+/// The chat bubble's tail, placed by translation at (x, y) in its window.
+pub fn chatTail(ui: *AppUi, point_left: bool, x: f32, y: f32) AppUi.Node {
+    var tail = ui.image(.{
+        .width = @floatFromInt(tail_h),
+        .height = @floatFromInt(tail_w),
+        .image = if (tail_ready) chat_tail_image_id else 0,
+    });
+    tail.widget.image_src = chatTailRect(point_left);
+    tail.widget.image_fit = .contain;
+    tail.widget.transform = canvas.Affine.translate(x, y);
+    return tail;
 }
 var avatar_agent: [24]u8 = @splat(0);
 var avatar_agent_len: usize = 0;
@@ -2307,8 +2343,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .toggle_pets_expanded => model.pets_expanded = !model.pets_expanded,
         .focus_flock_member => |index| {
             // The pane id rode all the way from Herdr on the bubble this
-            // body was built from, so reaching the session is the same
-            // verb the pet window already uses for the front bubble.
+            // body was built from, so Herdr can bring the session forward.
             if (index >= model.flock.len) return;
             const member = &model.flock.members[index];
             const pane = member.herdrPaneSlice();
@@ -2633,16 +2668,20 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .settings_closed => model.settings_open = false,
         .open_chat,
+        .show_chat,
+        .chat_brief,
         .chat_closed,
         .chat_input,
         .chat_submit,
         .chat_stop,
         .chat_clear,
         .chat_retry,
+        .chat_toggle_history,
         .chat_scrolled,
         .chat_line,
         .chat_response,
         .set_chat_provider,
+        .set_chat_stack,
         .chat_model_input,
         .chat_url_input,
         .chat_detect_models,
@@ -2923,10 +2962,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .open_website => plat.openExternal("https://petdex.dev"),
         .appearance => |a| {
             model.dark = a.color_scheme == .dark;
-            if (newestBubble(model)) |newest| {
-                registerTail(model.dark, fx);
-                loadAgentAvatar(newest.agent[0..newest.agent_len], model.dark, fx);
-            }
+            // The chat bubble's tail rides the same registration, and the
+            // chat can be open with no hook bubble at all.
+            registerTail(model.dark, fx);
+            if (newestBubble(model)) |newest| loadAgentAvatar(newest.agent[0..newest.agent_len], model.dark, fx);
             // The strip is themed, so a stack drawing from it has to
             // re-pack on an appearance flip exactly like settings does.
             if (model.settings_open or model.bubbles_len > 1) loadAgentsAtlas(model.dark, fx);
@@ -3024,6 +3063,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // the whole arc.
                 updateBubbleStackInFlight(model, now);
                 syncBubbleWindow(model, fx);
+                chat_shell.follow(model, fx);
                 if (model.vx >= physics_min_vel) {
                     setThrowState(model, .@"running-right", fx);
                 } else if (model.vx <= -physics_min_vel) {
@@ -3058,6 +3098,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // needs no cursor.
             updateBubbleStack(model, read.cursor_x, read.cursor_y, now, fx);
             syncBubbleWindow(model, fx);
+            chat_shell.follow(model, fx);
             if (model.dragging) {
                 if (read.primary_down) {
                     // Follow the cursor keeping the grab offset, and
@@ -3091,6 +3132,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     // above. Re-anchor the bubble immediately so a drag
                     // across displays does not leave it one frame behind.
                     syncBubbleWindow(model, fx);
+                    chat_shell.follow(model, fx);
                     return;
                 }
                 var release_x = read.x;
@@ -3105,6 +3147,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                         model.pet_y = moved.y;
                         pushSample(model, moved.x, moved.y, now);
                         syncBubbleWindow(model, fx);
+                        chat_shell.follow(model, fx);
                     }
                 }
                 // Release: velocity from our own 100ms sample tail,
@@ -3118,17 +3161,16 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // canned (#557's "pet" interaction).
                 if (isTap(now - model.press_ms, release_x - model.press_x, release_y - model.press_y)) {
                     model.sample_len = 0;
-                    // A second tap soon after the first opens the chat.
+                    // A second tap soon after the first: the pet catches
+                    // the user up on their agents and the last chat.
                     if (now - model.chat.last_tap_ms <= chat_shell.double_tap_ms) {
                         model.chat.last_tap_ms = 0;
-                        chat_shell.update(model, .open_chat, fx);
+                        chat_shell.update(model, .chat_brief, fx);
                         return;
                     }
                     model.chat.last_tap_ms = now;
-                    if (newestBubble(model)) |bubble| {
-                        const focused = if (env_home) |home| plat.activateHerdrPane(home, bubble.herdrPaneSlice()) else false;
-                        if (!focused) _ = plat.activateOriginApplication(bubble.origin_app, bubble.ttySlice(), bubble.cwdSlice());
-                    }
+                    // A tap opens the chat, and the pet reacts to the touch.
+                    chat_shell.update(model, .show_chat, fx);
                     model.pat_flip = !model.pat_flip;
                     applyState(model, if (model.pat_flip) .jumping else .waving, pat_react_ms, fx);
                     return;
@@ -3288,6 +3330,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
 pub fn onKey(keyboard: canvas.WidgetKeyboardEvent) ?Msg {
     if (keyboard.modifiers.hasNavigationModifier() or keyboard.modifiers.shift) return null;
     if (std.ascii.eqlIgnoreCase(keyboard.key, "space")) return .cycle_state;
+    // Dismisses the chat bubble; the composer lets a spare Escape through
+    // (patches/native-sdk-escape-fallthrough.patch). A no-op when closed.
+    // ponytail: on_key has no window label, so Escape in a Settings field
+    // closes the chat too; forward the view label if that matters.
+    if (std.ascii.eqlIgnoreCase(keyboard.key, "escape")) return .chat_closed;
     return null;
 }
 
@@ -3315,8 +3362,7 @@ pub fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "petdex.pet-page")) return .open_active_pet_page;
     if (std.mem.eql(u8, name, "petdex.updates")) return .check_updates;
     if (std.mem.eql(u8, name, "petdex.flock")) return .toggle_flock_window;
-    if (std.mem.eql(u8, name, "petdex.chat")) return .open_chat;
-    return null;
+    if (std.mem.eql(u8, name, "petdex.chat")) return .open_chat;    return null;
 }
 
 // ------------------------------------------------------------------- view
@@ -3354,7 +3400,7 @@ const bubble_avatar_width: f32 = 20;
 const bubble_busy_width: f32 = 16;
 const bubble_content_gap: f32 = 8;
 const bubble_card_padding: f32 = 12;
-const bubble_card_radius: f32 = 18;
+pub const bubble_card_radius: f32 = 18;
 const bubble_head_gap: f32 = 12;
 const bubble_line_gap: f32 = 2;
 /// Vertical breathing room between stacked conversation cards.
@@ -4173,7 +4219,7 @@ fn bubbleAboveProbeStale(model: *const Model, bubble_h: f32) bool {
 /// Calculate a global-coordinate move without applying a display clamp.
 /// The caller applies the destination display's visible-frame constraint
 /// only after this move has crossed any monitor boundary.
-fn bubbleMovePlan(cur_x: f64, cur_y: f64, want_x: f64, want_y: f64) ?BubbleMovePlan {
+pub fn bubbleMovePlan(cur_x: f64, cur_y: f64, want_x: f64, want_y: f64) ?BubbleMovePlan {
     const dx = want_x - cur_x;
     const dy = want_y - cur_y;
     if (@abs(dx) <= window_position_epsilon and @abs(dy) <= window_position_epsilon) return null;
@@ -4463,6 +4509,23 @@ pub fn rootView(ui: *AppUi, model: *const Model) AppUi.Node {
 
 // ----------------------------------------------------------- bubble
 
+/// The speech-bubble surface the hook bubbles and the chat bubble share.
+pub fn styleSpeechCard(node: *AppUi.Node, dark: bool) void {
+    node.widget.style.radius = bubble_card_radius;
+    node.widget.style.stroke_width = 1;
+    if (dark) {
+        node.widget.style.background = canvas.Color.rgb8(25, 25, 28);
+        node.widget.style.border = canvas.Color.rgba8(255, 255, 255, 26);
+    } else {
+        node.widget.style.background = canvas.Color.rgb8(255, 255, 255);
+        // Light mode needs the outline more than dark does, not less: a
+        // white card floats over a white editor with no silhouette, and
+        // the tail is the first part to disappear because it is the
+        // narrowest. Matches the tail hairline in registerTail.
+        node.widget.style.border = canvas.Color.rgb8(214, 214, 220);
+    }
+}
+
 /// One conversation's card. `slot` indexes the per-card clip scratch and
 /// decides whether this is the newest bubble, which is the only one the
 /// single avatar registry slot can speak for.
@@ -4571,20 +4634,7 @@ fn bubbleCard(ui: *AppUi, model: *const Model, slot: usize) AppUi.Node {
         .width = card_width,
         .height = bubbleRenderedCardHeight(model, slot),
     }, @as([]const AppUi.Node, if (clamped) content[0..0] else content[0..1]));
-    card.widget.style.radius = bubble_card_radius;
-    if (model.dark) {
-        card.widget.style.background = canvas.Color.rgb8(25, 25, 28);
-        card.widget.style.border = canvas.Color.rgba8(255, 255, 255, 26);
-        card.widget.style.stroke_width = 1;
-    } else {
-        card.widget.style.background = canvas.Color.rgb8(255, 255, 255);
-        // Light mode needs the outline more than dark does, not less: a
-        // white card floats over a white editor with no silhouette, and
-        // the tail is the first part to disappear because it is the
-        // narrowest. Matches the tail hairline in registerTail.
-        card.widget.style.border = canvas.Color.rgb8(214, 214, 220);
-        card.widget.style.stroke_width = 1;
-    }
+    styleSpeechCard(&card, model.dark);
 
     // Depth: shift up, shrink, and fade with distance from the front,
     // plus the horizontal shift that centers this card in the stack.
@@ -4907,15 +4957,49 @@ fn petdexWindows(model: *const Model, scratch: *PetdexApp.WindowsScratch) []cons
             .label = chat_shell.window_label,
             .canvas_label = chat_shell.canvas_label,
             .title = "Chat",
-            .width = chat_shell.window_w,
-            .height = chat_shell.window_h,
+            // macOS: a speech bubble beside the pet. Not an overlay panel
+            // like the hook bubble, which never becomes key: the composer
+            // needs the keyboard. Elsewhere a titled window (Windows'
+            // transparency is a black color key; Linux cannot move one).
+            .width = chat_view.window_w,
+            .height = chat_view.windowHeight(model),
             .resizable = false,
-            .titlebar = .hidden_inset,
+            .titlebar = if (chat_view.bubble) .chromeless else .hidden_inset,
+            .floating = chat_view.bubble,
+            .transparent = chat_view.bubble,
             .on_close = .chat_closed,
         };
         count += 1;
     }
     return scratch.windows[0..count];
+}
+
+test "chat opens as a speech bubble beside the pet on macOS" {
+    var model: Model = .{};
+    model.chat.open = true;
+    var scratch: PetdexApp.WindowsScratch = undefined;
+    const windows = petdexWindows(&model, &scratch);
+    try std.testing.expectEqual(@as(usize, 1), windows.len);
+    try std.testing.expectEqualStrings(chat_shell.window_label, windows[0].label);
+    const bubble = builtin.target.os.tag == .macos;
+    try std.testing.expectEqual(bubble, windows[0].transparent);
+    try std.testing.expectEqual(bubble, windows[0].floating);
+    try std.testing.expect(!windows[0].fullscreen_overlay);
+    try std.testing.expectEqual(if (bubble) .chromeless else .hidden_inset, windows[0].titlebar);
+}
+
+test "the chat tail's cells point left and right" {
+    const left = chatTailRect(true);
+    const right = chatTailRect(false);
+    try std.testing.expectEqual(@as(f32, 0), left.x);
+    try std.testing.expectEqual(@as(f32, @floatFromInt(tail_h)), right.x);
+    try std.testing.expectEqual(left.width, right.width);
+    try std.testing.expectEqual(@as(f32, @floatFromInt(tail_w)), left.height);
+}
+
+test "Escape dismisses the chat and Space still cycles the pet" {
+    try std.testing.expect(onKey(.{ .phase = .key_down, .key = "escape" }).? == .chat_closed);
+    try std.testing.expect(onKey(.{ .phase = .key_down, .key = "space" }).? == .cycle_state);
 }
 
 test "companion windows use the unified opaque shell" {

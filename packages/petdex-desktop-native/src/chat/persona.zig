@@ -45,6 +45,59 @@ pub fn build(out: *[max_bytes]u8, slug: []const u8, info: PetInfo, override: ?[]
     return domain.utf8Floor(w.buffered(), out.len);
 }
 
+/// One coding agent's notification, as the pet sums it up.
+pub const Note = struct {
+    agent: []const u8,
+    state: []const u8,
+    title: []const u8 = "",
+    text: []const u8 = "",
+    project: []const u8 = "",
+};
+
+/// The app's request that the pet catch the user up: how their coding
+/// agents are doing, then what the two of them last talked about. Sent
+/// as the newest user turn and never stored; the persona sets the voice.
+/// The request comes before the list, so a cut list keeps it.
+pub fn briefing(out: []u8, notes: []const Note) []const u8 {
+    var w: std.Io.Writer = .fixed(out);
+    w.writeAll("(From the app, not the user: they double-clicked you to catch up.) " ++
+        "In character, tell them how their coding agents are doing, anything waiting on them first, " ++
+        "then recap in one sentence what you two last talked about, if you have talked. " ++
+        "Two to four short sentences of plain text, in the language of your earlier conversation, " ++
+        "or of your description if there is none.\n") catch {};
+    if (notes.len == 0) {
+        w.writeAll("No coding agent has anything to report right now.") catch {};
+    } else {
+        w.writeAll("Their coding agents right now:") catch {};
+        for (notes) |n| {
+            w.print("\n- {s}, {s}", .{ n.agent, n.state }) catch {};
+            if (n.project.len > 0) w.print(", in {s}", .{n.project}) catch {};
+            if (n.title.len > 0) w.print(": {s}", .{n.title}) catch {};
+            if (n.text.len > 0) w.print(" — {s}", .{n.text}) catch {};
+        }
+    }
+    return domain.utf8Floor(w.buffered(), out.len);
+}
+
+test "a briefing lists each agent after the request" {
+    const t = std.testing;
+    var out: [4096]u8 = undefined;
+    const b = briefing(&out, &.{
+        .{ .agent = "claude", .state = "waiting", .title = "Allow Bash?", .project = "petdex" },
+        .{ .agent = "codex", .state = "working", .text = "Refactoring the parser" },
+    });
+    try t.expect(std.mem.indexOf(u8, b, "what you two last talked about") != null);
+    try t.expect(std.mem.indexOf(u8, b, "\n- claude, waiting, in petdex: Allow Bash?") != null);
+    try t.expect(std.mem.endsWith(u8, b, "\n- codex, working — Refactoring the parser"));
+    try t.expect(std.mem.endsWith(u8, briefing(&out, &.{}), "No coding agent has anything to report right now."));
+
+    // A short buffer keeps the request and cuts the list on a UTF-8 boundary.
+    var small: [600]u8 = undefined;
+    const cut = briefing(&small, &.{.{ .agent = "claude", .state = "waiting", .text = "あ" ** 200 }});
+    try t.expect(std.mem.indexOf(u8, cut, "what you two last talked about") != null);
+    try t.expect(std.unicode.utf8ValidateSlice(cut));
+}
+
 test "pet.json strings are decoded, including escapes" {
     const t = std.testing;
     var scratch: [1024]u8 = undefined;

@@ -5,9 +5,11 @@
 //! executes live in src/chat/, which stays pure.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const native_sdk = @import("native_sdk");
 const canvas = native_sdk.canvas;
 const app = @import("main.zig");
+const chat_view = @import("chat_view.zig");
 const plat = @import("plat.zig");
 const hook_server = @import("hook_server.zig");
 const catalog_mod = @import("catalog.zig");
@@ -30,12 +32,17 @@ const Effects = app.Effects;
 
 pub const window_label = "chat";
 pub const canvas_label = "chat-canvas";
-pub const window_w: f32 = 360;
-pub const window_h: f32 = 520;
-/// Space between the pet and the chat window it opens beside.
-pub const pet_gap: f32 = 12;
-/// Two taps on the pet within this window open the chat.
+/// A second tap on the pet within this window asks for a briefing.
 pub const double_tap_ms: i64 = 350;
+/// The most exchanges the chat bubble can keep on screen (Settings).
+pub const max_stack: u8 = 6;
+/// From the tail's tip to the pet window's edge.
+const pet_gap: f64 = 4;
+/// Where the tail points, as a fraction of the pet's height: its head.
+const head_frac: f64 = 0.3;
+/// After a screen edge pushed the bubble left of the pet, how far left
+/// the pet has to move before the right side is tried again.
+const side_hysteresis: f64 = 40;
 
 const token_key: u64 = 50;
 const models_key: u64 = 51;
@@ -49,6 +56,26 @@ const excerpt_bytes = 190;
 
 pub const ChatgptPhase = enum { signed_out, authorizing, exchanging, signed_in, failed };
 const TokenPurpose = enum { none, sign_in, refresh };
+
+/// Where the chat bubble sits beside the pet; `follow` keeps it there.
+pub const Place = struct {
+    /// Left of the pet, and the pet's x when the right side ran out.
+    left: bool = false,
+    left_at_x: f64 = 0,
+    /// The last target; NaN until the first placement.
+    want_x: f64 = std.math.nan(f64),
+    want_y: f64 = std.math.nan(f64),
+    /// Where the window landed after the screen clamp.
+    at_x: f64 = 0,
+    at_y: f64 = 0,
+    /// The height last applied, and the tail's center in the window.
+    h: f32 = 0,
+    tail_y: f32 = 0,
+
+    pub fn placed(self: Place) bool {
+        return !std.math.isNan(self.want_x);
+    }
+};
 
 /// Everything the chat keeps in the Model. Fixed-size, like the rest.
 pub const State = struct {
@@ -69,6 +96,8 @@ pub const State = struct {
     local_model: canvas.TextBuffer(128) = .{},
     codex_model: canvas.TextBuffer(128) = .{},
     bubble_excerpt: bool = true,
+    /// Recent exchanges stacked above the reply, 1 to max_stack.
+    stack: u8 = 3,
     creds: codex.Credentials = .{},
     chatgpt: ChatgptPhase = .signed_out,
     verifier: [pkce.verifier_len]u8 = undefined,
@@ -82,11 +111,9 @@ pub const State = struct {
     /// Transcript scroll offset, echoed back from on_scroll: secondary
     /// windows keep scroll model-driven. 0 shows the newest exchange.
     scroll: f32 = 0,
-    /// The window was just declared and still needs to be moved beside
-    /// the pet (poll does it once the platform has created it).
-    place_pending: bool = false,
-    place_tries: u8 = 0,
-    place_left: bool = false,
+    /// Past exchanges instead of the latest reply.
+    history: bool = false,
+    place: Place = .{},
 
     pub fn petSlug(self: *const State) []const u8 {
         return self.pet[0..self.pet_len];
@@ -147,7 +174,7 @@ pub fn boot(model: *Model) void {
 /// pick up the ChatGPT sign-in callback.
 pub fn poll(model: *Model, fx: *Effects) void {
     if (model.chat.open) syncPet(model, fx);
-    if (model.chat.place_pending) placeBesidePet(model, fx);
+    follow(model, fx);
     const callback = hook_server.chatgpt_mailbox.take() orelse return;
     const st = &model.chat;
     if (st.chatgpt != .authorizing) return;
@@ -164,15 +191,25 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     const st = &model.chat;
     switch (msg) {
         .open_chat => open(model, fx),
+        .show_chat => show(model, fx),
+        .chat_brief => brief(model, fx),
         .chat_closed => st.open = false,
         .chat_input => |edit| st.input.apply(edit),
         .chat_submit => submit(model, fx),
         .chat_stop => stop(model, fx),
         .chat_clear => clear(model, fx),
         .chat_retry => run(model, st.session.retry(needsRefresh(st, fx)), fx),
+        .chat_toggle_history => {
+            st.history = !st.history;
+            st.scroll = 0;
+        },
         .chat_scrolled => |scroll| st.scroll = scroll.offset,
         .chat_line => |line| st.session.onLine(st.stream_kind, line.key, line.line, line.truncated, line.dropped_before > 0, &parse_scratch),
         .chat_response => |response| onResponse(model, response, fx),
+        .set_chat_stack => |raw| {
+            st.stack = @intCast(std.math.clamp(raw, 1, max_stack));
+            saveConfig(st);
+        },
         .set_chat_provider => |raw| {
             st.kind = std.enums.fromInt(domain.ProviderKind, raw) orelse return;
             st.note_len = 0;
@@ -199,54 +236,147 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     }
 }
 
+/// Cmd+K, the tray and the pet's menu toggle the chat.
 fn open(model: *Model, fx: *Effects) void {
-    syncPet(model, fx);
     const st = &model.chat;
     if (st.open) {
-        fx.focusWindow(window_label);
+        st.open = false;
         return;
     }
+    syncPet(model, fx);
     st.scroll = 0;
-    st.place_pending = true;
-    st.place_tries = 0;
-    st.place_left = false;
+    st.history = false;
+    st.place = .{};
+    app.registerTail(model.dark, fx);
     st.open = true;
 }
 
-/// Move the new window beside the pet, bottom-aligned with it. Read
-/// both live origins and close the gap, like the bubble does: descriptor
-/// coordinates are only a creation hint, and displays can sit at
-/// negative offsets. Clamped moves keep it on the pet's screen.
-fn placeBesidePet(model: *Model, fx: *Effects) void {
-    const st = &model.chat;
-    const chat_origin = fx.moveWindow(window_label, 0, 0, false) orelse return; // not created yet
-    const pet_origin = fx.moveWindow("main", 0, 0, false) orelse return;
-    const pet_w = app.frame_w * model.scale;
-    const pet_h = app.frame_h * model.scale;
-    // Vertical centers line up. `origin + h/2` is the center whether the
-    // host's y axis points up (AppKit) or down, so no per-OS flip.
-    const want_y = pet_origin.y + pet_h / 2 - window_h / 2;
-    // Right of the pet, or left when the screen edge is in the way.
-    const want_x = if (st.place_left)
-        pet_origin.x - pet_gap - window_w
-    else
-        pet_origin.x + pet_w + pet_gap;
-    // The platform may still settle a new window after its first frame
-    // (AppKit cascades it), which would undo one relative move, so keep
-    // closing the gap for a few ticks.
-    if ((@abs(chat_origin.x - want_x) < 1 and @abs(chat_origin.y - want_y) < 1) or st.place_tries >= place_try_budget) {
-        st.place_pending = false;
-        return;
-    }
-    st.place_tries += 1;
-    const moved = fx.moveWindow(window_label, want_x - chat_origin.x, want_y - chat_origin.y, true) orelse return;
-    // A clamped move that fell short horizontally means no room on this
-    // side: try the other one.
-    if (!st.place_left and @abs(moved.x - want_x) >= 1) st.place_left = true;
+/// A tap on the pet opens the chat, or leaves it open.
+fn show(model: *Model, fx: *Effects) void {
+    if (!model.chat.open) open(model, fx);
 }
 
-/// Poll ticks (100 ms each) spent placing a newly opened window.
-const place_try_budget: u8 = 10;
+/// A double tap: the pet catches the user up on their coding agents and
+/// the last conversation, in its own voice, as a reply in the chat.
+fn brief(model: *Model, fx: *Effects) void {
+    show(model, fx);
+    const st = &model.chat;
+    // Unconfigured, the reply card already points at Settings.
+    if (!st.ready() or st.session.busy()) return;
+    const action = st.session.brief(needsRefresh(st, fx));
+    if (action == .none) return;
+    st.history = false;
+    st.scroll = 0;
+    app.applyState(model, .review, 0, fx);
+    run(model, action, fx);
+}
+
+var brief_buf: [4096]u8 = undefined;
+
+/// The briefing prompt, from the hook bubbles on screen right now.
+fn briefingPrompt(model: *const Model) []const u8 {
+    var notes: [hook_server.max_bubbles]persona.Note = undefined;
+    var n: usize = 0;
+    for (model.bubbles[0..model.bubbles_len]) |*b| {
+        const agent = b.agent[0..b.agent_len];
+        // The chat's own reply excerpts are not news.
+        if (std.mem.eql(u8, agent, "petdex")) continue;
+        notes[n] = .{
+            .agent = agent,
+            .state = if (b.agent_state_len > 0) b.agentStateSlice() else if (b.busy) "working" else "finished",
+            .title = b.title[0..b.title_len],
+            .text = b.text[0..b.text_len],
+            .project = std.fs.path.basename(b.cwdSlice()),
+        };
+        n += 1;
+    }
+    return persona.briefing(&brief_buf, notes[0..n]);
+}
+
+const Pet = struct { x: f64, y: f64, w: f64, h: f64 };
+const Point = struct { x: f64, y: f64 };
+
+/// The window origin beside the pet that puts the reply card's top level
+/// with the pet's top; `speech_top` is that card's offset in the window,
+/// below the stacked exchanges.
+fn originBeside(pet: Pet, left: bool, speech_top: f32) Point {
+    return .{
+        .x = if (left) pet.x - pet_gap - chat_view.window_w else pet.x + pet.w + pet_gap,
+        .y = pet.y - speech_top,
+    };
+}
+
+/// Stay left until the pet has moved clearly away from the edge that
+/// pushed the bubble there, so it cannot flap at the threshold.
+fn keepLeft(p: Place, pet_x: f64) bool {
+    return p.left and pet_x >= p.left_at_x - side_hysteresis;
+}
+
+/// The tail's center in window space: at the pet's head, kept on the
+/// reply card's straight edge (the card spans card_top..card_top+card_h),
+/// clear of its corner radius.
+fn tailY(pet_y: f64, pet_h: f64, win_y: f64, card_top: f32, card_h: f32) f32 {
+    const r = app.bubble_card_radius + @as(f32, @floatFromInt(app.tail_w)) / 2;
+    const aim: f32 = @floatCast(pet_y + pet_h * head_frac - win_y);
+    return std.math.clamp(aim, card_top + r, card_top + @max(r, card_h - r));
+}
+
+/// Keep the bubble beside the pet: on every frame the pet may move, and
+/// on poll ticks. Moves only when the target changed or the window was
+/// nudged (AppKit settles a new window after its first frame), and
+/// switches sides when the screen clamp stops it short. Descriptor
+/// coordinates are only a creation hint, so this also does the first
+/// placement.
+pub fn follow(model: *Model, fx: *Effects) void {
+    const st = &model.chat;
+    // Linux has no window move or resize.
+    if (!st.open or builtin.os.tag == .linux) return;
+    const p = &st.place;
+    // A titled window (Windows) is placed once and then belongs to the user.
+    if (!chat_view.bubble and p.placed()) return;
+    var cur = fx.moveWindow(window_label, 0, 0, false) orelse return; // not created yet
+    const h = chat_view.windowHeight(model);
+    if (chat_view.bubble and h != p.h) {
+        // AppKit keeps the bottom edge on resize; the move below puts
+        // the top back beside the pet's head.
+        _ = fx.resizeWindow(window_label, chat_view.window_w, h, .top_left);
+        p.h = h;
+        p.want_x = std.math.nan(f64);
+        cur = fx.moveWindow(window_label, 0, 0, false) orelse return;
+    }
+    const pet = Pet{
+        .x = model.pet_x,
+        .y = model.pet_y,
+        .w = app.frame_w * model.scale,
+        .h = app.frame_h * model.scale,
+    };
+    if (!keepLeft(p.*, pet.x)) p.left = false;
+    const speech_top = chat_view.speechTop(model);
+    var want = originBeside(pet, p.left, speech_top);
+    if (want.x == p.want_x and want.y == p.want_y and @abs(cur.x - p.at_x) < 1 and @abs(cur.y - p.at_y) < 1) return;
+    var landed = cur;
+    for (0..2) |pass| {
+        // Unclamped first so a pet on another display pulls the bubble
+        // across, then clamped to that display.
+        if (app.bubbleMovePlan(landed.x, landed.y, want.x, want.y)) |m| _ = fx.moveWindow(window_label, m.dx, m.dy, false) orelse return;
+        landed = fx.moveWindow(window_label, 0, 0, true) orelse return;
+        // A zero-delta clamp only reports where the window should be;
+        // apply it (settleBubbleWindow does the same for the hook bubble).
+        const actual = fx.moveWindow(window_label, 0, 0, false) orelse return;
+        if (app.bubbleMovePlan(actual.x, actual.y, landed.x, landed.y)) |m| _ = fx.moveWindow(window_label, m.dx, m.dy, false) orelse return;
+        // ponytail: with no room on either side (a screen under ~900pt
+        // wide) the second side stands, overlapping the pet.
+        if (!landed.hit_x or pass == 1) break;
+        p.left = !p.left;
+        if (p.left) p.left_at_x = pet.x;
+        want = originBeside(pet, p.left, speech_top);
+    }
+    p.want_x = want.x;
+    p.want_y = want.y;
+    p.at_x = landed.x;
+    p.at_y = landed.y;
+    p.tail_y = tailY(pet.y, pet.h, landed.y, speech_top, chat_view.cardHeight(model));
+}
 
 /// Point the conversation at the active pet: its transcript from the
 /// database and a persona built from its pet.json.
@@ -292,6 +422,7 @@ fn submit(model: *Model, fx: *Effects) void {
     if (action == .none) return;
     st.input.clear();
     st.scroll = 0;
+    st.history = false;
     if (st.session.transcript.last()) |m| {
         if (ensureHistory()) |h| _ = h.append(st.petSlug(), .user, m.text, st.kind, fx.wallMs());
     }
@@ -313,7 +444,14 @@ fn startRequest(model: *Model, fx: *Effects) void {
     const st = &model.chat;
     st.stream_kind = st.kind;
     var context: [session.context_messages]domain.Message = undefined;
-    const turns = st.session.context(&context);
+    const recent = st.session.context(&context);
+    // A briefing ends the context with the app's prompt, never stored.
+    var with_brief: [session.context_messages + 1]domain.Message = undefined;
+    const turns: []const domain.Message = if (st.session.briefing) blk: {
+        @memcpy(with_brief[0..recent.len], recent);
+        with_brief[recent.len] = .{ .role = .user, .text = briefingPrompt(model) };
+        break :blk with_brief[0 .. recent.len + 1];
+    } else recent;
     var cache_key: [80]u8 = undefined;
     const target: provider.Target = switch (st.kind) {
         .codex => .{
@@ -577,12 +715,13 @@ fn loadConfig(st: *State) void {
     setText(&st.local_model, cfg.openai_compat.model);
     setText(&st.codex_model, cfg.codex.model);
     st.bubble_excerpt = cfg.bubble_excerpt;
+    st.stack = std.math.clamp(cfg.stack, 1, max_stack);
 }
 
 fn saveConfig(st: *const State) void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    var cfg: config.Config = .{ .provider = st.kind, .bubble_excerpt = st.bubble_excerpt };
+    var cfg: config.Config = .{ .provider = st.kind, .bubble_excerpt = st.bubble_excerpt, .stack = st.stack };
     cfg.codex.model = st.codexModel();
     cfg.openai_compat.base_url = st.localUrl();
     cfg.openai_compat.model = st.localModel();
@@ -608,4 +747,39 @@ fn setNote(st: *State, message: []const u8) void {
 
 test {
     _ = chat;
+}
+
+test "the chat bubble sits beside the pet, its reply level with the pet's top" {
+    const pet = Pet{ .x = 100, .y = 200, .w = 134, .h = 146 };
+    const right = originBeside(pet, false, 0);
+    try std.testing.expectEqual(@as(f64, 100 + 134 + pet_gap), right.x);
+    try std.testing.expectEqual(@as(f64, 200), right.y);
+    const left = originBeside(pet, true, 0);
+    try std.testing.expectEqual(@as(f64, 100 - pet_gap - chat_view.window_w), left.x);
+    try std.testing.expectEqual(@as(f64, 200), left.y);
+    // Stacked exchanges rise above the pet.
+    try std.testing.expectEqual(@as(f64, 80), originBeside(pet, false, 120).y);
+}
+
+test "the chat bubble returns right only after the pet leaves the edge" {
+    const p = Place{ .left = true, .left_at_x = 1000 };
+    try std.testing.expect(keepLeft(p, 1100));
+    try std.testing.expect(keepLeft(p, 961));
+    try std.testing.expect(!keepLeft(p, 959));
+    try std.testing.expect(!keepLeft(.{}, 1000));
+}
+
+test "the chat tail points at the pet's head and stays off the corners" {
+    // Level with the pet: 30% down a 200pt pet.
+    try std.testing.expectEqual(@as(f32, 60), tailY(500, 200, 500, 0, 300));
+    // Pushed up by the screen's bottom edge: still the head.
+    try std.testing.expectEqual(@as(f32, 160), tailY(500, 200, 400, 0, 300));
+    // The ends stay clear of the corner radius.
+    try std.testing.expectEqual(@as(f32, 27), tailY(0, 200, 500, 0, 300));
+    try std.testing.expectEqual(@as(f32, 273), tailY(900, 200, 0, 0, 300));
+    // A card too short for both corners keeps to the first.
+    try std.testing.expectEqual(@as(f32, 27), tailY(500, 200, 500, 0, 40));
+    // Below stacked exchanges: the reply card, not the window, bounds it.
+    try std.testing.expectEqual(@as(f32, 160), tailY(500, 200, 400, 100, 300));
+    try std.testing.expectEqual(@as(f32, 127), tailY(500, 200, 500, 100, 300));
 }

@@ -135,6 +135,9 @@ pub const Session = struct {
     stream_failed: bool = false,
     /// Part of the last reply was lost to the SDK's line bounds.
     lost_text: bool = false,
+    /// The pet speaks first: the shell ends the request's context with
+    /// its briefing prompt, and no user turn enters the transcript.
+    briefing: bool = false,
     err_buf: [192]u8 = undefined,
     err_len: usize = 0,
 
@@ -177,14 +180,27 @@ pub const Session = struct {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return .none;
         self.transcript.append(.user, trimmed);
+        self.briefing = false;
         return self.begin(needs_refresh);
     }
 
-    /// Re-send after a failure; the user's message is still the newest.
+    /// Re-send after a failure: the user's message is still the newest,
+    /// or the failed request was a briefing.
     pub fn retry(self: *Session, needs_refresh: bool) Action {
         if (self.phase != .failed) return .none;
-        const m = self.transcript.last() orelse return .none;
-        if (m.role != .user) return .none;
+        if (!self.briefing) {
+            const m = self.transcript.last() orelse return .none;
+            if (m.role != .user) return .none;
+        }
+        return self.begin(needs_refresh);
+    }
+
+    /// Let the pet speak first: a request with no new user turn, which
+    /// the shell completes with its briefing prompt. The reply lands like
+    /// any other.
+    pub fn brief(self: *Session, needs_refresh: bool) Action {
+        if (self.busy()) return .none;
+        self.briefing = true;
         return self.begin(needs_refresh);
     }
 
@@ -307,6 +323,27 @@ fn newSession() *Session {
     const s = t.allocator.create(Session) catch unreachable;
     s.* = .{};
     return s;
+}
+
+test "a briefing streams a reply without a user turn and can be retried" {
+    const s = newSession();
+    defer t.allocator.destroy(s);
+    var scratch: [1024]u8 = undefined;
+    var line: [256]u8 = undefined;
+
+    s.transcript.append(.user, "hi");
+    s.transcript.append(.assistant, "hey");
+    try t.expectEqual(Action.request, s.brief(false));
+    try t.expect(s.briefing);
+    try t.expectEqual(@as(usize, 2), s.transcript.len());
+    try t.expectEqual(Action.failed, s.onResponse(.openai_compat, s.streamKey(), 0, "down"));
+    try t.expectEqual(Action.request, s.retry(false));
+    const key = s.streamKey();
+    s.onLine(.openai_compat, key, deltaLine(&line, "Claude is waiting."), false, false, &scratch);
+    try t.expectEqual(Action.done, s.onResponse(.openai_compat, key, 200, null));
+    try t.expectEqualStrings("Claude is waiting.", s.lastReply().?);
+    try t.expectEqual(Action.request, s.submit("thanks", false));
+    try t.expect(!s.briefing);
 }
 
 test "a reply streams into the transcript and completes" {

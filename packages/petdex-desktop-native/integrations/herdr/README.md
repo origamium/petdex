@@ -62,4 +62,4 @@ The startup snapshot always publishes the aggregate state, including `idle` when
 
 The aggregate includes every agent visible to Herdr. A directly hooked agent running outside Herdr is not visible to that aggregate and can briefly have its global state replaced by a bridged agent. Its next direct hook restores the richer state.
 
-Click-to-focus targets active Herdr agent panes. If the agent was released or Herdr cannot resolve the pane, Petdex falls back to the originating application.
+Clicking an agent in the Flock window focuses its Herdr pane. Clicking the pet opens the chat instead.
