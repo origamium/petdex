@@ -1,5 +1,6 @@
 const std = @import("std");
 const plat = @import("plat.zig");
+const i18n = @import("i18n.zig");
 
 pub const Status = enum(u8) {
     absent,
@@ -8,9 +9,9 @@ pub const Status = enum(u8) {
 
     pub fn caption(self: Status) []const u8 {
         return switch (self) {
-            .absent => "Not detected",
-            .available => "Installed; Petdex plugin not connected",
-            .connected => "Petdex plugin connected",
+            .absent => i18n.t("Not detected", "見つかりません"),
+            .available => i18n.t("Installed; Petdex plugin not connected", "インストール済み。Petdexプラグインは未接続"),
+            .connected => i18n.t("Petdex plugin connected", "Petdexプラグイン接続済み"),
         };
     }
 };
