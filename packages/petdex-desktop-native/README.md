@@ -83,6 +83,25 @@ the chat shows one of the pet's `thinking` lines, picked at random, or
 
 History lives in `~/.petdex/petdex.db`, up to 400 messages per pet.
 
+Two options under Settings → Chat have the pet speak first, both off by
+default:
+- **Small talk** says something unprompted every 5, 15, 30 or 60 minutes,
+  give or take a quarter.
+- **Speak up when an agent needs you** says so once each time a coding agent
+  starts waiting on you.
+
+Either line goes to the pet's own bubble, which opens as a card for 12
+seconds; press it to open the chat. The request carries the persona and the
+app's prompt without the conversation, and the pet keeps its pose. Nothing is
+said while the chat is open, while bubbles are off or in Focus, or while
+another request is on the wire. The lines are saved to history like any reply.
+
+## Appearance
+
+Settings → Appearance sets the pet's size, from 0.4 to 2.0 times its frame,
+and the look: Auto follows the system's light or dark appearance, Light and
+Dark keep one. The menus stay the system's.
+
 ## Language
 
 The app speaks English or Japanese. Settings → Appearance → Language offers
