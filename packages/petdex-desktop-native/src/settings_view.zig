@@ -74,29 +74,29 @@ fn mutedParagraph(ui: *AppUi, content: []const u8) AppUi.Node {
 
 fn agentStatusCaption(info: agent_hooks.AgentInfo, codex_note: bool, dsh_busy: bool, dsh_error: bool) []const u8 {
     if (info.kind == .dsh) {
-        if (dsh_busy) return "Running the DSH plugin command";
-        if (dsh_error) return "Plugin command failed - check npx and network";
+        if (dsh_busy) return i18n.t("Running the DSH plugin command", "DSHプラグインのコマンドを実行中");
+        if (dsh_error) return i18n.t("Plugin command failed - check npx and network", "プラグインのコマンドが失敗しました。npxとネットワークを確認してください");
         return switch (info.status) {
-            .absent => "Not detected",
-            .none => "Plugin not installed",
-            .node => "Restart DSH Web, then start a task",
-            .current => "Connected",
+            .absent => i18n.t("Not detected", "見つかりません"),
+            .none => i18n.t("Plugin not installed", "プラグイン未インストール"),
+            .node => i18n.t("Restart DSH Web, then start a task", "DSH Webを再起動してからタスクを始めてください"),
+            .current => i18n.t("Connected", "接続済み"),
         };
     }
-    if (info.kind == .codex and codex_note) return "Installed - restart Codex and approve its hooks once";
+    if (info.kind == .codex and codex_note) return i18n.t("Installed - restart Codex and approve its hooks once", "インストール済み。Codexを再起動して、フックを一度承認してください");
     if (info.kind == .opencode) {
         return switch (info.status) {
-            .absent => "Not detected",
-            .none => "Plugin not installed",
-            .node => "Plugin outdated",
-            .current => "Connected",
+            .absent => i18n.t("Not detected", "見つかりません"),
+            .none => i18n.t("Plugin not installed", "プラグイン未インストール"),
+            .node => i18n.t("Plugin outdated", "プラグインが古くなっています"),
+            .current => i18n.t("Connected", "接続済み"),
         };
     }
     return switch (info.status) {
-        .absent => "Not detected",
-        .none => "Hooks not installed",
-        .node => "Hooks outdated (CLI runner)",
-        .current => "Connected",
+        .absent => i18n.t("Not detected", "見つかりません"),
+        .none => i18n.t("Hooks not installed", "フック未インストール"),
+        .node => i18n.t("Hooks outdated (CLI runner)", "フックが古くなっています（CLIランナー）"),
+        .current => i18n.t("Connected", "接続済み"),
     };
 }
 
@@ -122,7 +122,7 @@ fn petMatchesFilter(name: []const u8, filter: []const u8) bool {
 }
 
 fn moreLabel(total: usize) []const u8 {
-    return std.fmt.bufPrint(&more_label_buf, "Show all ({d})", .{total}) catch "Show all";
+    return i18n.bufPrint(&more_label_buf, "Show all ({d})", "すべて表示（{d}）", .{total}) catch i18n.t("Show all", "すべて表示");
 }
 
 /// Download progress and the last failure, in the Settings page the app
@@ -132,16 +132,16 @@ fn installBanner(ui: *AppUi, model: *const Model) AppUi.Node {
     if (model.install.busy()) {
         const slug = model.install.currentSlug();
         const label = switch (model.install.phase) {
-            .manifest => std.fmt.bufPrint(&install_label_buf, "Looking up pets\u{2026}", .{}) catch "Looking up pets",
+            .manifest => i18n.t("Looking up pets\u{2026}", "ペットを検索中\u{2026}"),
             // The pet.json leg is a few hundred bytes and flashes past,
             // so both download legs read as one "Downloading" step
             // rather than flickering between two labels.
-            .pet_json, .spritesheet => std.fmt.bufPrint(&install_label_buf, "Downloading {s}\u{2026}", .{slug}) catch "Downloading pet",
+            .pet_json, .spritesheet => i18n.bufPrint(&install_label_buf, "Downloading {s}\u{2026}", "{s}をダウンロード中\u{2026}", .{slug}) catch i18n.t("Downloading pet", "ペットをダウンロード中"),
             .idle => unreachable,
         };
         return ui.el(.panel, .{ .padding = 12, .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.row(.{ .gap = 10, .cross = .center }, .{
-                ui.el(.spinner, .{ .width = 16, .height = 16, .semantics = .{ .label = "Installing" } }, .{}),
+                ui.el(.spinner, .{ .width = 16, .height = 16, .semantics = .{ .label = i18n.t("Installing", "インストール中") } }, .{}),
                 ui.text(.{ .size = .sm }, label),
             }),
         });
@@ -152,7 +152,7 @@ fn installBanner(ui: *AppUi, model: *const Model) AppUi.Node {
         return ui.el(.panel, .{ .padding = 12, .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.row(.{ .gap = 10, .cross = .center }, .{
                 ui.column(.{ .grow = 1 }, .{message}),
-                ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .dismiss_install_error }, "Dismiss"),
+                ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .dismiss_install_error }, i18n.t("Dismiss", "閉じる")),
             }),
         });
     }
@@ -165,21 +165,21 @@ fn agentsSection(ui: *AppUi, model: *const Model, icons: IconAtlas) AppUi.Node {
     for (model.agents, 0..) |info, i| {
         if (info.status == .absent) continue;
         const trailing = if (info.kind == .dsh and model.dsh_busy)
-            ui.button(.{ .size = .sm, .variant = .secondary, .disabled = true }, "Working")
+            ui.button(.{ .size = .sm, .variant = .secondary, .disabled = true }, i18n.t("Working", "処理中"))
         else if (info.kind == .dsh and info.status == .node)
-            ui.button(.{ .size = .sm, .variant = .secondary, .disabled = true }, "Restart DSH")
+            ui.button(.{ .size = .sm, .variant = .secondary, .disabled = true }, i18n.t("Restart DSH", "DSHを再起動"))
         else if (info.status == .current)
             ui.button(.{
                 .size = .sm,
                 .variant = .secondary,
                 .on_press = Msg{ .uninstall_agent = @intCast(i) },
-            }, "Disconnect")
+            }, i18n.t("Disconnect", "接続解除"))
         else
             ui.button(.{
                 .size = .sm,
                 .variant = .primary,
                 .on_press = Msg{ .install_agent = @intCast(i) },
-            }, if (info.status == .node) "Update" else "Install");
+            }, if (info.status == .node) i18n.t("Update", "アップデート") else i18n.t("Install", "インストール"));
         var logo = ui.image(.{
             .width = 24,
             .height = 24,
@@ -208,7 +208,7 @@ fn agentsSection(ui: *AppUi, model: *const Model, icons: IconAtlas) AppUi.Node {
     }
     if (count == 0) {
         return ui.el(.panel, .{ .padding = 12, .style_tokens = .{ .background = .surface, .radius = .md } }, .{
-            ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, "No coding agents detected on this machine"),
+            ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, i18n.t("No coding agents detected on this machine", "コーディングエージェントが見つかりません")),
         });
     }
     return ui.column(.{ .gap = 12 }, @as([]const AppUi.Node, rows[0..count]));
@@ -270,8 +270,8 @@ fn remoteSection(ui: *AppUi, model: *const Model) AppUi.Node {
         count += 1;
     }
     if (count == 0) return ui.el(.stack, .{}, .{});
-    const heading = ui.text(.{ .size = .lg }, "Remote Agents");
-    const hint = mutedParagraph(ui, "Declared in ~/.petdex/remote-agents.json; sync runs at launch");
+    const heading = ui.text(.{ .size = .lg }, i18n.t("Remote Agents", "リモートエージェント"));
+    const hint = mutedParagraph(ui, i18n.t("Declared in ~/.petdex/remote-agents.json; sync runs at launch", "~/.petdex/remote-agents.jsonで設定します。同期は起動時に行います"));
     const list = ui.column(.{ .gap = 12 }, @as([]const AppUi.Node, rows[0..count]));
     return ui.column(.{ .gap = 12 }, .{ heading, hint, list });
 }
@@ -281,30 +281,30 @@ var update_status_buf: [96]u8 = undefined;
 fn updatesSection(ui: *AppUi, model: *const Model) AppUi.Node {
     const latest = model.latest_version[0..model.latest_version_len];
     const version_status = switch (model.update_phase) {
-        .idle => std.fmt.bufPrint(&update_status_buf, "{s} · Not checked yet", .{app.updates.current_version}) catch app.updates.current_version,
-        .checking => std.fmt.bufPrint(&update_status_buf, "{s} · Checking…", .{app.updates.current_version}) catch app.updates.current_version,
-        .current => std.fmt.bufPrint(&update_status_buf, "{s} · Up to date", .{app.updates.current_version}) catch app.updates.current_version,
-        .available => std.fmt.bufPrint(&update_status_buf, "{s} installed · {s} available", .{ app.updates.current_version, latest }) catch app.updates.current_version,
-        .failed => std.fmt.bufPrint(&update_status_buf, "{s} · Check failed", .{app.updates.current_version}) catch app.updates.current_version,
+        .idle => i18n.bufPrint(&update_status_buf, "{s} · Not checked yet", "{s} · 未確認", .{app.updates.current_version}) catch app.updates.current_version,
+        .checking => i18n.bufPrint(&update_status_buf, "{s} · Checking…", "{s} · 確認中…", .{app.updates.current_version}) catch app.updates.current_version,
+        .current => i18n.bufPrint(&update_status_buf, "{s} · Up to date", "{s} · 最新", .{app.updates.current_version}) catch app.updates.current_version,
+        .available => i18n.bufPrint(&update_status_buf, "{s} installed · {s} available", "{s}をインストール済み · {s}が利用可能", .{ app.updates.current_version, latest }) catch app.updates.current_version,
+        .failed => i18n.bufPrint(&update_status_buf, "{s} · Check failed", "{s} · 確認に失敗", .{app.updates.current_version}) catch app.updates.current_version,
     };
     const version_action = if (model.update_phase == .available)
         if (model.install_source == .homebrew)
-            ui.button(.{ .variant = .primary, .on_press = .copy_brew_command }, if (model.brew_command_copied) "Copied" else "Copy brew upgrade command")
+            ui.button(.{ .variant = .primary, .on_press = .copy_brew_command }, if (model.brew_command_copied) i18n.t("Copied", "コピーしました") else i18n.t("Copy brew upgrade command", "brew upgradeのコマンドをコピー"))
         else
-            ui.button(.{ .variant = .primary, .on_press = .download_update }, "Download update")
+            ui.button(.{ .variant = .primary, .on_press = .download_update }, i18n.t("Download update", "アップデートをダウンロード"))
     else
-        ui.button(.{ .variant = .secondary, .on_press = .check_updates, .disabled = model.update_phase == .checking or model.update_cancel_pending }, "Check now");
+        ui.button(.{ .variant = .secondary, .on_press = .check_updates, .disabled = model.update_phase == .checking or model.update_cancel_pending }, i18n.t("Check now", "今すぐ確認"));
     const warning_title = if (builtin.os.tag == .macos and model.install_source == .homebrew)
-        "Homebrew manages updates"
+        i18n.t("Homebrew manages updates", "アップデートはHomebrewで管理")
     else
-        "Updates stay manual";
+        i18n.t("Updates stay manual", "アップデートは手動");
     const warning_copy = if (builtin.os.tag == .macos)
         if (model.install_source == .homebrew)
-            "Petdex never runs Brew for you. Update with brew upgrade --cask petdex."
+            i18n.t("Petdex never runs Brew for you. Update with brew upgrade --cask petdex.", "PetdexがBrewを実行することはありません。brew upgrade --cask petdexでアップデートしてください。")
         else
-            "Petdex never replaces itself. Homebrew users should install the petdex cask first."
+            i18n.t("Petdex never replaces itself. Homebrew users should install the petdex cask first.", "Petdexが自分自身を置き換えることはありません。Homebrewをお使いの場合は、先にpetdexのcaskをインストールしてください。")
     else
-        "Petdex can download a release, but never replaces itself automatically.";
+        i18n.t("Petdex can download a release, but never replaces itself automatically.", "Petdexはリリースをダウンロードできますが、自動で置き換えることはありません。");
     var warning = ui.el(.panel, .{ .padding = 12, .style_tokens = .{ .radius = .md } }, .{
         ui.column(.{ .gap = 4 }, .{
             ui.text(.{}, warning_title),
@@ -313,11 +313,11 @@ fn updatesSection(ui: *AppUi, model: *const Model) AppUi.Node {
     });
     warning.widget.style.background = if (model.dark) canvas.Color.rgb8(48, 38, 22) else canvas.Color.rgb8(255, 246, 214);
     return ui.column(.{ .gap = 12 }, .{
-        ui.text(.{ .size = .lg }, "Updates"),
+        ui.text(.{ .size = .lg }, i18n.t("Updates", "アップデート")),
         ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
                 ui.column(.{ .grow = 1 }, .{
-                    ui.text(.{}, "Current version"),
+                    ui.text(.{}, i18n.t("Current version", "現在のバージョン")),
                     mutedParagraph(ui, version_status),
                 }),
                 version_action,
@@ -326,13 +326,13 @@ fn updatesSection(ui: *AppUi, model: *const Model) AppUi.Node {
         ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
                 ui.column(.{ .grow = 1 }, .{
-                    ui.text(.{}, "Check automatically"),
-                    mutedParagraph(ui, "Quietly checks once per day"),
+                    ui.text(.{}, i18n.t("Check automatically", "自動で確認")),
+                    mutedParagraph(ui, i18n.t("Quietly checks once per day", "1日に1回、バックグラウンドで確認します")),
                 }),
                 ui.el(.switch_control, .{
                     .selected = model.update_checks_enabled,
                     .on_toggle = .toggle_update_checks,
-                    .semantics = .{ .label = "Check for updates automatically" },
+                    .semantics = .{ .label = i18n.t("Check for updates automatically", "アップデートを自動で確認") },
                 }, .{}),
             }),
         }),
@@ -342,22 +342,24 @@ fn updatesSection(ui: *AppUi, model: *const Model) AppUi.Node {
 
 fn cloudStatus(status: app.desktop_auth.PetStatus) []const u8 {
     return switch (status) {
-        .pending => "Pending review",
-        .approved => "Yours",
-        .rejected => "Needs changes",
-        .caught => "Caught",
+        .pending => i18n.t("Pending review", "審査待ち"),
+        .approved => i18n.t("Yours", "作成したペット"),
+        .rejected => i18n.t("Needs changes", "修正が必要"),
+        .caught => i18n.t("Caught", "捕まえたペット"),
     };
 }
 
 fn cloudPetRow(ui: *AppUi, pet: *const app.desktop_auth.Pet, cloud_id: u32, preview_cell: ?usize, images: CloudImages) AppUi.Node {
     const installed = catalog_mod.catalogIndexOf(pet.slugSlice()) != null;
     const usable = pet.status == .approved or pet.status == .caught;
+    // 「インストール」 is six full-width characters.
+    const width: f32 = if (i18n.current == .ja) 84 else 64;
     const action = if (!usable)
-        ui.button(.{ .size = .sm, .width = 64, .variant = .secondary, .disabled = true }, "Review")
+        ui.button(.{ .size = .sm, .width = width, .variant = .secondary, .disabled = true }, i18n.t("Review", "審査中"))
     else if (installed)
-        ui.button(.{ .size = .sm, .width = 64, .variant = .primary, .on_press = Msg{ .auth_install_pet = cloud_id } }, "Select")
+        ui.button(.{ .size = .sm, .width = width, .variant = .primary, .on_press = Msg{ .auth_install_pet = cloud_id } }, i18n.t("Select", "選択"))
     else
-        ui.button(.{ .size = .sm, .width = 64, .variant = .primary, .on_press = Msg{ .auth_install_pet = cloud_id } }, "Install");
+        ui.button(.{ .size = .sm, .width = width, .variant = .primary, .on_press = Msg{ .auth_install_pet = cloud_id } }, i18n.t("Install", "インストール"));
     const cell = preview_cell orelse images.preview_ready.len;
     var thumb = ui.image(.{
         .width = 40,
@@ -389,37 +391,37 @@ fn cloudPetRow(ui: *AppUi, pet: *const app.desktop_auth.Pet, cloud_id: u32, prev
             mutedParagraph(ui, cloudStatus(pet.status)),
         }),
         action,
-        ui.button(.{ .size = .sm, .width = 54, .variant = .secondary, .on_press = Msg{ .auth_open_pet = cloud_id } }, "Open"),
+        ui.button(.{ .size = .sm, .width = 54, .variant = .secondary, .on_press = Msg{ .auth_open_pet = cloud_id } }, i18n.t("Open", "開く")),
     });
 }
 
 fn cloudLibrarySection(ui: *AppUi, model: *const Model, images: CloudImages) AppUi.Node {
     const auth = &model.auth;
     const action = switch (auth.phase) {
-        .signed_out, .failed => ui.button(.{ .size = .sm, .variant = .primary, .on_press = .auth_sign_in }, if (auth.phase == .failed) "Try again" else "Sign in"),
+        .signed_out, .failed => ui.button(.{ .size = .sm, .variant = .primary, .on_press = .auth_sign_in }, if (auth.phase == .failed) i18n.t("Try again", "再試行") else i18n.t("Sign in", "サインイン")),
         .signed_in => ui.row(.{ .gap = 8 }, .{
-            ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .auth_refresh }, "Sync"),
-            ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .auth_sign_out }, "Sign out"),
+            ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .auth_refresh }, i18n.t("Sync", "同期")),
+            ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .auth_sign_out }, i18n.t("Sign out", "サインアウト")),
         }),
-        .loading, .authorizing, .exchanging, .syncing => ui.el(.spinner, .{ .width = 18, .height = 18, .semantics = .{ .label = "Working" } }, .{}),
-        .unavailable => ui.button(.{ .size = .sm, .variant = .secondary, .disabled = true }, "macOS only"),
+        .loading, .authorizing, .exchanging, .syncing => ui.el(.spinner, .{ .width = 18, .height = 18, .semantics = .{ .label = i18n.t("Working", "処理中") } }, .{}),
+        .unavailable => ui.button(.{ .size = .sm, .variant = .secondary, .disabled = true }, i18n.t("macOS only", "macOSのみ")),
     };
-    const title = if (auth.phase == .signed_in and auth.name_len > 0) auth.nameSlice() else "My Petdex";
+    const title = if (auth.phase == .signed_in and auth.name_len > 0) auth.nameSlice() else i18n.t("My Petdex", "マイPetdex");
     const caption = switch (auth.phase) {
-        .signed_out => "See pets you created and caught",
-        .loading => "Checking for a saved Petdex session",
-        .authorizing => "Finish signing in in your browser",
-        .exchanging => "Completing secure sign-in",
-        .syncing => "Syncing your Petdex library",
-        .signed_in => if (auth.email_len > 0) auth.emailSlice() else "Your cloud pet library",
-        .failed => if (auth.error_len > 0) auth.errorSlice() else "Petdex sign-in failed",
-        .unavailable => "Account sync currently uses macOS Keychain",
+        .signed_out => i18n.t("See pets you created and caught", "作成したペットと捕まえたペットを表示"),
+        .loading => i18n.t("Checking for a saved Petdex session", "保存済みのPetdexセッションを確認中"),
+        .authorizing => i18n.t("Finish signing in in your browser", "ブラウザでサインインを完了してください"),
+        .exchanging => i18n.t("Completing secure sign-in", "サインインを完了中"),
+        .syncing => i18n.t("Syncing your Petdex library", "Petdexライブラリを同期中"),
+        .signed_in => if (auth.email_len > 0) auth.emailSlice() else i18n.t("Your cloud pet library", "クラウドのペットライブラリ"),
+        .failed => if (auth.error_len > 0) auth.errorSlice() else i18n.t("Petdex sign-in failed", "Petdexにサインインできませんでした"),
+        .unavailable => i18n.t("Account sync currently uses macOS Keychain", "アカウントの同期は今のところmacOSのキーチェーンでのみ使えます"),
     };
     var avatar = ui.image(.{
         .width = 36,
         .height = 36,
         .image = if (auth.phase == .signed_in and images.avatar_ready) images.avatar_image else 0,
-        .semantics = .{ .label = "Profile photo" },
+        .semantics = .{ .label = i18n.t("Profile photo", "プロフィール写真") },
     });
     avatar.widget.image_fit = .cover;
     avatar.widget.style.radius = 18;
@@ -440,25 +442,25 @@ fn petsTop(ui: *AppUi, model: *const Model, filter: []const u8) AppUi.Node {
         .height = 34,
         .text = filter,
         .on_input = AppUi.inputMsg(.pet_filter),
-        .placeholder = "Search pets",
-        .semantics = .{ .label = "Search pets" },
+        .placeholder = i18n.t("Search pets", "ペットを検索"),
+        .semantics = .{ .label = i18n.t("Search pets", "ペットを検索") },
     }, .{});
     const filters = ui.row(.{ .gap = 6 }, .{
-        ui.button(.{ .size = .sm, .variant = if (model.pet_source == .installed) .primary else .secondary, .on_press = Msg{ .set_pet_source = @intFromEnum(app.desktop_auth.LibraryView.installed) } }, "Installed"),
-        ui.button(.{ .size = .sm, .variant = if (model.pet_source == .yours) .primary else .secondary, .disabled = model.auth.phase != .signed_in, .on_press = Msg{ .set_pet_source = @intFromEnum(app.desktop_auth.LibraryView.yours) } }, "Yours"),
-        ui.button(.{ .size = .sm, .variant = if (model.pet_source == .caught) .primary else .secondary, .disabled = model.auth.phase != .signed_in, .on_press = Msg{ .set_pet_source = @intFromEnum(app.desktop_auth.LibraryView.caught) } }, "Caught"),
-        ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .auth_open_community }, "Community"),
+        ui.button(.{ .size = .sm, .variant = if (model.pet_source == .installed) .primary else .secondary, .on_press = Msg{ .set_pet_source = @intFromEnum(app.desktop_auth.LibraryView.installed) } }, i18n.t("Installed", "インストール済み")),
+        ui.button(.{ .size = .sm, .variant = if (model.pet_source == .yours) .primary else .secondary, .disabled = model.auth.phase != .signed_in, .on_press = Msg{ .set_pet_source = @intFromEnum(app.desktop_auth.LibraryView.yours) } }, i18n.t("Yours", "作成した")),
+        ui.button(.{ .size = .sm, .variant = if (model.pet_source == .caught) .primary else .secondary, .disabled = model.auth.phase != .signed_in, .on_press = Msg{ .set_pet_source = @intFromEnum(app.desktop_auth.LibraryView.caught) } }, i18n.t("Caught", "捕まえた")),
+        ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .auth_open_community }, i18n.t("Community", "コミュニティ")),
     });
     if (model.install.busy() or model.install.error_len > 0) {
         return ui.column(.{ .gap = 8 }, .{
-            ui.text(.{ .size = .lg }, "Pets"),
+            ui.text(.{ .size = .lg }, i18n.t("Pets", "ペット")),
             filters,
             installBanner(ui, model),
             search,
         });
     }
     return ui.column(.{ .gap = 8 }, .{
-        ui.text(.{ .size = .lg }, "Pets"),
+        ui.text(.{ .size = .lg }, i18n.t("Pets", "ペット")),
         filters,
         search,
     });
@@ -468,7 +470,7 @@ fn petsTop(ui: *AppUi, model: *const Model, filter: []const u8) AppUi.Node {
 /// own language, so either can be found whatever the UI speaks.
 fn languagePanel(ui: *AppUi, model: *const Model) AppUi.Node {
     const caption = if (builtin.os.tag != .macos and !custom_font_active.* and model.language != .en)
-        i18n.t("Japanese needs a Japanese font in Custom font below", "日本語を表示するには、下の「カスタムフォント」に日本語フォントを指定してください")
+        i18n.t("Japanese needs a Japanese font in Custom font file below", "日本語を表示するには、下の「カスタムフォントファイル」に日本語フォントを指定してください")
     else if (builtin.os.tag == .macos)
         i18n.t("Auto follows your system language; the menu bar changes after a restart", "自動はシステムの言語に合わせます。メニューバーは再起動後に切り替わります")
     else
@@ -536,10 +538,10 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
                     ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, entry.rootSlice()),
                 }),
                 if (active)
-                    ui.button(.{ .size = .sm, .width = 64, .variant = .primary, .disabled = true }, "Active")
+                    ui.button(.{ .size = .sm, .width = 64, .variant = .primary, .disabled = true }, i18n.t("Active", "使用中"))
                 else
-                    ui.button(.{ .size = .sm, .width = 64, .variant = .primary, .on_press = Msg{ .select_pet = @intCast(i) } }, "Select"),
-                ui.button(.{ .size = .sm, .variant = .secondary, .on_press = Msg{ .open_pet_page = @intCast(i) } }, "Open"),
+                    ui.button(.{ .size = .sm, .width = 64, .variant = .primary, .on_press = Msg{ .select_pet = @intCast(i) } }, i18n.t("Select", "選択")),
+                ui.button(.{ .size = .sm, .variant = .secondary, .on_press = Msg{ .open_pet_page = @intCast(i) } }, i18n.t("Open", "開く")),
             });
             shown += 1;
         }
@@ -576,112 +578,112 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
         if (model.pet_source == .installed and matches > shown)
             ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .toggle_pets_expanded }, moreLabel(matches))
         else if (model.pet_source == .installed and model.pets_expanded and matches > 6)
-            ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .toggle_pets_expanded }, "Show less")
+            ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .toggle_pets_expanded }, i18n.t("Show less", "表示を減らす"))
         else if (model.pet_source != .installed and matches > shown)
-            ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .auth_open_library }, "Open all on Petdex")
+            ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .auth_open_library }, i18n.t("Open all on Petdex", "Petdexですべて開く"))
         else if (matches == 0)
-            ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, if (model.pet_source == .installed) "No installed pets match your search" else "No pets match your search")
+            ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, if (model.pet_source == .installed) i18n.t("No installed pets match your search", "一致するインストール済みのペットはありません") else i18n.t("No pets match your search", "一致するペットはありません"))
         else
             ui.el(.stack, .{}, .{}),
         ui.el(.stack, .{ .height = 10 }, .{}),
-        ui.text(.{ .size = .lg }, "Agents"),
+        ui.text(.{ .size = .lg }, i18n.t("Agents", "エージェント")),
         agentsSection(ui, model, icons),
         herdrSection(ui, model, icons),
         remoteSection(ui, model),
         ui.el(.stack, .{ .height = 10 }, .{}),
         chat_view.settingsSection(ui, model),
         ui.el(.stack, .{ .height = 10 }, .{}),
-        ui.text(.{ .size = .lg }, "Appearance"),
+        ui.text(.{ .size = .lg }, i18n.t("Appearance", "外観")),
         languagePanel(ui, model),
         ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
                 ui.column(.{ .grow = 1 }, .{
-                    ui.text(.{}, "Pet size"),
-                    mutedParagraph(ui, "Adjust the size of your pet"),
+                    ui.text(.{}, i18n.t("Pet size", "ペットの大きさ")),
+                    mutedParagraph(ui, i18n.t("Adjust the size of your pet", "ペットの表示サイズを調整します")),
                 }),
-                ui.el(.slider, .{ .width = 150, .value = scale_fraction, .on_value = AppUi.valueMsg(.set_scale), .semantics = .{ .label = "Pet size" } }, .{}),
+                ui.el(.slider, .{ .width = 150, .value = scale_fraction, .on_value = AppUi.valueMsg(.set_scale), .semantics = .{ .label = i18n.t("Pet size", "ペットの大きさ") } }, .{}),
             }),
         }),
         ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
                 ui.column(.{ .grow = 1 }, .{
-                    ui.text(.{}, "Bubble text size"),
-                    mutedParagraph(ui, "Size of the bubble text"),
+                    ui.text(.{}, i18n.t("Bubble text size", "吹き出しの文字サイズ")),
+                    mutedParagraph(ui, i18n.t("Size of the bubble text", "吹き出しに表示する文字の大きさ")),
                 }),
-                ui.el(.slider, .{ .width = 150, .value = bubble_text_fraction, .on_value = AppUi.valueMsg(.set_bubble_text_size), .semantics = .{ .label = "Bubble text size" } }, .{}),
+                ui.el(.slider, .{ .width = 150, .value = bubble_text_fraction, .on_value = AppUi.valueMsg(.set_bubble_text_size), .semantics = .{ .label = i18n.t("Bubble text size", "吹き出しの文字サイズ") } }, .{}),
             }),
         }),
         ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.column(.{ .padding = 12, .gap = 8 }, .{
-                ui.text(.{}, "Custom font file"),
+                ui.text(.{}, i18n.t("Custom font file", "カスタムフォントファイル")),
                 mutedParagraph(ui, if (model.font_load_failed)
-                    "Could not load this TrueType font; the default font is active"
+                    i18n.t("Could not load this TrueType font; the default font is active", "このTrueTypeフォントを読み込めませんでした。標準のフォントを使用しています")
                 else if (model.font_path_dirty)
-                    "Saved; restart Petdex to apply"
+                    i18n.t("Saved; restart Petdex to apply", "保存しました。Petdexを再起動すると反映されます")
                 else if (custom_font_active.*)
-                    "Applied to all app text; restart after changing the path"
+                    i18n.t("Applied to all app text; restart after changing the path", "アプリのすべての文字に適用中。パスを変えたら再起動してください")
                 else
-                    "Optional local .ttf path; leave empty for the default font"),
+                    i18n.t("Optional local .ttf path; leave empty for the default font", "ローカルの.ttfファイルのパス。空欄なら標準のフォントを使います")),
                 ui.el(.input, .{
                     .height = 34,
                     .text = model.font_path.text(),
                     .on_input = AppUi.inputMsg(.font_path_input),
                     .placeholder = "/path/to/font.ttf",
-                    .semantics = .{ .label = "Custom font file path" },
+                    .semantics = .{ .label = i18n.t("Custom font file path", "カスタムフォントファイルのパス") },
                 }, .{}),
             }),
         }),
         ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
                 ui.column(.{ .grow = 1 }, .{
-                    ui.text(.{}, "Show messages"),
-                    mutedParagraph(ui, "Agent activity bubbles over the pet"),
+                    ui.text(.{}, i18n.t("Show messages", "メッセージを表示")),
+                    mutedParagraph(ui, i18n.t("Agent activity bubbles over the pet", "エージェントの動きをペットの吹き出しで表示")),
                 }),
                 ui.el(.switch_control, .{
                     .selected = model.bubbles_enabled,
                     .on_toggle = .toggle_bubbles,
-                    .semantics = .{ .label = "Show messages" },
+                    .semantics = .{ .label = i18n.t("Show messages", "メッセージを表示") },
                 }, .{}),
             }),
         }),
         ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
                 ui.column(.{ .grow = 1 }, .{
-                    ui.text(.{}, "One bubble per conversation"),
-                    mutedParagraph(ui, "Stack a card per agent; off shows one bubble at a time"),
+                    ui.text(.{}, i18n.t("One bubble per conversation", "会話ごとに吹き出しを分ける")),
+                    mutedParagraph(ui, i18n.t("Stack a card per agent; off shows one bubble at a time", "エージェントごとにカードを重ねます。オフにすると吹き出しは1つずつ表示されます")),
                 }),
                 ui.el(.switch_control, .{
                     .selected = model.bubbles_per_conversation,
                     .on_toggle = .toggle_bubbles_per_conversation,
-                    .semantics = .{ .label = "One bubble per conversation" },
+                    .semantics = .{ .label = i18n.t("One bubble per conversation", "会話ごとに吹き出しを分ける") },
                 }, .{}),
             }),
         }),
         ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
                 ui.column(.{ .grow = 1 }, .{
-                    ui.text(.{}, "Bubble lifetime"),
-                    mutedParagraph(ui, "0 keeps bubbles visible; 1–60 seconds enables expiry"),
+                    ui.text(.{}, i18n.t("Bubble lifetime", "吹き出しの表示時間")),
+                    mutedParagraph(ui, i18n.t("0 keeps bubbles visible; 1–60 seconds enables expiry", "0で表示し続けます。1〜60秒を指定すると自動で消えます")),
                 }),
                 ui.el(.input, .{
                     .width = 72,
                     .height = 34,
                     .text = model.bubble_lifetime_text[0..model.bubble_lifetime_text_len],
                     .on_input = AppUi.inputMsg(.bubble_lifetime_input),
-                    .semantics = .{ .label = "Bubble lifetime in seconds" },
+                    .semantics = .{ .label = i18n.t("Bubble lifetime in seconds", "吹き出しの表示秒数") },
                 }, .{}),
             }),
         }),
         ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
                 ui.column(.{ .grow = 1 }, .{
-                    ui.text(.{}, "Rotate pet daily"),
-                    mutedParagraph(ui, "Wake up to a different pet each day"),
+                    ui.text(.{}, i18n.t("Rotate pet daily", "毎日ペットを入れ替える")),
+                    mutedParagraph(ui, i18n.t("Wake up to a different pet each day", "毎日違うペットに会えます")),
                 }),
                 ui.el(.switch_control, .{
                     .selected = model.rotate_pets,
                     .on_toggle = .toggle_rotate_pets,
-                    .semantics = .{ .label = "Rotate pet daily" },
+                    .semantics = .{ .label = i18n.t("Rotate pet daily", "毎日ペットを入れ替える") },
                 }, .{}),
             }),
         }),
@@ -691,13 +693,13 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
             ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
                 ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
                     ui.column(.{ .grow = 1 }, .{
-                        ui.text(.{}, "Launch at login"),
-                        mutedParagraph(ui, "Start Petdex when you log in"),
+                        ui.text(.{}, i18n.t("Launch at login", "ログイン時に起動")),
+                        mutedParagraph(ui, i18n.t("Start Petdex when you log in", "ログインしたときにPetdexを起動します")),
                     }),
                     ui.el(.switch_control, .{
                         .selected = model.launch_at_login,
                         .on_toggle = .toggle_launch_at_login,
-                        .semantics = .{ .label = "Launch at login" },
+                        .semantics = .{ .label = i18n.t("Launch at login", "ログイン時に起動") },
                     }, .{}),
                 }),
             })
@@ -709,13 +711,13 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
             ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
                 ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
                     ui.column(.{ .grow = 1 }, .{
-                        ui.text(.{}, "Hide Dock icon"),
-                        mutedParagraph(ui, "Petdex lives in the menu bar only"),
+                        ui.text(.{}, i18n.t("Hide Dock icon", "Dockにアイコンを表示しない")),
+                        mutedParagraph(ui, i18n.t("Petdex lives in the menu bar only", "Petdexはメニューバーにだけ表示されます")),
                     }),
                     ui.el(.switch_control, .{
                         .selected = model.hide_dock,
                         .on_toggle = .toggle_hide_dock,
-                        .semantics = .{ .label = "Hide Dock icon" },
+                        .semantics = .{ .label = i18n.t("Hide Dock icon", "Dockにアイコンを表示しない") },
                     }, .{}),
                 }),
             })
@@ -724,23 +726,23 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
         ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
                 ui.column(.{ .grow = 1 }, .{
-                    ui.text(.{}, "Waiting sound"),
-                    mutedParagraph(ui, "Play a chime when your agent is waiting for your input"),
+                    ui.text(.{}, i18n.t("Waiting sound", "待機中の通知音")),
+                    mutedParagraph(ui, i18n.t("Play a chime when your agent is waiting for your input", "エージェントが入力を待っているときにチャイムを鳴らします")),
                 }),
                 ui.el(.switch_control, .{
                     .selected = model.waiting_sound,
                     .on_toggle = .toggle_waiting_sound,
-                    .semantics = .{ .label = "Waiting sound" },
+                    .semantics = .{ .label = i18n.t("Waiting sound", "待機中の通知音") },
                 }, .{}),
             }),
         }),
         ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
                 ui.column(.{ .grow = 1 }, .{
-                    ui.text(.{}, "Custom pets"),
+                    ui.text(.{}, i18n.t("Custom pets", "カスタムペット")),
                     ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, "~/.petdex/pets"),
                 }),
-                ui.button(.{ .on_press = .open_pets_folder }, "Open folder"),
+                ui.button(.{ .on_press = .open_pets_folder }, i18n.t("Open folder", "フォルダを開く")),
             }),
         }),
         ui.el(.stack, .{ .height = 10 }, .{}),
