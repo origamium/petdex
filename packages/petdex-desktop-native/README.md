@@ -47,9 +47,15 @@ deletes that file once it passes 32 MB.
 ## Bubbles
 
 Each coding-agent conversation floats over the pet as a bubble with the
-agent's logo. An orange dot means the agent needs you, a red one that it
-failed. Click a bubble for its project and status; click again to close it.
-A finished bubble pops a moment later. Up to ten conversations float at once.
+agent's logo. A bubble waiting on you glows, with an orange dot; one that hit
+an error wears a red "!". Click a bubble to open it into a card: the project,
+the agent and its status, the model and reasoning effort when the agent
+reports them (Claude Code, Codex, OpenCode), and the first lines of what it is
+doing or last said. Click again to close it. A finished bubble pops a moment
+later. Up to ten conversations float at once.
+
+Claude Code reports failed tools and failed turns once its hooks are installed
+again from Settings; an earlier install keeps working without them.
 
 ## Chat
 
