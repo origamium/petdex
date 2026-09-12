@@ -178,6 +178,7 @@ pub const Msg = union(enum) {
     chat_response: native_sdk.EffectResponse,
     set_chat_provider: u32,
     set_chat_stack: u32,
+    set_language: u32,
     chat_model_input: canvas.TextInputEvent,
     chat_url_input: canvas.TextInputEvent,
     chat_detect_models,
@@ -279,6 +280,7 @@ pub const Model = struct {
     /// Sprite scale, persisted. Codex parity: the settings slider maps
     /// 0.4..1.2 over this.
     scale: f32 = 0.7,
+    language: i18n.Pref = .auto,
     active_pet: u32 = 0,
     window_fitted: bool = false,
     bubbles_enabled: bool = true,
@@ -1357,11 +1359,18 @@ fn jsonUnescapeString(value: []const u8, output: []u8) ?[]const u8 {
 fn saveSettings(model: *const Model) void {
     var path_buf: [512]u8 = undefined;
     const path = settingsPath(&path_buf) orelse return;
-    // Headroom check (a bufPrint overflow here fails silently and
-    // drops the whole save): keep room for the configurable bubble
-    // fields, rotation state, a long slug, and negative coordinates.
-    // Grown with every key added; `font_path` alone can escape to 1024.
-    var buf: [2304]u8 = undefined;
+    var buf: [settings_json_bytes]u8 = undefined;
+    const json = settingsJson(model, &buf) orelse return;
+    cWriteFile(path, json);
+}
+
+// Headroom check (a bufPrint overflow here fails silently and drops the
+// whole save): keep room for the configurable bubble fields, rotation
+// state, a long slug, and negative coordinates. Grown with every key
+// added; `font_path` alone can escape to 1024.
+const settings_json_bytes = 2336;
+
+fn settingsJson(model: *const Model, buf: []u8) ?[]const u8 {
     const active = if (model.active_pet < catalog_mod.catalog_len) catalog[model.active_pet].slice() else "";
     // The position keys only exist once the window has been fitted and
     // read: a save fired on the very first frame would otherwise
@@ -1374,10 +1383,9 @@ fn saveSettings(model: *const Model) void {
         "";
     var escaped_font_buf: [1024]u8 = undefined;
     const font_path = std.mem.trim(u8, model.font_path.text(), " \t\r\n");
-    const escaped_font = jsonEscapeString(font_path, &escaped_font_buf) orelse return;
+    const escaped_font = jsonEscapeString(font_path, &escaped_font_buf) orelse return null;
     const latest = model.latest_version[0..model.latest_version_len];
-    const json = std.fmt.bufPrint(&buf, "{{\"active_pet\":\"{s}\",\"scale\":{d:.2},\"bubbles\":{},\"bubbles_per_conversation\":{},\"waiting_sound\":{},\"bubble_text\":{d:.1},\"bubble_lifetime\":{d:.0},\"font_path\":\"{s}\",\"hide_dock\":{},\"rotate_pets\":{},\"rotation_day\":{d},\"update_checks\":{},\"last_update_check_ms\":{d},\"latest_desktop_version\":\"{s}\"{s},\"agents_prompted\":{}}}", .{ active, model.scale, model.bubbles_enabled, model.bubbles_per_conversation, model.waiting_sound, model.bubble_text_px, model.bubble_lifetime_secs, escaped_font, model.hide_dock, model.rotate_pets, model.rotation_day, model.update_checks_enabled, model.last_update_check_ms, latest, pos, model.agents_prompted }) catch return;
-    cWriteFile(path, json);
+    return std.fmt.bufPrint(buf, "{{\"active_pet\":\"{s}\",\"scale\":{d:.2},\"bubbles\":{},\"bubbles_per_conversation\":{},\"waiting_sound\":{},\"bubble_text\":{d:.1},\"bubble_lifetime\":{d:.0},\"font_path\":\"{s}\",\"hide_dock\":{},\"rotate_pets\":{},\"rotation_day\":{d},\"update_checks\":{},\"last_update_check_ms\":{d},\"latest_desktop_version\":\"{s}\"{s},\"agents_prompted\":{},\"language\":\"{s}\"}}", .{ active, model.scale, model.bubbles_enabled, model.bubbles_per_conversation, model.waiting_sound, model.bubble_text_px, model.bubble_lifetime_secs, escaped_font, model.hide_dock, model.rotate_pets, model.rotation_day, model.update_checks_enabled, model.last_update_check_ms, latest, pos, model.agents_prompted, @tagName(model.language) }) catch null;
 }
 
 fn setUnsignedText(buffer: []u8, length: *usize, value: u16) void {
@@ -1497,6 +1505,15 @@ fn freeSheet(s: *Sheet) void {
 }
 
 var initial_scale: f32 = 0.7;
+var initial_language: i18n.Pref = .auto;
+/// Whether the launch environment asks for Japanese (macOS preferences,
+/// the Windows UI language, the POSIX locale); read once in main().
+var os_japanese = false;
+
+/// Resolve the Settings choice into the language the UI speaks.
+fn applyLanguage(pref: i18n.Pref) void {
+    i18n.current = i18n.resolve(pref, os_japanese, builtin.os.tag == .macos or custom_font_active);
+}
 var initial_pet: u32 = 0;
 var initial_bubbles: bool = true;
 var initial_bubbles_per_conversation: bool = true;
@@ -1845,6 +1862,9 @@ fn resolveInitialPet(io: std.Io, allocator: std.mem.Allocator, environ_map: *std
                 if (jsonUnescapeString(encoded, &initial_font_path)) |value| {
                     initial_font_path_len = value.len;
                 }
+            }
+            if (hook_server.jsonStringPub(json, "language")) |value| {
+                initial_language = std.meta.stringToEnum(i18n.Pref, value) orelse .auto;
             }
             if (hook_server.jsonStringPub(json, "bubbles")) |_| {} else if (std.mem.indexOf(u8, json, "\"bubbles\":false") != null) {
                 initial_bubbles = false;
@@ -2197,6 +2217,7 @@ pub fn boot(model: *Model, fx: *Effects) void {
     // not cost the user their scale, their bubble preference, or the
     // Agents section.
     model.scale = initial_scale;
+    model.language = initial_language;
     model.bubbles_enabled = initial_bubbles;
     model.bubbles_per_conversation = initial_bubbles_per_conversation;
     model.waiting_sound = initial_waiting_sound;
@@ -2660,6 +2681,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .settings_closed => model.settings_open = false,
         .clear_notifications => clearBubble(model),
+        .set_language => |raw| {
+            model.language = std.enums.fromInt(i18n.Pref, raw) orelse return;
+            applyLanguage(model.language);
+            saveSettings(model);
+        },
         .open_chat,
         .show_chat,
         .chat_brief,
@@ -4973,6 +4999,10 @@ pub fn main(init: std.process.Init) !void {
             initial_font_load_failed = true;
         }
     }
+    // After the hook fast path (hooks never pay for the lookup) and the
+    // custom font (it decides whether Japanese can be drawn).
+    os_japanese = plat.systemPrefersJapanese(.{ init.environ_map.get("LC_ALL"), init.environ_map.get("LC_MESSAGES"), init.environ_map.get("LANG") });
+    applyLanguage(initial_language);
     const app_state = try PetdexApp.create(std.heap.page_allocator, .{
         .name = "petdex-desktop-native",
         .scene = shell_scene,
@@ -5424,6 +5454,19 @@ test "the hook stack keeps clear of an open chat bubble" {
     // Chat on the left: the card's left edge stops at the pet's.
     model.chat.place.left = true;
     try std.testing.expectApproxEqAbs(1000 - bubble_canvas_margin, bubbleWantX(&model, w), 0.001);
+}
+
+test "settings JSON keeps the language and fits the worst-case font path" {
+    var model: Model = .{};
+    model.language = .ja;
+    model.window_fitted = true;
+    model.pet_x = -123456;
+    model.pet_y = -123456;
+    // Every byte a quote: the longest escape the font path can take.
+    model.font_path.set("\"" ** 512);
+    var buf: [settings_json_bytes]u8 = undefined;
+    const json = settingsJson(&model, &buf).?;
+    try std.testing.expectEqual(i18n.Pref.ja, std.meta.stringToEnum(i18n.Pref, hook_server.jsonStringPub(json, "language").?).?);
 }
 
 test "custom font path round-trips through settings JSON escaping" {

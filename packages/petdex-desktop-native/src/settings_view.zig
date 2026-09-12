@@ -30,6 +30,7 @@ const max_catalog = catalog_mod.max_catalog;
 const agent_hooks = @import("agent_hooks.zig");
 const remote_runtime = @import("remote_runtime.zig");
 const chat_view = @import("chat_view.zig");
+const i18n = @import("i18n.zig");
 const settingsBackground = app.settingsBackground;
 const companion_header_h = app.companion_header_h;
 
@@ -463,6 +464,36 @@ fn petsTop(ui: *AppUi, model: *const Model, filter: []const u8) AppUi.Node {
     });
 }
 
+/// Auto follows the system language. English and 日本語 are named in their
+/// own language, so either can be found whatever the UI speaks.
+fn languagePanel(ui: *AppUi, model: *const Model) AppUi.Node {
+    const caption = if (builtin.os.tag != .macos and !custom_font_active.* and model.language != .en)
+        i18n.t("Japanese needs a Japanese font in Custom font below", "日本語を表示するには、下の「カスタムフォント」に日本語フォントを指定してください")
+    else if (builtin.os.tag == .macos)
+        i18n.t("Auto follows your system language; the menu bar changes after a restart", "自動はシステムの言語に合わせます。メニューバーは再起動後に切り替わります")
+    else
+        i18n.t("Auto follows your system language", "自動はシステムの言語に合わせます");
+    var buttons: [3]AppUi.Node = undefined;
+    for (&buttons, [_]i18n.Pref{ .auto, .en, .ja }) |*button, pref| button.* = ui.button(.{
+        .size = .sm,
+        .variant = if (model.language == pref) .primary else .secondary,
+        .on_press = Msg{ .set_language = @intFromEnum(pref) },
+    }, switch (pref) {
+        .auto => i18n.t("Auto", "自動"),
+        .en => "English",
+        .ja => "日本語",
+    });
+    return ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
+        ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
+            ui.column(.{ .grow = 1 }, .{
+                ui.text(.{}, i18n.t("Language", "言語")),
+                mutedParagraph(ui, caption),
+            }),
+            ui.row(.{ .gap = 6 }, @as([]const AppUi.Node, &buttons)),
+        }),
+    });
+}
+
 pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: ThumbAtlas, cloud_images: CloudImages) AppUi.Node {
     var rows: [max_catalog]AppUi.Node = undefined;
     var shown: usize = 0;
@@ -561,6 +592,7 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
         chat_view.settingsSection(ui, model),
         ui.el(.stack, .{ .height = 10 }, .{}),
         ui.text(.{ .size = .lg }, "Appearance"),
+        languagePanel(ui, model),
         ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
                 ui.column(.{ .grow = 1 }, .{
