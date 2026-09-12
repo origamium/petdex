@@ -1,0 +1,54 @@
+diff --git a/src/runtime/effects.zig b/src/runtime/effects.zig
+index 284f05d..4401843 100644
+--- a/src/runtime/effects.zig
++++ b/src/runtime/effects.zig
+@@ -66,6 +66,7 @@ const std = @import("std");
+ const builtin = @import("builtin");
+ const platform = @import("../platform/root.zig");
+ const runtime_clock = @import("clock.zig");
++const canvas = @import("canvas");
+ 
+ /// Maximum in-flight effects (spawn slots / worker threads).
+ pub const max_effects: usize = 16;
+@@ -1789,6 +1790,9 @@ pub fn Effects(comptime Msg: type) type {
+         /// by `UiApp` alongside the services — the seam behind
+         /// app-drawn window controls (loop-thread only).
+         window_actions: ?WindowActionBinding = null,
++        /// petdex: the runtime's text measurement, set by `UiApp`
++        /// alongside the window verbs (see `textMeasure`).
++        text_measure: ?*const canvas.TextMeasureProvider = null,
+         /// The embedding host's named-command services (`hostSend` /
+         /// `hostRequest`), bound by whoever hosts a transpiled app core
+         /// (loop-thread only). Null means no host services: sends drop,
+@@ -3339,6 +3343,16 @@ pub fn Effects(comptime Msg: type) type {
+         /// `wallMs` replay-clock pattern) is the declared follow-up;
+         /// until then, apps that need replay-clean sessions should
+         /// treat the result as presentation-only.
++        /// petdex: the text measurement the runtime stamps into layout
++        /// tokens, so app-side layout (line counts, hugging widths)
++        /// wraps exactly as presentation draws. Null under the fake
++        /// executor or where the platform has none; the estimator then
++        /// stands in, as it does for layout.
++        pub fn textMeasure(self: *Self) ?*const canvas.TextMeasureProvider {
++            if (self.executor == .fake) return null;
++            return self.text_measure;
++        }
++
+         pub fn moveWindow(self: *Self, window_label: []const u8, dx: f64, dy: f64, clamp: bool) ?MoveWindowResult {
+             if (self.executor == .fake) return null;
+             const binding = self.window_actions orelse return null;
+diff --git a/src/runtime/ui_app.zig b/src/runtime/ui_app.zig
+index bedf1c3..a5d2b02 100644
+--- a/src/runtime/ui_app.zig
++++ b/src/runtime/ui_app.zig
+@@ -1101,6 +1101,10 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+                 .focus_fn = effectsFocusWindowByLabel,
+                 .minimize_fn = effectsMinimizeWindowByLabel,
+             });
++            // petdex: the measurement layout stamps into tokens, for
++            // update-side layout. The host provider, where there is one,
++            // is fixed for the runtime's lifetime.
++            self.effects.text_measure = runtime.textMeasureProvider();
+             if (runtime.options.session_recorder) |recorder| {
+                 self.effects.bindJournal(recorder.effectJournal());
+             }

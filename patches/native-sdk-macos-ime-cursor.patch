@@ -1,0 +1,19 @@
+diff --git a/src/platform/macos/appkit_host.m b/src/platform/macos/appkit_host.m
+index d33f1f9..cd17886 100644
+--- a/src/platform/macos/appkit_host.m
++++ b/src/platform/macos/appkit_host.m
+@@ -6179,7 +6179,13 @@ static double NativeSdkClampedPinchMagnification(double magnification) {
+     }
+     self.markedText = text;
+     self.markedTextRange = NSMakeRange(0, text.length);
+-    [self emitTextInputEventWithKind:NATIVE_SDK_APPKIT_GPU_INPUT_IME_SET_COMPOSITION text:text compositionCursor:(NSInteger)cursor];
++    // petdex: AppKit counts the cursor in UTF-16 units, the gpu_surface
++    // contract in UTF-8 bytes (the Windows host converts GCS_CURSORPOS the
++    // same way). Unconverted, a Japanese composition put the caret a third
++    // of the way in, and commit left it there.
++    if (cursor < text.length) cursor = [text rangeOfComposedCharacterSequenceAtIndex:cursor].location;
++    NSUInteger cursorBytes = [[text substringToIndex:cursor] lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
++    [self emitTextInputEventWithKind:NATIVE_SDK_APPKIT_GPU_INPUT_IME_SET_COMPOSITION text:text compositionCursor:(NSInteger)cursorBytes];
+ }
+ 
+ - (void)unmarkText {
