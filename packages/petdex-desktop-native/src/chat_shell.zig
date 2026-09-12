@@ -600,6 +600,8 @@ fn clear(model: *Model, fx: *Effects) void {
         fx.cancel(key);
     }
     st.session.load(&.{});
+    st.history = false;
+    st.scroll = 0;
     if (ensureHistory()) |h| h.clear(st.petSlug());
 }
 

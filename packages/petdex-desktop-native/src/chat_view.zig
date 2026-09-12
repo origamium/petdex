@@ -401,19 +401,13 @@ fn composer(ui: *AppUi, model: *const Model, st: *const State) AppUi.Node {
 /// Small round buttons under the composer. Each wears the bubble surface
 /// so it stays legible over any desktop.
 fn controls(ui: *AppUi, model: *const Model, st: *const State) AppUi.Node {
-    var nodes: [4]AppUi.Node = undefined;
-    var n: usize = 0;
-    nodes[n] = ui.el(.stack, .{ .grow = 1 }, .{});
-    n += 1;
-    if (st.history) {
-        nodes[n] = roundButton(ui, model, "trash", "Clear Chat", .chat_clear, st.session.transcript.len() == 0);
-        n += 1;
-    }
-    nodes[n] = roundButton(ui, model, "clock", if (st.history) "Latest Reply" else "Earlier Messages", .chat_toggle_history, false);
-    n += 1;
-    nodes[n] = roundButton(ui, model, "x", "Close Chat", .chat_closed, false);
-    n += 1;
-    return ui.row(.{ .gap = 6, .width = card_w }, @as([]const AppUi.Node, nodes[0..n]));
+    return ui.row(.{ .gap = 6, .width = card_w }, .{
+        ui.el(.stack, .{ .grow = 1 }, .{}),
+        // Starts over: the conversation and its saved history go.
+        roundButton(ui, model, "edit", "New Chat", .chat_clear, st.session.transcript.len() == 0 and !st.session.busy()),
+        roundButton(ui, model, "clock", if (st.history) "Latest Reply" else "Earlier Messages", .chat_toggle_history, false),
+        roundButton(ui, model, "x", "Close Chat", .chat_closed, false),
+    });
 }
 
 fn roundButton(ui: *AppUi, model: *const Model, icon: []const u8, label: []const u8, msg: Msg, disabled: bool) AppUi.Node {

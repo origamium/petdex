@@ -160,6 +160,7 @@ pub const Msg = union(enum) {
     auth_avatar_response: native_sdk.EffectResponse,
     auth_preview_response: native_sdk.EffectResponse,
     auth_library_done: native_sdk.EffectExit,
+    clear_notifications,
     // Pet chat (chat_shell.zig).
     open_chat,
     show_chat,
@@ -2657,6 +2658,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             startAuthImages(model, fx);
         },
         .settings_closed => model.settings_open = false,
+        .clear_notifications => clearBubble(model),
         .open_chat,
         .show_chat,
         .chat_brief,
@@ -3339,6 +3341,7 @@ pub fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "petdex.updates")) return .check_updates;
     if (std.mem.eql(u8, name, "petdex.flock")) return .toggle_flock_window;
     if (std.mem.eql(u8, name, "petdex.chat")) return .open_chat;
+    if (std.mem.eql(u8, name, "petdex.clear-notifications")) return .clear_notifications;
     return null;
 }
 
@@ -3351,6 +3354,7 @@ const pet_menu = [_]AppUi.ContextMenuItem{
     .{ .label = "Open Flock", .msg = .toggle_flock_window },
     .{ .label = "View Pet on Petdex", .msg = .open_active_pet_page },
     .{ .label = "Chat", .msg = .open_chat },
+    .{ .label = "Clear Notifications", .msg = .clear_notifications },
     .{ .label = "Close Pet", .msg = .close_pet },
 };
 
@@ -4825,18 +4829,19 @@ fn petdexStatusItem(model: *const Model, scratch: *PetdexApp.StatusItemScratch) 
         .label = if (model.focus_mode) "Focus Mode: On" else "Focus Mode: Off",
         .command = "petdex.focus",
     };
-    scratch.items[5] = .{ .id = 5, .label = "Shuffle Pet", .command = "petdex.shuffle" };
-    scratch.items[6] = .{
+    scratch.items[5] = .{ .id = 13, .label = "Clear Notifications", .command = "petdex.clear-notifications", .enabled = model.bubbles_len > 0 };
+    scratch.items[6] = .{ .id = 5, .label = "Shuffle Pet", .command = "petdex.shuffle" };
+    scratch.items[7] = .{
         .id = 6,
         .label = if (model.flock.open) "Hide Flock" else "Show Flock",
         .command = "petdex.flock",
     };
-    scratch.items[7] = .{ .id = 7, .label = "View Pet on Petdex", .command = "petdex.pet-page" };
-    scratch.items[8] = .{ .id = 8, .separator = true };
-    scratch.items[9] = .{ .id = 9, .label = update_label, .command = "petdex.updates", .enabled = model.update_phase != .checking };
-    scratch.items[10] = .{ .id = 10, .separator = true };
-    scratch.items[11] = .{ .id = 11, .label = "Quit Petdex", .command = "petdex.quit" };
-    return .{ .items = scratch.items[0..12] };
+    scratch.items[8] = .{ .id = 7, .label = "View Pet on Petdex", .command = "petdex.pet-page" };
+    scratch.items[9] = .{ .id = 8, .separator = true };
+    scratch.items[10] = .{ .id = 9, .label = update_label, .command = "petdex.updates", .enabled = model.update_phase != .checking };
+    scratch.items[11] = .{ .id = 10, .separator = true };
+    scratch.items[12] = .{ .id = 11, .label = "Quit Petdex", .command = "petdex.quit" };
+    return .{ .items = scratch.items[0..13] };
 }
 
 /// The menu-bar button icon: the brand mark's silhouette with the face
@@ -5286,19 +5291,25 @@ test "tray exposes website active pet and updater commands" {
     var model: Model = .{};
     var scratch: PetdexApp.StatusItemScratch = .{};
     var state = petdexStatusItem(&model, &scratch);
-    try std.testing.expectEqual(@as(usize, 12), state.items.len);
+    try std.testing.expectEqual(@as(usize, 13), state.items.len);
     try std.testing.expectEqualStrings("petdex.chat", state.items[1].command);
     try std.testing.expectEqualStrings("Open petdex.dev", state.items[2].label);
-    try std.testing.expectEqualStrings("Show Flock", state.items[6].label);
-    try std.testing.expectEqualStrings("View Pet on Petdex", state.items[7].label);
-    try std.testing.expect(std.mem.startsWith(u8, state.items[9].label, "Check for Updates"));
+    try std.testing.expectEqualStrings("petdex.clear-notifications", state.items[5].command);
+    // Nothing to clear, nothing to press.
+    try std.testing.expect(!state.items[5].enabled);
+    try std.testing.expectEqualStrings("Show Flock", state.items[7].label);
+    try std.testing.expectEqualStrings("View Pet on Petdex", state.items[8].label);
+    try std.testing.expect(std.mem.startsWith(u8, state.items[10].label, "Check for Updates"));
     try std.testing.expectEqual(std.meta.Tag(Msg).open_chat, std.meta.activeTag(onCommand("petdex.chat").?));
+    try std.testing.expectEqual(std.meta.Tag(Msg).clear_notifications, std.meta.activeTag(onCommand("petdex.clear-notifications").?));
 
+    testPushBubble(&model, "alpha", "waiting", false, -1);
     model.update_phase = .available;
     @memcpy(model.latest_version[0.."0.10.0".len], "0.10.0");
     model.latest_version_len = "0.10.0".len;
     state = petdexStatusItem(&model, &scratch);
-    try std.testing.expectEqualStrings("Update to Petdex 0.10.0…", state.items[9].label);
+    try std.testing.expect(state.items[5].enabled);
+    try std.testing.expectEqualStrings("Update to Petdex 0.10.0…", state.items[10].label);
 }
 
 test "bubble text default is its own value, not the range floor" {
