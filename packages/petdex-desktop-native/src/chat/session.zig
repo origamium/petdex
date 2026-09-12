@@ -7,6 +7,7 @@
 const std = @import("std");
 const domain = @import("domain.zig");
 const provider = @import("provider.zig");
+const i18n = @import("../i18n.zig");
 
 const Role = domain.Role;
 const Message = domain.Message;
@@ -249,7 +250,7 @@ pub const Session = struct {
         if (key != self.streamKey() or self.phase != .streaming) return .none;
         if (transport_error) |message| return self.fail(message);
         if (status >= 200 and status < 300 and !self.stream_failed) {
-            if (!self.pending) return self.fail("The reply was empty.");
+            if (!self.pending) return self.fail(i18n.t("The reply was empty.", "返事が空でした。"));
             self.pending = false;
             self.phase = .idle;
             return .done;
@@ -263,7 +264,7 @@ pub const Session = struct {
         }
         if (self.err_len == 0) {
             var buf: [64]u8 = undefined;
-            self.setError(std.fmt.bufPrint(&buf, "The server answered HTTP {d}.", .{status}) catch "The request failed.");
+            self.setError(i18n.bufPrint(&buf, "The server answered HTTP {d}.", "サーバーがHTTP {d}を返しました。", .{status}) catch i18n.t("The request failed.", "リクエストに失敗しました。"));
         }
         return self.fail(null);
     }

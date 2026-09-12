@@ -8,6 +8,7 @@ const canvas = native_sdk.canvas;
 const app = @import("main.zig");
 const chat_shell = @import("chat_shell.zig");
 const chat = @import("chat/chat.zig");
+const i18n = @import("i18n.zig");
 
 const Model = app.Model;
 const Msg = app.Msg;
@@ -241,22 +242,22 @@ const speech_buf_len = 192;
 /// What the pet's bubble says right now.
 fn speech(st: *const State, buf: []u8) Speech {
     const s = &st.session;
-    if (s.phase == .failed) return .{ .text = s.errorText(), .tone = .failure, .action = .chat_retry, .action_label = "Retry" };
+    if (s.phase == .failed) return .{ .text = s.errorText(), .tone = .failure, .action = .chat_retry, .action_label = i18n.t("Retry", "再試行") };
     // From the moment a request starts (a send, a retry, a briefing,
     // a credential refresh) until its first words: the thinking line.
     const reply = s.currentReply() orelse "";
     if (s.busy() and reply.len == 0) return .{ .text = st.thinkingText() };
     if (!st.ready()) return .{
         .text = if (st.kind == .codex)
-            std.fmt.bufPrint(buf, "Sign in to ChatGPT in Settings to talk to {s}.", .{st.petName()}) catch "Sign in to ChatGPT in Settings."
+            i18n.bufPrint(buf, "Sign in to ChatGPT in Settings to talk to {s}.", "{s}と話すには、設定でChatGPTにサインインしてください。", .{st.petName()}) catch i18n.t("Sign in to ChatGPT in Settings.", "設定でChatGPTにサインインしてください。")
         else
-            "Set the local server URL in Settings.",
+            i18n.t("Set the local server URL in Settings.", "設定でローカルサーバーのURLを指定してください。"),
         .action = .open_settings,
-        .action_label = "Open Settings",
+        .action_label = i18n.t("Open Settings", "設定を開く"),
     };
     if (reply.len > 0) return .{ .text = reply, .tone = .speech };
-    if (s.lost_text) return .{ .text = "Part of this reply was lost." };
-    return .{ .text = std.fmt.bufPrint(buf, "Say hello to {s}.", .{st.petName()}) catch "Say hello." };
+    if (s.lost_text) return .{ .text = i18n.t("Part of this reply was lost.", "返事の一部が失われました。") };
+    return .{ .text = i18n.bufPrint(buf, "Say hello to {s}.", "{s}に話しかけてみましょう。", .{st.petName()}) catch i18n.t("Say hello.", "話しかけてみましょう。") };
 }
 
 fn speechCard(ui: *AppUi, model: *const Model, st: *const State) AppUi.Node {
@@ -356,12 +357,12 @@ fn statusRow(ui: *AppUi, st: *const State) AppUi.Node {
         return ui.column(.{ .padding = 8, .gap = 6 }, .{
             ui.paragraph(.{ .size = .sm, .style_tokens = .{ .foreground = .destructive } }, &.{.{ .text = s.errorText() }}),
             ui.row(.{}, .{
-                ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .chat_retry }, "Retry"),
+                ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .chat_retry }, i18n.t("Retry", "再試行")),
             }),
         });
     }
     if (s.thinking()) return ui.column(.{ .padding = 8 }, .{muted(ui, st.thinkingText())});
-    return ui.column(.{ .padding = 8 }, .{muted(ui, "Part of this reply was lost.")});
+    return ui.column(.{ .padding = 8 }, .{muted(ui, i18n.t("Part of this reply was lost.", "返事の一部が失われました。"))});
 }
 
 /// The user's own bubble: a capsule field in the pet bubble's colors,
@@ -371,17 +372,17 @@ fn composer(ui: *AppUi, model: *const Model, st: *const State) AppUi.Node {
         .grow = 1,
         .height = pill_h,
         .text = st.inputText(),
-        .placeholder = ui.fmt("Message {s}", .{st.petName()}),
+        .placeholder = i18n.fmt(ui, "Message {s}", "{s}にメッセージ", .{st.petName()}),
         .on_input = AppUi.inputMsg(.chat_input),
         .on_submit = .chat_submit,
         .autofocus = true,
-        .semantics = .{ .label = "Message" },
+        .semantics = .{ .label = i18n.t("Message", "メッセージ") },
     }, .{});
     app.styleSpeechCard(&field, model.dark);
     field.widget.style.radius = pill_h / 2;
     const busy = st.session.busy();
     var action = if (busy)
-        ui.button(.{ .height = pill_h, .on_press = .chat_stop }, "Stop")
+        ui.button(.{ .height = pill_h, .on_press = .chat_stop }, i18n.t("Stop", "停止"))
     else
         ui.button(.{
             .icon = "arrow-up",
@@ -391,7 +392,7 @@ fn composer(ui: *AppUi, model: *const Model, st: *const State) AppUi.Node {
             .height = pill_h,
             .disabled = st.input.len == 0 or !st.ready(),
             .on_press = .chat_submit,
-            .semantics = .{ .label = "Send" },
+            .semantics = .{ .label = i18n.t("Send", "送信") },
         }, "");
     if (busy) app.styleSpeechCard(&action, model.dark);
     action.widget.style.radius = pill_h / 2;
@@ -404,9 +405,9 @@ fn controls(ui: *AppUi, model: *const Model, st: *const State) AppUi.Node {
     return ui.row(.{ .gap = 6, .width = card_w }, .{
         ui.el(.stack, .{ .grow = 1 }, .{}),
         // Starts over: the conversation and its saved history go.
-        roundButton(ui, model, "edit", "New Chat", .chat_clear, st.session.transcript.len() == 0 and !st.session.busy()),
-        roundButton(ui, model, "clock", if (st.history) "Latest Reply" else "Earlier Messages", .chat_toggle_history, false),
-        roundButton(ui, model, "x", "Close Chat", .chat_closed, false),
+        roundButton(ui, model, "edit", i18n.t("New Chat", "新しいチャット"), .chat_clear, st.session.transcript.len() == 0 and !st.session.busy()),
+        roundButton(ui, model, "clock", if (st.history) i18n.t("Latest Reply", "最新の返事") else i18n.t("Earlier Messages", "以前のメッセージ"), .chat_toggle_history, false),
+        roundButton(ui, model, "x", i18n.t("Close Chat", "チャットを閉じる"), .chat_closed, false),
     });
 }
 
@@ -430,11 +431,11 @@ fn roundButton(ui: *AppUi, model: *const Model, icon: []const u8, label: []const
 pub fn settingsSection(ui: *AppUi, model: *const Model) AppUi.Node {
     const st = &model.chat;
     return ui.column(.{ .gap = 10 }, .{
-        ui.text(.{ .size = .lg }, "Chat"),
+        ui.text(.{ .size = .lg }, i18n.t("Chat", "チャット")),
         panel(ui, ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
             ui.column(.{ .grow = 1 }, .{
-                ui.text(.{}, "Talk to your pet"),
-                muted(ui, "Click the pet to chat; double-click for a catch-up on your agents"),
+                ui.text(.{}, i18n.t("Talk to your pet", "ペットと話す")),
+                muted(ui, i18n.t("Click the pet to chat; double-click for a catch-up on your agents", "クリックでチャット、ダブルクリックでエージェントの様子を聞けます")),
             }),
             ui.row(.{ .gap = 6 }, .{
                 ui.button(.{
@@ -446,7 +447,7 @@ pub fn settingsSection(ui: *AppUi, model: *const Model) AppUi.Node {
                     .size = .sm,
                     .variant = if (st.kind == .openai_compat) .primary else .secondary,
                     .on_press = Msg{ .set_chat_provider = @intFromEnum(chat.domain.ProviderKind.openai_compat) },
-                }, "Local"),
+                }, i18n.t("Local", "ローカル")),
             }),
         })),
         switch (st.kind) {
@@ -455,8 +456,8 @@ pub fn settingsSection(ui: *AppUi, model: *const Model) AppUi.Node {
         },
         panel(ui, ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
             ui.column(.{ .grow = 1 }, .{
-                ui.text(.{}, "Messages on screen"),
-                muted(ui, "Recent exchanges the chat bubble keeps"),
+                ui.text(.{}, i18n.t("Messages on screen", "画面に残すメッセージ")),
+                muted(ui, i18n.t("Recent exchanges the chat bubble keeps", "チャットの吹き出しに残す最近のやりとりの数")),
             }),
             stackPicker(ui, st),
         })),
@@ -469,23 +470,23 @@ fn stackPicker(ui: *AppUi, st: *const State) AppUi.Node {
         .size = .sm,
         .variant = if (st.stack == n) .primary else .secondary,
         .on_press = Msg{ .set_chat_stack = @intCast(n) },
-        .semantics = .{ .label = if (n == 1) "1 exchange" else ui.fmt("{d} exchanges", .{n}) },
+        .semantics = .{ .label = if (n == 1) i18n.t("1 exchange", "1件のやりとり") else i18n.fmt(ui, "{d} exchanges", "{d}件のやりとり", .{n}) },
     }, ui.fmt("{d}", .{n}));
     return ui.row(.{ .gap = 4 }, @as([]const AppUi.Node, &buttons));
 }
 
 fn chatgptPanel(ui: *AppUi, st: *const State) AppUi.Node {
     const status: []const u8 = switch (st.chatgpt) {
-        .signed_in => "Signed in. Replies use your ChatGPT plan",
-        .authorizing => "Finish signing in in your browser",
-        .exchanging => "Signing in…",
-        .failed => if (st.note_len > 0) st.noteText() else "Sign-in failed",
-        .signed_out => "Uses your Plus or Pro plan; no API key needed",
+        .signed_in => i18n.t("Signed in. Replies use your ChatGPT plan", "サインイン済み。返事にはChatGPTのプランを使います"),
+        .authorizing => i18n.t("Finish signing in in your browser", "ブラウザでサインインを完了してください"),
+        .exchanging => i18n.t("Signing in…", "サインイン中…"),
+        .failed => if (st.note_len > 0) st.noteText() else i18n.t("Sign-in failed", "サインインできませんでした"),
+        .signed_out => i18n.t("Uses your Plus or Pro plan; no API key needed", "PlusまたはProのプランを使います。APIキーは不要です"),
     };
     const action = switch (st.chatgpt) {
-        .signed_in => ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .chatgpt_sign_out }, "Sign out"),
-        .exchanging => ui.button(.{ .size = .sm, .variant = .secondary, .disabled = true }, "Sign in"),
-        else => ui.button(.{ .size = .sm, .variant = .primary, .on_press = .chatgpt_sign_in }, "Sign in"),
+        .signed_in => ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .chatgpt_sign_out }, i18n.t("Sign out", "サインアウト")),
+        .exchanging => ui.button(.{ .size = .sm, .variant = .secondary, .disabled = true }, i18n.t("Sign in", "サインイン")),
+        else => ui.button(.{ .size = .sm, .variant = .primary, .on_press = .chatgpt_sign_in }, i18n.t("Sign in", "サインイン")),
     };
     const show_note = st.note_len > 0 and st.chatgpt != .failed;
     return panel(ui, ui.column(.{ .padding = 12, .gap = 8 }, .{
@@ -497,44 +498,44 @@ fn chatgptPanel(ui: *AppUi, st: *const State) AppUi.Node {
             action,
         }),
         if (st.chatgpt != .signed_in)
-            ui.row(.{}, .{ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .chatgpt_import }, "Use Codex CLI Sign-in")})
+            ui.row(.{}, .{ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .chatgpt_import }, i18n.t("Use Codex CLI Sign-in", "Codex CLIのサインインを使う"))})
         else
             ui.el(.stack, .{}, .{}),
         if (show_note) muted(ui, st.noteText()) else ui.el(.stack, .{}, .{}),
-        ui.text(.{ .size = .sm }, "Model"),
+        ui.text(.{ .size = .sm }, i18n.t("Model", "モデル")),
         ui.el(.input, .{
             .height = 34,
             .text = st.codexModel(),
             .placeholder = chat.codex.default_model,
             .on_input = AppUi.inputMsg(.chat_model_input),
-            .semantics = .{ .label = "ChatGPT model" },
+            .semantics = .{ .label = i18n.t("ChatGPT model", "ChatGPTのモデル") },
         }, .{}),
     }));
 }
 
 fn localPanel(ui: *AppUi, st: *const State) AppUi.Node {
     return panel(ui, ui.column(.{ .padding = 12, .gap = 8 }, .{
-        ui.text(.{}, "Local server"),
-        muted(ui, "LM Studio, Ollama, or any OpenAI-compatible server"),
-        ui.text(.{ .size = .sm }, "Server URL"),
+        ui.text(.{}, i18n.t("Local server", "ローカルサーバー")),
+        muted(ui, i18n.t("LM Studio, Ollama, or any OpenAI-compatible server", "LM Studio、Ollama、またはOpenAI互換のサーバー")),
+        ui.text(.{ .size = .sm }, i18n.t("Server URL", "サーバーのURL")),
         ui.el(.input, .{
             .height = 34,
             .text = st.localUrl(),
             .placeholder = chat.openai_compat.default_base_url,
             .on_input = AppUi.inputMsg(.chat_url_input),
-            .semantics = .{ .label = "Server URL" },
+            .semantics = .{ .label = i18n.t("Server URL", "サーバーのURL") },
         }, .{}),
-        ui.text(.{ .size = .sm }, "Model"),
+        ui.text(.{ .size = .sm }, i18n.t("Model", "モデル")),
         ui.row(.{ .gap = 8, .cross = .center }, .{
             ui.el(.input, .{
                 .grow = 1,
                 .height = 34,
                 .text = st.localModel(),
-                .placeholder = "The loaded model",
+                .placeholder = i18n.t("The loaded model", "読み込まれているモデル"),
                 .on_input = AppUi.inputMsg(.chat_model_input),
-                .semantics = .{ .label = "Local model" },
+                .semantics = .{ .label = i18n.t("Local model", "ローカルのモデル") },
             }, .{}),
-            ui.button(.{ .size = .sm, .variant = .secondary, .disabled = st.detecting, .on_press = .chat_detect_models }, "Detect"),
+            ui.button(.{ .size = .sm, .variant = .secondary, .disabled = st.detecting, .on_press = .chat_detect_models }, i18n.t("Detect", "検出")),
         }),
         if (st.note_len > 0) muted(ui, st.noteText()) else ui.el(.stack, .{}, .{}),
     }));

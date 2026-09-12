@@ -5,6 +5,7 @@
 const std = @import("std");
 const domain = @import("domain.zig");
 const provider = @import("provider.zig");
+const i18n = @import("../i18n.zig");
 
 const Message = domain.Message;
 const StreamEvent = domain.StreamEvent;
@@ -61,7 +62,7 @@ pub fn parseLine(line: []const u8, scratch: []u8) ?StreamEvent {
     if (std.mem.eql(u8, data, "[DONE]")) return .done;
     var fba = std.heap.FixedBufferAllocator.init(scratch);
     const chunk = std.json.parseFromSliceLeaky(Chunk, fba.allocator(), data, .{ .ignore_unknown_fields = true }) catch return null;
-    if (chunk.@"error") |err| return .{ .failed = if (err.message.len > 0) err.message else "The server reported an error" };
+    if (chunk.@"error") |err| return .{ .failed = if (err.message.len > 0) err.message else i18n.t("The server reported an error", "サーバーがエラーを返しました") };
     if (chunk.choices.len == 0) return null;
     const content = chunk.choices[0].delta.content orelse return null;
     if (content.len == 0) return null;

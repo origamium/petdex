@@ -8,6 +8,7 @@
 const std = @import("std");
 const domain = @import("domain.zig");
 const provider = @import("provider.zig");
+const i18n = @import("../i18n.zig");
 
 const Message = domain.Message;
 const StreamEvent = domain.StreamEvent;
@@ -115,20 +116,22 @@ pub fn parseLine(line: []const u8, scratch: []u8) ?StreamEvent {
         std.mem.eql(u8, kind, "response.done") or
         std.mem.eql(u8, kind, "response.incomplete")) return .done;
     if (std.mem.eql(u8, kind, "response.failed")) {
-        const ev = parseJson(FailedEvent, data, scratch) orelse return .{ .failed = generic_failure };
-        const err = ev.response.@"error" orelse return .{ .failed = generic_failure };
-        return .{ .failed = if (err.message.len > 0) err.message else generic_failure };
+        const ev = parseJson(FailedEvent, data, scratch) orelse return .{ .failed = genericFailure() };
+        const err = ev.response.@"error" orelse return .{ .failed = genericFailure() };
+        return .{ .failed = if (err.message.len > 0) err.message else genericFailure() };
     }
     if (std.mem.eql(u8, kind, "error")) {
-        const ev = parseJson(ErrorEvent, data, scratch) orelse return .{ .failed = generic_failure };
+        const ev = parseJson(ErrorEvent, data, scratch) orelse return .{ .failed = genericFailure() };
         if (ev.message.len > 0) return .{ .failed = ev.message };
         if (ev.@"error") |err| if (err.message.len > 0) return .{ .failed = err.message };
-        return .{ .failed = generic_failure };
+        return .{ .failed = genericFailure() };
     }
     return null;
 }
 
-const generic_failure = "ChatGPT could not finish the reply.";
+fn genericFailure() []const u8 {
+    return i18n.t("ChatGPT could not finish the reply.", "ChatGPTが返事を最後まで作れませんでした。");
+}
 
 /// The type leads every event, so even a truncated line says whether it
 /// was a text delta.
@@ -464,7 +467,7 @@ test "stream events map to deltas, done and failures" {
     try t.expect(parseLine("data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\"}]}}", &scratch).? == .done);
     try t.expect(parseLine("data: {\"type\":\"response.incomplete\"}", &scratch).? == .done);
     try t.expectEqualStrings("Rate limited", parseLine("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"rate_limit\",\"message\":\"Rate limited\"}}}", &scratch).?.failed);
-    try t.expectEqualStrings(generic_failure, parseLine("data: {\"type\":\"response.failed\",\"response\":{}}", &scratch).?.failed);
+    try t.expectEqualStrings(genericFailure(), parseLine("data: {\"type\":\"response.failed\",\"response\":{}}", &scratch).?.failed);
     try t.expectEqualStrings("bad model", parseLine("data: {\"type\":\"error\",\"message\":\"bad model\"}", &scratch).?.failed);
     try t.expectEqualStrings("nested", parseLine("data: {\"type\":\"error\",\"error\":{\"message\":\"nested\"}}", &scratch).?.failed);
     try t.expect(parseLine("data: {\"type\":\"response.created\",\"response\":{}}", &scratch) == null);

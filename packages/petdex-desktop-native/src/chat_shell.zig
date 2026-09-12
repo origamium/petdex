@@ -17,6 +17,7 @@ const pkce = @import("pkce.zig");
 const secret_store = @import("secret_store.zig");
 const chat_history = @import("chat_history.zig");
 const chat = @import("chat/chat.zig");
+const i18n = @import("i18n.zig");
 
 const domain = chat.domain;
 const provider = chat.provider;
@@ -124,7 +125,7 @@ pub const State = struct {
     }
 
     pub fn petName(self: *const State) []const u8 {
-        return if (self.pet_name_len > 0) self.pet_name[0..self.pet_name_len] else "your pet";
+        return if (self.pet_name_len > 0) self.pet_name[0..self.pet_name_len] else i18n.t("your pet", "ペット");
     }
 
     pub fn inputText(self: *const State) []const u8 {
@@ -144,7 +145,7 @@ pub const State = struct {
     }
 
     pub fn thinkingText(self: *const State) []const u8 {
-        return if (self.thinking_len > 0) self.thinking[0..self.thinking_len] else "Thinking…";
+        return if (self.thinking_len > 0) self.thinking[0..self.thinking_len] else i18n.t("Thinking…", "考え中…");
     }
 
     pub fn noteText(self: *const State) []const u8 {
@@ -191,9 +192,9 @@ pub fn poll(model: *Model, fx: *Effects) void {
     const st = &model.chat;
     if (st.chatgpt != .authorizing) return;
     if (callback.error_len > 0) return failSignIn(st, callback.errorSlice());
-    if (!std.mem.eql(u8, callback.stateSlice(), &st.oauth_state)) return failSignIn(st, "ChatGPT sent back a sign-in for another attempt. Try again.");
+    if (!std.mem.eql(u8, callback.stateSlice(), &st.oauth_state)) return failSignIn(st, i18n.t("ChatGPT sent back a sign-in for another attempt. Try again.", "ChatGPTから別のサインインの応答が届きました。もう一度お試しください。"));
     var body_buf: [8192]u8 = undefined;
-    const body = codex.tokenBody(&body_buf, callback.codeSlice(), &st.verifier) orelse return failSignIn(st, "The sign-in code was too long.");
+    const body = codex.tokenBody(&body_buf, callback.codeSlice(), &st.verifier) orelse return failSignIn(st, i18n.t("The sign-in code was too long.", "サインインのコードが長すぎます。"));
     st.chatgpt = .exchanging;
     st.token_purpose = .sign_in;
     postToken(fx, body);
@@ -529,8 +530,8 @@ fn startRequest(model: *Model, fx: *Effects) void {
     const auth: provider.Auth = if (st.kind == .codex) st.creds.auth() else .{};
     const request = provider.buildRequest(st.kind, target, auth, persona_buf[0..persona_len], turns, &bufs) orelse {
         const why: []const u8 = switch (st.kind) {
-            .codex => if (st.creds.signedIn()) "The conversation is too long to send." else "Sign in to ChatGPT in Settings first.",
-            .openai_compat => if (st.local_url.len == 0) "Set the server URL in Settings first." else "The conversation is too long to send.",
+            .codex => if (st.creds.signedIn()) i18n.t("The conversation is too long to send.", "会話が長すぎて送信できません。") else i18n.t("Sign in to ChatGPT in Settings first.", "先に設定でChatGPTにサインインしてください。"),
+            .openai_compat => if (st.local_url.len == 0) i18n.t("Set the server URL in Settings first.", "先に設定でサーバーのURLを指定してください。") else i18n.t("The conversation is too long to send.", "会話が長すぎて送信できません。"),
         };
         run(model, st.session.onResponse(st.kind, st.session.streamKey(), 0, why), fx);
         return;
@@ -556,13 +557,13 @@ fn onResponse(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) 
     const transport: ?[]const u8 = switch (response.outcome) {
         .ok => null,
         .cancelled => return,
-        .timed_out => "The reply took too long.",
+        .timed_out => i18n.t("The reply took too long.", "返事に時間がかかりすぎました。"),
         .connect_failed => switch (st.stream_kind) {
-            .openai_compat => "Could not reach the local server. Is it running?",
-            .codex => "Could not reach ChatGPT.",
+            .openai_compat => i18n.t("Could not reach the local server. Is it running?", "ローカルサーバーに接続できません。起動していますか？"),
+            .codex => i18n.t("Could not reach ChatGPT.", "ChatGPTに接続できません。"),
         },
-        .tls_failed => "A secure connection could not be made.",
-        .rejected, .protocol_failed => "The connection failed.",
+        .tls_failed => i18n.t("A secure connection could not be made.", "安全な接続を確立できませんでした。"),
+        .rejected, .protocol_failed => i18n.t("The connection failed.", "接続に失敗しました。"),
     };
     run(model, st.session.onResponse(st.stream_kind, response.key, response.status, transport), fx);
 }
@@ -626,11 +627,11 @@ fn ensureHistory() ?*chat_history.History {
 
 fn signIn(st: *State) void {
     if (st.chatgpt == .exchanging) return;
-    const p = pkce.generate() orelse return failSignIn(st, "Could not start ChatGPT sign-in.");
+    const p = pkce.generate() orelse return failSignIn(st, i18n.t("Could not start ChatGPT sign-in.", "ChatGPTのサインインを開始できませんでした。"));
     st.verifier = p.verifier;
     st.oauth_state = p.state;
     var url_buf: [1024]u8 = undefined;
-    const url = codex.authorizeUrl(&url_buf, &p.challenge, &p.state) orelse return failSignIn(st, "Could not start ChatGPT sign-in.");
+    const url = codex.authorizeUrl(&url_buf, &p.challenge, &p.state) orelse return failSignIn(st, i18n.t("Could not start ChatGPT sign-in.", "ChatGPTのサインインを開始できませんでした。"));
     hook_server.startOAuthListener(codex.callback_port, codex.callback_path, &hook_server.chatgpt_mailbox);
     st.chatgpt = .authorizing;
     st.note_len = 0;
@@ -646,14 +647,14 @@ fn startRefresh(model: *Model, fx: *Effects) void {
     const st = &model.chat;
     st.stream_kind = st.kind;
     if (st.creds.refresh_len == 0) {
-        run(model, st.session.onRefreshed(false, "Sign in to ChatGPT in Settings."), fx);
+        run(model, st.session.onRefreshed(false, i18n.t("Sign in to ChatGPT in Settings.", "設定でChatGPTにサインインしてください。")), fx);
         return;
     }
     // A token request already in flight resolves the session when it lands.
     if (st.token_purpose != .none) return;
     var body_buf: [8192]u8 = undefined;
     const body = codex.refreshBody(&body_buf, st.creds.refreshToken()) orelse {
-        run(model, st.session.onRefreshed(false, "Sign in to ChatGPT in Settings."), fx);
+        run(model, st.session.onRefreshed(false, i18n.t("Sign in to ChatGPT in Settings.", "設定でChatGPTにサインインしてください。")), fx);
         return;
     };
     st.token_purpose = .refresh;
@@ -684,12 +685,12 @@ fn onToken(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) voi
         st.chatgpt = .signed_in;
         st.note_len = 0;
     } else if (purpose == .sign_in) {
-        failSignIn(st, "ChatGPT sign-in could not complete.");
+        failSignIn(st, i18n.t("ChatGPT sign-in could not complete.", "ChatGPTのサインインを完了できませんでした。"));
     } else if (response.outcome == .ok and codex.isDeadRefresh(response.body)) {
         signOut(st);
     }
     if (st.session.phase == .refreshing) {
-        run(model, st.session.onRefreshed(ok, "Sign in to ChatGPT again in Settings."), fx);
+        run(model, st.session.onRefreshed(ok, i18n.t("Sign in to ChatGPT again in Settings.", "設定でChatGPTにもう一度サインインしてください。")), fx);
     }
 }
 
@@ -701,15 +702,15 @@ fn importCodex(st: *State, fx: *Effects) void {
     else
         std.fmt.bufPrint(&path_buf, "{s}/.codex/auth.json", .{home})) catch return;
     const bytes = plat.readFileAlloc(std.heap.page_allocator, path, 256 * 1024) orelse
-        return setNote(st, "No Codex CLI sign-in was found.");
+        return setNote(st, i18n.t("No Codex CLI sign-in was found.", "Codex CLIのサインイン情報が見つかりません。"));
     defer std.heap.page_allocator.free(bytes);
     if (!codex.importCodexAuth(&st.creds, std.heap.page_allocator, bytes, fx.wallMs()))
-        return setNote(st, "Codex CLI is not signed in with a ChatGPT account.");
+        return setNote(st, i18n.t("Codex CLI is not signed in with a ChatGPT account.", "Codex CLIはChatGPTアカウントでサインインしていません。"));
     saveCredentials(st);
     st.chatgpt = .signed_in;
     // True, not boilerplate: the copy shares Codex's refresh token, and
     // whichever client refreshes first may sign the other out.
-    setNote(st, "Copied from Codex CLI. Codex may ask you to sign in again later.");
+    setNote(st, i18n.t("Copied from Codex CLI. Codex may ask you to sign in again later.", "Codex CLIからコピーしました。あとでCodexからもう一度サインインを求められることがあります。"));
 }
 
 fn signOut(st: *State) void {
@@ -739,7 +740,7 @@ fn detectModels(st: *State, fx: *Effects) void {
     if (st.detecting) return;
     var url_buf: [320]u8 = undefined;
     const base = std.mem.trimEnd(u8, st.localUrl(), "/");
-    if (base.len == 0) return setNote(st, "Set the server URL first.");
+    if (base.len == 0) return setNote(st, i18n.t("Set the server URL first.", "先にサーバーのURLを指定してください。"));
     const url = std.fmt.bufPrint(&url_buf, "{s}/models", .{base}) catch return;
     st.detecting = true;
     st.note_len = 0;
@@ -753,11 +754,11 @@ fn detectModels(st: *State, fx: *Effects) void {
 
 fn onModels(st: *State, response: native_sdk.EffectResponse) void {
     st.detecting = false;
-    if (response.outcome != .ok) return setNote(st, "Could not reach the server. Is it running?");
-    if (response.status != 200) return setNote(st, "The server did not list its models.");
+    if (response.outcome != .ok) return setNote(st, i18n.t("Could not reach the server. Is it running?", "サーバーに接続できません。起動していますか？"));
+    if (response.status != 200) return setNote(st, i18n.t("The server did not list its models.", "サーバーからモデルの一覧を取得できませんでした。"));
     const scratch = std.heap.page_allocator.alloc(u8, 512 * 1024) catch return;
     defer std.heap.page_allocator.free(scratch);
-    const id = openai_compat.firstModelId(response.body, scratch) orelse return setNote(st, "The server has no model loaded.");
+    const id = openai_compat.firstModelId(response.body, scratch) orelse return setNote(st, i18n.t("The server has no model loaded.", "サーバーにモデルが読み込まれていません。"));
     setText(&st.local_model, id);
     saveConfig(st);
 }

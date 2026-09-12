@@ -18,6 +18,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const plat = @import("plat.zig");
+const i18n = @import("i18n.zig");
 const dsh_integration = @import("dsh_integration.zig");
 
 /// One connection, plus the Io that owns it. Everything downstream of
@@ -388,7 +389,7 @@ pub fn startOAuthListener(port: u16, path: []const u8, inbox: *AuthMailbox) void
     if (oauth_listener_running.swap(true, .acq_rel)) return;
     const thread = std.Thread.spawn(.{}, runOAuthListener, .{ port, path, inbox }) catch {
         oauth_listener_running.store(false, .release);
-        inbox.set(errorCallback("Could not start the sign-in listener."));
+        inbox.set(errorCallback(i18n.t("Could not start the sign-in listener.", "サインインの待ち受けを開始できませんでした。")));
         return;
     };
     thread.detach();
@@ -406,7 +407,7 @@ fn runOAuthListener(port: u16, path: []const u8, inbox: *AuthMailbox) void {
         .mode = .stream,
         .protocol = .tcp,
     }) catch {
-        inbox.set(errorCallback("Port 1455 is in use, usually by `codex login`. Finish or cancel it, then try again."));
+        inbox.set(errorCallback(i18n.t("Port 1455 is in use, usually by `codex login`. Finish or cancel it, then try again.", "ポート1455が使用中です。多くの場合は`codex login`です。終了するかキャンセルしてから、もう一度お試しください。")));
         return;
     };
     defer listener.deinit(io);
