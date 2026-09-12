@@ -44,6 +44,13 @@ Builds pass `-Dtrace=off`. Without it the SDK appends a trace record per frame
 and timer to `native-sdk.jsonl` in the platform log directory (#714); the app
 deletes that file once it passes 32 MB.
 
+## Bubbles
+
+Each coding-agent conversation floats over the pet as a bubble with the
+agent's logo. An orange dot means the agent needs you, a red one that it
+failed. Click a bubble for its project and status; click again to close it.
+A finished bubble pops a moment later. Up to ten conversations float at once.
+
 ## Chat
 
 Click the pet to talk to it; double-click it for a catch-up on your coding
