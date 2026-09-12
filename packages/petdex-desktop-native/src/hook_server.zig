@@ -109,7 +109,15 @@ pub const Bubble = struct {
     model_len: usize = 0,
     effort: [16]u8 = @splat(0),
     effort_len: usize = 0,
+    /// Warp's link back to the pane the agent runs in (`WARP_FOCUS_URL`).
+    /// Every event from that pane carries it.
+    focus_url: [64]u8 = @splat(0),
+    focus_url_len: usize = 0,
     counter: u64 = 0,
+
+    pub fn focusUrlSlice(self: *const Bubble) []const u8 {
+        return self.focus_url[0..self.focus_url_len];
+    }
 
     pub fn modelSlice(self: *const Bubble) []const u8 {
         return self.model[0..self.model_len];
@@ -341,6 +349,20 @@ pub const Mailbox = struct {
             @memcpy(b.agent_state[0..n], state[0..n]);
             @memset(b.agent_state[n..], 0);
             b.agent_state_len = n;
+            self.bubbles_dirty = true;
+            return;
+        }
+    }
+
+    /// Record the Warp pane link for a session that already has a slot.
+    pub fn setBubbleFocusUrl(self: *Mailbox, session: []const u8, url: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.bubbles[0..self.bubbles_len]) |*b| {
+            if (!std.mem.eql(u8, b.sessionSlice(), session)) continue;
+            const n = @min(url.len, b.focus_url.len);
+            @memcpy(b.focus_url[0..n], url[0..n]);
+            b.focus_url_len = n;
             self.bubbles_dirty = true;
             return;
         }
@@ -965,6 +987,9 @@ fn route(server: *Server, conn: *Conn, method: []const u8, target: []const u8, p
         const effort = jsonString(body, "effort") orelse "";
         if (model.len > 0 or effort.len > 0) {
             mailbox.setBubbleModel(session, model[0..escapedCut(model, 48)], effort[0..escapedCut(effort, 16)]);
+        }
+        if (plat.safeWarpFocusUrl(jsonString(body, "warp_focus_url"))) |url| {
+            mailbox.setBubbleFocusUrl(session, url);
         }
         mirrorBubble(server, capped, counter, title[0..@min(title.len, 96)], agent[0..@min(agent.len, 24)], busy) catch {};
         const out = std.fmt.bufPrint(&scratch, "{{\"ok\":true,\"counter\":{d}}}", .{counter}) catch return;

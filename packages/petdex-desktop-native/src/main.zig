@@ -3379,6 +3379,8 @@ const hook_glow_period_s: f32 = 1.6;
 /// The card's text column, and how many lines of the bubble's text it shows.
 const bubble_text_width: f32 = bubble_card_width - bubble_card_padding * 2 - bubble_avatar_width - bubble_content_gap;
 const bubble_text_max_lines = 3;
+/// The card's button to the agent's terminal.
+const hook_button_h: f32 = 26;
 /// The simulation's clock, running only while a bubble is on screen.
 const hook_tick_key: u64 = 0xb0bb1e;
 const hook_tick_interval_ms: u32 = 33;
@@ -3432,8 +3434,67 @@ fn bubbleLineHeight(model: *const Model) f32 {
 /// what it needs.
 fn bubbleCardHeight(model: *const Model, slot: ?usize) f32 {
     const lines = if (slot) |s| bubbleCardLines(model, s) else 2;
-    const inner = @max(bubbleContentHeight(model, lines), bubble_avatar_width);
+    var content = bubbleContentHeight(model, lines);
+    if (slot) |s| {
+        if (bubbleDestination(&model.bubbles[s]) != .none) content += bubble_content_gap + hook_button_h;
+    }
+    const inner = @max(content, bubble_avatar_width);
     return @ceil(inner + bubble_card_padding * 2);
+}
+
+/// Where the card's button takes the user: the agent's pane in Warp, or
+/// its tab in Terminal. Both are macOS verbs.
+const Destination = enum { none, warp, terminal };
+
+fn bubbleDestination(bubble: *const hook_server.Bubble) Destination {
+    if (builtin.target.os.tag != .macos) return .none;
+    if (plat.safeWarpFocusUrl(bubble.focusUrlSlice()) != null) return .warp;
+    if (bubble.origin_app == .terminal and plat.safeSourceTty(bubble.ttySlice()) != null) return .terminal;
+    return .none;
+}
+
+fn destinationLabel(destination: Destination) []const u8 {
+    return switch (destination) {
+        .warp => i18n.t("Open in Warp", "Warpで開く"),
+        .terminal => i18n.t("Open in Terminal", "ターミナルで開く"),
+        .none => "",
+    };
+}
+
+fn openDestination(bubble: *const hook_server.Bubble) void {
+    switch (bubbleDestination(bubble)) {
+        .warp => _ = plat.openWarpSession(bubble.focusUrlSlice()),
+        .terminal => _ = plat.activateOriginApplication(.terminal, bubble.ttySlice(), bubble.cwdSlice()),
+        .none => {},
+    }
+}
+
+const HookRect = struct { x: f32, y: f32, w: f32, h: f32 };
+
+/// The card's button in card coordinates: under the text, as wide as the
+/// text column. It is drawn and hit-tested from this one rect.
+fn cardButtonRect(model: *const Model, slot: usize) HookRect {
+    return .{
+        .x = bubble_card_padding + bubble_avatar_width + bubble_content_gap,
+        .y = bubble_card_padding + bubbleContentHeight(model, bubbleCardLines(model, slot)) + bubble_content_gap,
+        .w = bubble_text_width,
+        .h = hook_button_h,
+    };
+}
+
+/// The slot whose card button is under a window-local point, once its
+/// card is fully open.
+fn cardButtonHit(model: *const Model, x: f32, y: f32) ?usize {
+    const index = model.hook_sim.openIndex() orelse return null;
+    const slot = hookSlot(model, model.hook_sim.bodies[index].id) orelse return null;
+    if (bubbleDestination(&model.bubbles[slot]) == .none) return null;
+    const s = bubble_sim.shape(model.hook_sim.bodies[index], hookLayout(model));
+    if (s.open < 0.99) return null;
+    const r = cardButtonRect(model, slot);
+    const left = s.x - s.w / 2 + r.x;
+    const top = s.y - s.h / 2 + r.y;
+    if (x < left or x > left + r.w or y < top or y > top + r.h) return null;
+    return slot;
 }
 
 /// How many lines the card for `slot` holds: the project and the status,
@@ -3620,15 +3681,23 @@ fn tickHookBubbles(model: *Model, fx: *Effects) void {
 /// The body under the global cursor, which the bubble window reports
 /// alongside its own origin.
 fn hookUnderCursor(model: *const Model, fx: *Effects) ?usize {
-    if (builtin.target.os.tag == .linux or !model.bubble_placed) return null;
-    const win = fx.moveWindow("bubble", 0, 0, false) orelse return null;
-    return model.hook_sim.hit(hookLayout(model), @floatCast(win.cursor_x - win.x), @floatCast(win.cursor_y - win.y));
+    const at = hookCursor(model, fx) orelse return null;
+    return model.hook_sim.hit(hookLayout(model), at[0], at[1]);
 }
 
-/// A press on the bubble window opens the bubble under the cursor as its
-/// card, or closes the card.
+fn hookCursor(model: *const Model, fx: *Effects) ?[2]f32 {
+    if (builtin.target.os.tag == .linux or !model.bubble_placed) return null;
+    const win = fx.moveWindow("bubble", 0, 0, false) orelse return null;
+    return .{ @floatCast(win.cursor_x - win.x), @floatCast(win.cursor_y - win.y) };
+}
+
+/// A press on the bubble window: on the open card's button, the agent's
+/// terminal comes forward; elsewhere, the bubble under the cursor opens as
+/// its card, or the card closes.
 fn pressHookBubble(model: *Model, fx: *Effects) void {
-    const index = hookUnderCursor(model, fx) orelse return;
+    const at = hookCursor(model, fx) orelse return;
+    if (cardButtonHit(model, at[0], at[1])) |slot| return openDestination(&model.bubbles[slot]);
+    const index = model.hook_sim.hit(hookLayout(model), at[0], at[1]) orelse return;
     model.hook_sim.toggle(index);
     syncBubbleWindow(model, fx);
 }
@@ -4199,7 +4268,13 @@ fn hookBubble(ui: *AppUi, model: *const Model, index: usize, layout: bubble_sim.
     }
     parts[len] = panel;
     len += 1;
-    if (!show_card) {
+    if (show_card) {
+        const destination = bubbleDestination(&model.bubbles[slot.?]);
+        if (destination != .none) {
+            parts[len] = cardButton(ui, model, slot.?, destinationLabel(destination), (s.open - 0.5) * 2);
+            len += 1;
+        }
+    } else {
         switch (body.status) {
             .waiting => {
                 parts[len] = rimMark(ui, model, s, hook_dot, orange);
@@ -4221,6 +4296,25 @@ fn hookBubble(ui: *AppUi, model: *const Model, index: usize, layout: bubble_sim.
         .multiply(canvas.Affine.translate(-s.w / 2, -s.h / 2));
     group.widget.opacity = s.alpha;
     return group;
+}
+
+/// The card's button to the agent's terminal: a quiet rounded rect with
+/// its label, placed from cardButtonRect so what is drawn is what is hit.
+fn cardButton(ui: *AppUi, model: *const Model, slot: usize, label: []const u8, opacity: f32) AppUi.Node {
+    const r = cardButtonRect(model, slot);
+    var text = ui.text(.{ .size = .heading }, label);
+    text.widget.style.foreground = if (model.dark) canvas.Color.rgb8(237, 237, 238) else canvas.Color.rgb8(17, 17, 17);
+    var button = ui.el(.panel, .{ .width = r.w, .height = r.h }, .{
+        ui.column(.{ .grow = 1, .main = .center, .cross = .center }, .{text}),
+    });
+    button.widget.style.radius = 7;
+    button.widget.style.stroke_width = 1;
+    button.widget.style.background = if (model.dark) canvas.Color.rgba8(255, 255, 255, 18) else canvas.Color.rgba8(0, 0, 0, 10);
+    button.widget.style.border = if (model.dark) canvas.Color.rgba8(255, 255, 255, 26) else canvas.Color.rgb8(214, 214, 220);
+    button.widget.semantics.label = label;
+    button.widget.transform = canvas.Affine.translate(r.x, r.y);
+    button.widget.opacity = opacity;
+    return button;
 }
 
 /// A round mark of `size` on the bubble's rim, up and to the right, ringed
@@ -4767,7 +4861,7 @@ pub fn main(init: std.process.Init) !void {
             const phase = args_it.next() orelse return;
             const agent: ?[]const u8 = args_it.next();
             const origin_app = plat.OriginApplication.fromTermProgram(init.environ_map.get("TERM_PROGRAM"));
-            hook_runner.run(phase, agent, origin_app, init.environ_map.get("PWD"), init.environ_map.get("HERDR_PANE_ID"), env_home orelse return);
+            hook_runner.run(phase, agent, origin_app, init.environ_map.get("PWD"), init.environ_map.get("HERDR_PANE_ID"), init.environ_map.get("WARP_FOCUS_URL"), env_home orelse return);
             return;
         }
     }
@@ -5807,6 +5901,49 @@ test "an error wears a badge, and waiting on the user glows, still or not" {
     try std.testing.expectEqual(@as(usize, 3), hookBubble(&ui, &model, 0, layout).nodes.len);
     model.hook_sim.bodies[0].status = .working;
     try std.testing.expectEqual(@as(usize, 1), hookBubble(&ui, &model, 0, layout).nodes.len);
+}
+
+test "an open card offers the agent's Warp pane or Terminal tab" {
+    var model: Model = .{};
+    testPushBubble(&model, "alpha", "reading", true, -1);
+    try std.testing.expectEqual(Destination.none, bubbleDestination(&model.bubbles[0]));
+    const plain = bubbleCardHeight(&model, 0);
+    const url = "warp://session/0123456789abcdef0123456789abcdef";
+    @memcpy(model.bubbles[0].focus_url[0..url.len], url);
+    model.bubbles[0].focus_url_len = url.len;
+    try std.testing.expectEqual(Destination.warp, bubbleDestination(&model.bubbles[0]));
+    // The card makes room for the button, under the text and inside it.
+    const with_button = bubbleCardHeight(&model, 0);
+    try std.testing.expect(with_button > plain);
+    const r = cardButtonRect(&model, 0);
+    try std.testing.expect(r.y + r.h <= with_button - bubble_card_padding + 0.5);
+    // Terminal.app is found by its tty.
+    model.bubbles[0].focus_url_len = 0;
+    model.bubbles[0].origin_app = .terminal;
+    const tty = "/dev/ttys004";
+    @memcpy(model.bubbles[0].source_tty[0..tty.len], tty);
+    model.bubbles[0].source_tty_len = tty.len;
+    try std.testing.expectEqual(Destination.terminal, bubbleDestination(&model.bubbles[0]));
+}
+
+test "a press on the open card's button belongs to the button" {
+    var model: Model = .{};
+    testPushBubble(&model, "alpha", "reading", true, -1);
+    const url = "warp://session/0123456789abcdef0123456789abcdef";
+    @memcpy(model.bubbles[0].focus_url[0..url.len], url);
+    model.bubbles[0].focus_url_len = url.len;
+    syncHookSim(&model);
+    model.hook_sim.toggle(0);
+    // The button answers once the card has finished opening.
+    for (0..30) |_| model.hook_sim.step(1.0 / 30.0, hookLayout(&model));
+    const index = model.hook_sim.openIndex().?;
+    const s = bubble_sim.shape(model.hook_sim.bodies[index], hookLayout(&model));
+    const r = cardButtonRect(&model, 0);
+    const left = s.x - s.w / 2;
+    const top = s.y - s.h / 2;
+    try std.testing.expectEqual(@as(?usize, 0), cardButtonHit(&model, left + r.x + r.w / 2, top + r.y + r.h / 2));
+    // The title line above it is the card's.
+    try std.testing.expectEqual(@as(?usize, null), cardButtonHit(&model, left + r.x + 4, top + bubble_card_padding + 2));
 }
 
 test "a seventh conversation starts a second row of bubbles" {

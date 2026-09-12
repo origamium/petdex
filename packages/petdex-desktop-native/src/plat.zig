@@ -757,6 +757,42 @@ test "Herdr pane ids accept only bounded CLI-safe identifiers" {
     try std.testing.expect(safeHerdrPaneId(&too_long) == null);
 }
 
+/// Warp's link back to one pane (`WARP_FOCUS_URL`, which Warp sets in every
+/// pane since its 2026.05 builds): opening it brings that window, tab and
+/// pane to the front. Only this exact shape passes; Warp's URL handler has
+/// been an attack surface before.
+pub fn safeWarpFocusUrl(value: ?[]const u8) ?[]const u8 {
+    const url = value orelse return null;
+    const prefixes = [_][]const u8{ "warp://session/", "warppreview://session/", "warposs://session/" };
+    for (prefixes) |prefix| {
+        if (!std.mem.startsWith(u8, url, prefix)) continue;
+        const id = url[prefix.len..];
+        if (id.len != 32) return null;
+        for (id) |ch| {
+            if (!std.ascii.isDigit(ch) and !(ch >= 'a' and ch <= 'f')) return null;
+        }
+        return url;
+    }
+    return null;
+}
+
+/// Bring a Warp pane to the front from its link.
+pub fn openWarpSession(url_raw: []const u8) bool {
+    if (builtin.os.tag != .macos) return false;
+    const url = safeWarpFocusUrl(url_raw) orelse return false;
+    return spawnAndWait(&.{ "/usr/bin/open", url });
+}
+
+test "Warp pane links accept only a session id on a Warp scheme" {
+    try std.testing.expect(safeWarpFocusUrl("warp://session/0123456789abcdef0123456789abcdef") != null);
+    try std.testing.expect(safeWarpFocusUrl("warppreview://session/0123456789abcdef0123456789abcdef") != null);
+    try std.testing.expect(safeWarpFocusUrl("warp://session/0123456789ABCDEF0123456789abcdef") == null);
+    try std.testing.expect(safeWarpFocusUrl("warp://session/0123456789abcdef0123456789abcde") == null);
+    try std.testing.expect(safeWarpFocusUrl("warp://action/new_tab?path=/tmp") == null);
+    try std.testing.expect(safeWarpFocusUrl("https://session/0123456789abcdef0123456789abcdef") == null);
+    try std.testing.expect(safeWarpFocusUrl(null) == null);
+}
+
 fn spawnAndWait(argv: []const []const u8) bool {
     var scope = Scope.init();
     defer scope.deinit();

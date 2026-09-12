@@ -36,12 +36,18 @@ function clip(text, max = 40) {
   return text.length <= max ? text : text.slice(0, max - 1) + "…";
 }
 
+// Warp gives each pane a link back to itself; the bubble's card offers it.
+const WARP_FOCUS_URL = /^(warp|warppreview|warposs):\/\/session\/[0-9a-f]{32}$/;
+
 function originMetadata() {
   const sourceApp = process.env.TERM_PROGRAM;
-  if (sourceApp !== "Apple_Terminal" && sourceApp !== "vscode") return {};
+  const focusUrl = process.env.WARP_FOCUS_URL;
+  const warp = typeof focusUrl === "string" && WARP_FOCUS_URL.test(focusUrl) ? { warp_focus_url: focusUrl } : {};
+  if (sourceApp !== "Apple_Terminal" && sourceApp !== "vscode") return warp;
   return {
     source_app: sourceApp,
     source_cwd: process.cwd(),
+    ...warp,
   };
 }
 

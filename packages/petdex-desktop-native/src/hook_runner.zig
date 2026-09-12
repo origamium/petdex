@@ -35,7 +35,7 @@ const post_poll_ms: u64 = 5;
 
 /// argv tail after "bubble": [phase, agent?]. Reads stdin, formats,
 /// POSTs bubble + state to the in-process hook server. Never fails outward.
-pub fn run(phase: []const u8, arg_agent: ?[]const u8, origin_app: plat.OriginApplication, source_cwd_raw: ?[]const u8, herdr_pane_raw: ?[]const u8, home: []const u8) void {
+pub fn run(phase: []const u8, arg_agent: ?[]const u8, origin_app: plat.OriginApplication, source_cwd_raw: ?[]const u8, herdr_pane_raw: ?[]const u8, warp_focus_raw: ?[]const u8, home: []const u8) void {
     // Always finish consuming the host's payload before any early return.
     // The host may still be writing after the useful 64 KiB prefix, and
     // closing the read end early propagates EPIPE/Broken pipe to the agent.
@@ -90,7 +90,10 @@ pub fn run(phase: []const u8, arg_agent: ?[]const u8, origin_app: plat.OriginApp
     var scan_buf: [transcript_tail_cap]u8 = undefined;
     var model_buf: [48]u8 = undefined;
     var effort_buf: [16]u8 = undefined;
-    const settings: Settings = if (isPromptPhase(phase) or isStopPhase(phase)) modelSettings(payload, &scan_buf, &model_buf, &effort_buf) else .{};
+    var settings: Settings = if (isPromptPhase(phase) or isStopPhase(phase)) modelSettings(payload, &scan_buf, &model_buf, &effort_buf) else .{};
+    // Warp hands each pane a link back to itself. Every event carries it,
+    // so the card can bring that pane forward.
+    settings.focus_url = plat.safeWarpFocusUrl(warp_focus_raw) orelse "";
 
     var text_buf: [256]u8 = undefined;
     var text = formatBubble(phase, payload, &text_buf) orelse "";
@@ -251,8 +254,10 @@ pub fn bubbleBodyWithMetadata(out: []u8, text: []const u8, title: []const u8, bu
     return bubbleBodyFull(out, text, title, busy, agent, session_id, source_app, source_tty, source_cwd, herdr_pane, agent_state, .{});
 }
 
-/// The model and reasoning effort a session runs with, when the agent says.
-pub const Settings = struct { model: []const u8 = "", effort: []const u8 = "" };
+/// The optional tail of a bubble body: the model and reasoning effort a
+/// session runs with, when the agent says, and Warp's link to the pane it
+/// runs in (`WARP_FOCUS_URL`), when it runs in Warp.
+pub const Settings = struct { model: []const u8 = "", effort: []const u8 = "", focus_url: []const u8 = "" };
 
 /// bubbleBodyWithMetadata plus the model and effort, appended last and only
 /// when known: without them the body is byte for byte the one above.
@@ -265,6 +270,11 @@ pub fn bubbleBodyFull(out: []u8, text: []const u8, title: []const u8, busy: bool
     var effort_buf: [40]u8 = undefined;
     const effort_part: []const u8 = if (settings.effort.len > 0)
         (std.fmt.bufPrint(&effort_buf, ",\"effort\":\"{s}\"", .{settings.effort}) catch return null)
+    else
+        "";
+    var focus_buf: [96]u8 = undefined;
+    const focus_part: []const u8 = if (settings.focus_url.len > 0)
+        (std.fmt.bufPrint(&focus_buf, ",\"warp_focus_url\":\"{s}\"", .{settings.focus_url}) catch return null)
     else
         "";
     var title_buf: [256]u8 = undefined;
@@ -287,7 +297,7 @@ pub fn bubbleBodyFull(out: []u8, text: []const u8, title: []const u8, busy: bool
         (std.fmt.bufPrint(&state_buf, ",\"agent_state\":\"{s}\"", .{st}) catch return null)
     else
         "";
-    return std.fmt.bufPrint(out, "{{\"text\":\"{s}\"{s},\"busy\":{},\"agent_source\":\"{s}\"{s}{s}{s}{s}{s}}}", .{ text, title_part, busy, agent, session_part, metadata, state_part, model_part, effort_part }) catch null;
+    return std.fmt.bufPrint(out, "{{\"text\":\"{s}\"{s},\"busy\":{},\"agent_source\":\"{s}\"{s}{s}{s}{s}{s}{s}}}", .{ text, title_part, busy, agent, session_part, metadata, state_part, model_part, effort_part, focus_part }) catch null;
 }
 
 /// Codex puts `model` in every hook payload; neither agent puts the effort
@@ -1151,10 +1161,17 @@ test "a preview keeps its first lines" {
 test "the longest bubble body fits one POST" {
     var buf: [post_body_cap]u8 = undefined;
     const cwd = "/" ++ ("d" ** 510);
-    const body = bubbleBodyFull(&buf, "x" ** 190, "t" ** 60, true, "claude-code", "a" ** 64, "Apple_Terminal", "/dev/ttys000", cwd, "p" ** 64, "waiting", .{ .model = "m" ** 48, .effort = "e" ** 16 }).?;
+    const body = bubbleBodyFull(&buf, "x" ** 190, "t" ** 60, true, "claude-code", "a" ** 64, "Apple_Terminal", "/dev/ttys000", cwd, "p" ** 64, "waiting", .{ .model = "m" ** 48, .effort = "e" ** 16, .focus_url = "warppreview://session/" ++ ("a" ** 32) }).?;
     // Past the old 1 KiB cap that dropped such a bubble without a word.
     try t.expect(body.len > 1024);
     try t.expect(body.len <= post_body_cap);
+}
+
+test "a Warp pane's link rides the bubble" {
+    var buf: [post_body_cap]u8 = undefined;
+    const url = "warp://session/0123456789abcdef0123456789abcdef";
+    const body = bubbleBodyFull(&buf, "t", "", true, "codex", "s1", "", "", "", "", null, .{ .focus_url = url }).?;
+    try t.expectEqualStrings(url, hook_server.jsonStringPub(body, "warp_focus_url").?);
 }
 
 test "a turn that ends on an error fails its bubble" {

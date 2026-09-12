@@ -51,8 +51,10 @@ agent's logo. A bubble waiting on you glows, with an orange dot; one that hit
 an error wears a red "!". Click a bubble to open it into a card: the project,
 the agent and its status, the model and reasoning effort when the agent
 reports them (Claude Code, Codex, OpenCode), and the first lines of what it is
-doing or last said. Click again to close it. A finished bubble pops a moment
-later. Up to ten conversations float at once.
+doing or last said. When the agent runs in Warp (2026.05 or later) or in
+Terminal, the card also brings its pane or tab to the front. Click again to
+close it. A finished bubble pops a moment later. Up to ten conversations float
+at once.
 
 Claude Code reports failed tools and failed turns once its hooks are installed
 again from Settings; an earlier install keeps working without them.
