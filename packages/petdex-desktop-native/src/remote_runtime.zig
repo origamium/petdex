@@ -16,6 +16,7 @@ const remote_agents = @import("remote_agents.zig");
 const remote_ssh = @import("remote_ssh.zig");
 const remote_writeback = @import("remote_writeback.zig");
 const plat = @import("plat.zig");
+const i18n = @import("i18n.zig");
 
 const AgentKind = agent_hooks.AgentKind;
 
@@ -621,21 +622,21 @@ pub fn onBackoff(slot: *Slot, slot_idx: usize, home: []const u8) Action {
 /// "Connected". A completed sync has already cleared wb_failed.
 pub fn statusCaption(slot: *const Slot) []const u8 {
     if (slot.tunnel_ready and slot.sync_complete) {
-        return "Connected";
+        return i18n.t("Connected", "接続済み");
     }
     return switch (slot.op) {
-        .probe => "Connecting…",
-        .quiesce => "Securing remote feed…",
-        .tunnel => "Opening secure tunnel…",
-        .profile, .fetch, .push => "Checking and patching hooks…",
-        .token => "Enabling remote feed…",
-        .watcher => "Starting remote feeds…",
+        .probe => i18n.t("Connecting…", "接続中…"),
+        .quiesce => i18n.t("Securing remote feed…", "リモートのフィードを保護中…"),
+        .tunnel => i18n.t("Opening secure tunnel…", "安全なトンネルを開いています…"),
+        .profile, .fetch, .push => i18n.t("Checking and patching hooks…", "フックを確認して修正中…"),
+        .token => i18n.t("Enabling remote feed…", "リモートのフィードを有効化中…"),
+        .watcher => i18n.t("Starting remote feeds…", "リモートのフィードを開始中…"),
         .none => if (slot.tunnel_ready)
-            (if (slot.wb_failed) "Tunnel up; patch retrying…" else "Tunnel up; setup retrying…")
+            (if (slot.wb_failed) i18n.t("Tunnel up; patch retrying…", "トンネル接続済み。修正を再試行中…") else i18n.t("Tunnel up; setup retrying…", "トンネル接続済み。設定を再試行中…"))
         else if (slot.backoff_ms > 0)
-            "Reconnecting…"
+            i18n.t("Reconnecting…", "再接続中…")
         else
-            "Idle",
+            i18n.t("Idle", "待機中"),
     };
 }
 

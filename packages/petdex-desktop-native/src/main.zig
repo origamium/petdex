@@ -28,6 +28,12 @@ const remote_ssh = @import("remote_ssh.zig");
 const remote_writeback = @import("remote_writeback.zig");
 const remote_runtime = @import("remote_runtime.zig");
 const herdr_status = @import("herdr_status.zig");
+const sdk_log = @import("sdk_log.zig");
+const i18n = @import("i18n.zig");
+const chat = @import("chat/chat.zig");
+const chat_history = @import("chat_history.zig");
+const chat_shell = @import("chat_shell.zig");
+const chat_view = @import("chat_view.zig");
 pub const desktop_auth = @import("desktop_auth.zig");
 const flock_mod = @import("flock.zig");
 pub const updates = @import("updates.zig");
@@ -38,8 +44,8 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 const canvas_label = "pet-canvas";
-const frame_w: f32 = 192;
-const frame_h: f32 = 208;
+pub const frame_w: f32 = 192;
+pub const frame_h: f32 = 208;
 const max_scale: f32 = 1.2;
 const pet_edge_pad: f32 = 8;
 const win_w: f32 = frame_w * max_scale;
@@ -107,8 +113,6 @@ pub const Msg = union(enum) {
     chime_done: native_sdk.EffectExit,
     set_bubble_text_size: f32,
     bubble_lifetime_input: canvas.TextInputEvent,
-    bubble_columns_input: canvas.TextInputEvent,
-    bubble_answer_lines_input: canvas.TextInputEvent,
     font_path_input: canvas.TextInputEvent,
     toggle_hide_dock,
     toggle_launch_at_login,
@@ -157,9 +161,35 @@ pub const Msg = union(enum) {
     auth_avatar_response: native_sdk.EffectResponse,
     auth_preview_response: native_sdk.EffectResponse,
     auth_library_done: native_sdk.EffectExit,
+    clear_notifications,
+    // Pet chat (chat_shell.zig).
+    open_chat,
+    show_chat,
+    chat_brief,
+    chat_closed,
+    chat_input: canvas.TextInputEvent,
+    chat_submit,
+    chat_stop,
+    chat_clear,
+    chat_retry,
+    chat_toggle_history,
+    chat_scrolled: canvas.ScrollState,
+    chat_line: native_sdk.EffectLine,
+    chat_response: native_sdk.EffectResponse,
+    set_chat_provider: u32,
+    set_chat_stack: u32,
+    set_language: u32,
+    chat_model_input: canvas.TextInputEvent,
+    chat_url_input: canvas.TextInputEvent,
+    chat_detect_models,
+    chat_models_response: native_sdk.EffectResponse,
+    chatgpt_sign_in,
+    chatgpt_import,
+    chatgpt_sign_out,
+    chatgpt_token_response: native_sdk.EffectResponse,
     noop,
 
-    pub const view_unbound = .{ "frame_tick", "poll_tick", "physics_tick", "frame_clock", "cycle_state", "native_drag_watchdog", "chime_done", "quit_app", "toggle_focus_mode", "shuffle_pet", "dsh_install_done", "dsh_remove_done", "remote_line", "remote_done", "remote_backoff", "update_boot_check", "update_response", "homebrew_done", "homebrew_timeout", "brew_command_copied", "auth_token_response", "auth_avatar_response", "auth_preview_response", "auth_library_done" };
+    pub const view_unbound = .{ "frame_tick", "poll_tick", "physics_tick", "frame_clock", "cycle_state", "native_drag_watchdog", "chime_done", "quit_app", "toggle_focus_mode", "shuffle_pet", "dsh_install_done", "dsh_remove_done", "remote_line", "remote_done", "remote_backoff", "update_boot_check", "update_response", "homebrew_done", "homebrew_timeout", "brew_command_copied", "auth_token_response", "auth_avatar_response", "auth_preview_response", "auth_library_done", "chat_line", "chat_response", "chat_models_response", "chatgpt_token_response" };
 };
 
 pub const Model = struct {
@@ -207,6 +237,9 @@ pub const Model = struct {
     /// the top of the screen for the expanded height to fit. Flipped,
     /// the front card is the TOP one and the stack grows downward.
     bubble_flipped: bool = false,
+    /// The bubble window has been moved beside the pet since it opened;
+    /// until then it stays invisible.
+    bubble_placed: bool = false,
     /// A constrained placement probe can prove that the above candidate is
     /// outside the current display's visible frame. Keep that result until
     /// the pet moves to another display/position or the bubble is resized;
@@ -247,6 +280,7 @@ pub const Model = struct {
     /// Sprite scale, persisted. Codex parity: the settings slider maps
     /// 0.4..1.2 over this.
     scale: f32 = 0.7,
+    language: i18n.Pref = .auto,
     active_pet: u32 = 0,
     window_fitted: bool = false,
     bubbles_enabled: bool = true,
@@ -279,14 +313,7 @@ pub const Model = struct {
     bubble_lifetime_text_len: usize = 1,
     /// Bubble layout is user-controlled on every platform: one title line
     /// plus this many answer lines, each with the configured column budget.
-    bubble_columns: u16 = bubble_columns_default,
-    bubble_answer_lines: u8 = bubble_answer_lines_default,
-    bubble_columns_text: [4]u8 = .{ '4', '0', 0, 0 },
-    bubble_columns_text_len: usize = 2,
-    bubble_answer_lines_text: [2]u8 = .{ '2', 0 },
-    bubble_answer_lines_text_len: usize = 1,
-    font_path: [512]u8 = @splat(0),
-    font_path_len: usize = 0,
+    font_path: canvas.TextBuffer(512) = .{},
     font_path_dirty: bool = false,
     font_load_failed: bool = false,
     /// macOS: run as a menu-bar app — no Dock icon, no app switcher
@@ -359,6 +386,7 @@ pub const Model = struct {
     settings_scroll: f32 = 0,
     auth_preview_next: usize = 0,
     auth_preview_ready: [12]bool = @splat(false),
+    chat: chat_shell.State = .{},
 };
 
 /// Petdex web tokens (globals.css) translated from OKLCH: brand purple
@@ -375,6 +403,7 @@ fn petdexThemeTokens(model: *const Model) canvas.DesignTokens {
     // preference remains available on the untouched Win/mac SDK too.
     tokens.typography.heading_size = model.bubble_text_px;
     if (custom_font_active) tokens.typography.font_id = custom_font_id;
+    tokens.text_measure = text_measure;
     // Linux's software presenter needs an alpha-zero clear all the way
     // into GTK's ARGB surface. Win32 and AppKit retain their upstream
     // platform-owned transparency paths and ordinary theme tokens.
@@ -405,7 +434,13 @@ fn petdexThemeTokens(model: *const Model) canvas.DesignTokens {
     return tokens.withOverrides(canvas.accentOverrides(c.accent, scheme));
 }
 
-fn petdexTokens(model: *const Model) canvas.DesignTokens {
+/// The runtime's text measurement (CoreText on macOS), captured from
+/// Effects on poll ticks. App-side layout (bubble widths, the chat's line
+/// counts) then wraps exactly as the runtime paints; null, as under
+/// tests, keeps the SDK's estimator.
+pub var text_measure: ?*const canvas.TextMeasureProvider = null;
+
+pub fn petdexTokens(model: *const Model) canvas.DesignTokens {
     var tokens = petdexThemeTokens(model);
     // Transparent pet and bubble windows must clear to zero alpha. The
     // settings window paints its own opaque page background below.
@@ -458,7 +493,8 @@ pub const InstallState = struct {
     ext_png: bool = false,
     /// Last failure, shown in Settings until dismissed. Empty means the
     /// install either succeeded or never ran.
-    error_text: [96]u8 = @splat(0),
+    /// Sized for Japanese, three bytes a character.
+    error_text: [192]u8 = @splat(0),
     error_len: usize = 0,
     /// The compact endpoint is preferred. A failed request gets one
     /// retry against the legacy endpoint for older mirrors.
@@ -524,8 +560,8 @@ pub const InstallState = struct {
         self.queued -= 1;
     }
 
-    pub fn setError(self: *InstallState, comptime fmt: []const u8, args: anytype) void {
-        const written = std.fmt.bufPrint(&self.error_text, fmt, args) catch {
+    pub fn setError(self: *InstallState, comptime en: []const u8, comptime ja: []const u8, args: anytype) void {
+        const written = i18n.bufPrint(&self.error_text, en, ja, args) catch {
             self.error_len = 0;
             return;
         };
@@ -567,7 +603,7 @@ fn startInstallQueue(model: *Model, fx: *Effects) void {
     if (model.install.busy() or model.install.queued == 0) return;
     if (installer.detect() == null) {
         std.debug.print("{s}", .{installer.missing_downloader_note});
-        model.install.setError("No downloader: install curl", .{});
+        model.install.setError("No downloader: install curl", "ダウンローダーがありません。curlをインストールしてください。", .{});
         model.install.queued = 0;
         return;
     }
@@ -601,28 +637,28 @@ fn beginCurrentPet(model: *Model, fx: *Effects) bool {
     var path_buf: [512]u8 = undefined;
     const manifest_path = manifestTmpPath(&path_buf) orelse return false;
     const manifest = plat.readFileAlloc(boot_allocator, manifest_path, max_manifest_bytes) orelse {
-        model.install.setError("Manifest download failed", .{});
+        model.install.setError("Manifest download failed", "マニフェストをダウンロードできませんでした。", .{});
         return false;
     };
     defer boot_allocator.free(manifest);
 
     const urls = installer.findPetUrls(manifest, slug) orelse {
-        model.install.setError("{s} is not in the catalog", .{slug});
+        model.install.setError("{s} is not in the catalog", "{s}はカタログにありません。", .{slug});
         return false;
     };
     const pet_json = urls.resolvePetJson(model.install.asset_url_buffers[0][0..]) orelse {
-        model.install.setError("{s} has an invalid pet.json URL", .{slug});
+        model.install.setError("{s} has an invalid pet.json URL", "{s}のpet.jsonのURLが正しくありません。", .{slug});
         return false;
     };
     const spritesheet = urls.resolveSpritesheet(model.install.asset_url_buffers[1][0..]) orelse {
-        model.install.setError("{s} has an invalid spritesheet URL", .{slug});
+        model.install.setError("{s} has an invalid spritesheet URL", "{s}のスプライトシートのURLが正しくありません。", .{slug});
         return false;
     };
     // The host check happens before a single byte is requested: an
     // approved-but-stale row could carry a URL off the asset origin,
     // and the app must not write those bytes to a pet directory.
     if (!installer.isTrustedAssetUrl(pet_json) or !installer.isTrustedAssetUrl(spritesheet)) {
-        model.install.setError("{s} has an untrusted asset host", .{slug});
+        model.install.setError("{s} has an untrusted asset host", "{s}のアセットのホストは信頼できません。", .{slug});
         return false;
     }
     model.install.ext_png = std.mem.eql(u8, urls.spritesheetExt(), "png");
@@ -947,13 +983,13 @@ fn saveAuthSession(model: *const Model, fx: *Effects) void {
 
 fn fetchAuthLibrary(model: *Model, fx: *Effects) void {
     if (model.auth.access_token_len == 0) {
-        model.auth.setError("Your Petdex session is missing an access token");
+        model.auth.setError(i18n.t("Your Petdex session is missing an access token", "Petdexのセッションにアクセストークンがありません。"));
         return;
     }
     model.auth.phase = .syncing;
     var config_buf: [9000]u8 = undefined;
     const config = std.fmt.bufPrint(&config_buf, "url = \"{s}\"\nheader = \"Authorization: Bearer {s}\"\nsilent\nshow-error\nwrite-out = \"\\n%{{http_code}}\"\n", .{ env_auth_library_url, model.auth.accessToken() }) catch {
-        model.auth.setError("Your Petdex session token is too large");
+        model.auth.setError(i18n.t("Your Petdex session token is too large", "Petdexのセッショントークンが大きすぎます。"));
         return;
     };
     const argv = [_][]const u8{ "/usr/bin/curl", "--max-time", "15", "--config", "-" };
@@ -970,7 +1006,7 @@ fn requestAuthTokens(model: *Model, code: ?[]const u8, fx: *Effects) void {
     var body_buf: [10000]u8 = undefined;
     const body = if (code) |value| desktop_auth.tokenBody(&model.auth, value, &body_buf) else desktop_auth.refreshBody(&model.auth, &body_buf);
     const payload = body orelse {
-        model.auth.setError("Could not prepare the Petdex sign-in request");
+        model.auth.setError(i18n.t("Could not prepare the Petdex sign-in request", "Petdexのサインイン要求を準備できませんでした。"));
         return;
     };
     model.auth.refreshing = code == null;
@@ -1191,7 +1227,7 @@ var sheet: Sheet = .{};
 /// (caller frees) and the display name.
 /// Env snapshot taken in main() from init.environ_map (Zig 0.16 has no
 /// global getenv; env rides std.process.Init).
-var env_home: ?[]const u8 = null;
+pub var env_home: ?[]const u8 = null;
 var env_wanted_pet: ?[]const u8 = null;
 var env_auth_library_url: []const u8 = desktop_auth.library_url;
 
@@ -1324,11 +1360,18 @@ fn jsonUnescapeString(value: []const u8, output: []u8) ?[]const u8 {
 fn saveSettings(model: *const Model) void {
     var path_buf: [512]u8 = undefined;
     const path = settingsPath(&path_buf) orelse return;
-    // Headroom check (a bufPrint overflow here fails silently and
-    // drops the whole save): keep room for the configurable bubble
-    // fields, rotation state, a long slug, and negative coordinates.
-    // Grown with every key added; `font_path` alone can escape to 1024.
-    var buf: [2304]u8 = undefined;
+    var buf: [settings_json_bytes]u8 = undefined;
+    const json = settingsJson(model, &buf) orelse return;
+    cWriteFile(path, json);
+}
+
+// Headroom check (a bufPrint overflow here fails silently and drops the
+// whole save): keep room for the configurable bubble fields, rotation
+// state, a long slug, and negative coordinates. Grown with every key
+// added; `font_path` alone can escape to 1024.
+const settings_json_bytes = 2336;
+
+fn settingsJson(model: *const Model, buf: []u8) ?[]const u8 {
     const active = if (model.active_pet < catalog_mod.catalog_len) catalog[model.active_pet].slice() else "";
     // The position keys only exist once the window has been fitted and
     // read: a save fired on the very first frame would otherwise
@@ -1340,11 +1383,10 @@ fn saveSettings(model: *const Model) void {
     else
         "";
     var escaped_font_buf: [1024]u8 = undefined;
-    const font_path = std.mem.trim(u8, model.font_path[0..model.font_path_len], " \t\r\n");
-    const escaped_font = jsonEscapeString(font_path, &escaped_font_buf) orelse return;
+    const font_path = std.mem.trim(u8, model.font_path.text(), " \t\r\n");
+    const escaped_font = jsonEscapeString(font_path, &escaped_font_buf) orelse return null;
     const latest = model.latest_version[0..model.latest_version_len];
-    const json = std.fmt.bufPrint(&buf, "{{\"active_pet\":\"{s}\",\"scale\":{d:.2},\"bubbles\":{},\"bubbles_per_conversation\":{},\"waiting_sound\":{},\"bubble_text\":{d:.1},\"bubble_lifetime\":{d:.0},\"bubble_columns\":{},\"bubble_answer_lines\":{},\"font_path\":\"{s}\",\"hide_dock\":{},\"rotate_pets\":{},\"rotation_day\":{d},\"update_checks\":{},\"last_update_check_ms\":{d},\"latest_desktop_version\":\"{s}\"{s},\"agents_prompted\":{}}}", .{ active, model.scale, model.bubbles_enabled, model.bubbles_per_conversation, model.waiting_sound, model.bubble_text_px, model.bubble_lifetime_secs, model.bubble_columns, model.bubble_answer_lines, escaped_font, model.hide_dock, model.rotate_pets, model.rotation_day, model.update_checks_enabled, model.last_update_check_ms, latest, pos, model.agents_prompted }) catch return;
-    cWriteFile(path, json);
+    return std.fmt.bufPrint(buf, "{{\"active_pet\":\"{s}\",\"scale\":{d:.2},\"bubbles\":{},\"bubbles_per_conversation\":{},\"waiting_sound\":{},\"bubble_text\":{d:.1},\"bubble_lifetime\":{d:.0},\"font_path\":\"{s}\",\"hide_dock\":{},\"rotate_pets\":{},\"rotation_day\":{d},\"update_checks\":{},\"last_update_check_ms\":{d},\"latest_desktop_version\":\"{s}\"{s},\"agents_prompted\":{},\"language\":\"{s}\"}}", .{ active, model.scale, model.bubbles_enabled, model.bubbles_per_conversation, model.waiting_sound, model.bubble_text_px, model.bubble_lifetime_secs, escaped_font, model.hide_dock, model.rotate_pets, model.rotation_day, model.update_checks_enabled, model.last_update_check_ms, latest, pos, model.agents_prompted, @tagName(model.language) }) catch null;
 }
 
 fn setUnsignedText(buffer: []u8, length: *usize, value: u16) void {
@@ -1371,23 +1413,6 @@ fn editUnsignedText(buffer: []u8, length: *usize, edit: canvas.TextInputEvent, m
     const value = std.fmt.parseInt(u16, buffer[0..length.*], 10) catch return null;
     if (value < min_value or value > max_value) return null;
     return value;
-}
-
-fn editPathText(buffer: []u8, length: *usize, edit: canvas.TextInputEvent) void {
-    switch (edit) {
-        .insert_text => |text| {
-            const available = buffer.len - length.*;
-            const count = @min(available, text.len);
-            @memcpy(buffer[length.* .. length.* + count], text[0..count]);
-            length.* += count;
-        },
-        .delete_backward, .delete_word_backward => {
-            if (length.* > 0) length.* -= 1;
-            while (length.* > 0 and (buffer[length.*] & 0xC0) == 0x80) length.* -= 1;
-        },
-        .clear => length.* = 0,
-        else => {},
-    }
 }
 
 /// Read a pet's encoded sheet bytes into `buf`. Prefers pet.json's
@@ -1481,14 +1506,21 @@ fn freeSheet(s: *Sheet) void {
 }
 
 var initial_scale: f32 = 0.7;
+var initial_language: i18n.Pref = .auto;
+/// Whether the launch environment asks for Japanese (macOS preferences,
+/// the Windows UI language, the POSIX locale); read once in main().
+var os_japanese = false;
+
+/// Resolve the Settings choice into the language the UI speaks.
+fn applyLanguage(pref: i18n.Pref) void {
+    i18n.current = i18n.resolve(pref, os_japanese, builtin.os.tag == .macos or custom_font_active);
+}
 var initial_pet: u32 = 0;
 var initial_bubbles: bool = true;
 var initial_bubbles_per_conversation: bool = true;
 var initial_waiting_sound: bool = false;
 var initial_bubble_text_px: f32 = bubble_text_default_px;
 var initial_bubble_lifetime_secs: f32 = bubble_lifetime_default_secs;
-var initial_bubble_columns: u16 = bubble_columns_default;
-var initial_bubble_answer_lines: u8 = bubble_answer_lines_default;
 var initial_hide_dock: bool = false;
 var initial_rotate_pets: bool = false;
 var initial_rotation_day: u32 = 0;
@@ -1512,6 +1544,7 @@ var initial_pet_y: ?f64 = null;
 const avatar_image_id: u64 = 13;
 const tail_image_id: u64 = 14;
 const auth_avatar_image_id: u64 = 15;
+const chat_tail_image_id: u64 = 17;
 const auth_preview_atlas_id: u64 = 16;
 const auth_preview_cell: usize = 48;
 const auth_preview_columns: usize = 6;
@@ -1615,18 +1648,23 @@ fn loadAgentsAtlas(dark: bool, fx: *Effects) void {
     agents_icons_dark = dark;
     agents_icons_ready = true;
 }
-const tail_w: usize = 18;
-const tail_h: usize = 9;
+pub const tail_w: usize = 18;
+pub const tail_h: usize = 9;
 const tail_atlas_h: usize = tail_h * 2;
+/// The chat's side tail image: two cells, each tail_h wide.
+const side_tail_w: usize = tail_h * 2;
 var tail_dark: bool = false;
 var tail_ready: bool = false;
 
 /// Register both speech-bubble tail directions in one image slot. The
 /// upper atlas cell points down for a bubble above the pet; the lower
-/// cell points up for a bubble that has flipped below it.
-fn registerTail(dark: bool, fx: *Effects) void {
+/// cell points up for a bubble that has flipped below it. The chat
+/// bubble beside the pet gets the same triangle turned sideways, in its
+/// own image.
+pub fn registerTail(dark: bool, fx: *Effects) void {
     if (tail_ready and tail_dark == dark) return;
     var pixels: [tail_w * tail_atlas_h * 4]u8 = @splat(0);
+    var side: [side_tail_w * tail_w * 4]u8 = @splat(0);
     const cr: u8 = if (dark) 25 else 255;
     const cg: u8 = if (dark) 25 else 255;
     const cb: u8 = if (dark) 28 else 255;
@@ -1658,10 +1696,16 @@ fn registerTail(dark: bool, fx: *Effects) void {
                 const mirror_y = tail_atlas_h - y - 1;
                 const mirror_i = (mirror_y * tail_w + x) * 4;
                 @memcpy(pixels[mirror_i..][0..4], pixels[i..][0..4]);
+                // Transposed for the chat: the left cell points left and
+                // the right one right, each with its plain base column
+                // against the card.
+                @memcpy(side[(x * side_tail_w + (tail_h - 1 - y)) * 4 ..][0..4], pixels[i..][0..4]);
+                @memcpy(side[(x * side_tail_w + (tail_h + y)) * 4 ..][0..4], pixels[i..][0..4]);
             }
         }
     }
     fx.registerImage(tail_image_id, tail_w, tail_atlas_h, &pixels) catch return;
+    fx.registerImage(chat_tail_image_id, side_tail_w, tail_w, &side) catch return;
     tail_dark = dark;
     tail_ready = true;
 }
@@ -1677,6 +1721,26 @@ fn tailSourceRect(flipped: bool) geometry.RectF {
         @floatFromInt(tail_w),
         @floatFromInt(tail_h),
     );
+}
+
+/// The chat tail's cell: `point_left` for a bubble right of the pet.
+/// Both cells span the full height, so the vertical origin flip that
+/// tailSourceRect minds does not arise.
+fn chatTailRect(point_left: bool) geometry.RectF {
+    return geometry.RectF.init(if (point_left) 0 else @floatFromInt(tail_h), 0, @floatFromInt(tail_h), @floatFromInt(tail_w));
+}
+
+/// The chat bubble's tail, placed by translation at (x, y) in its window.
+pub fn chatTail(ui: *AppUi, point_left: bool, x: f32, y: f32) AppUi.Node {
+    var tail = ui.image(.{
+        .width = @floatFromInt(tail_h),
+        .height = @floatFromInt(tail_w),
+        .image = if (tail_ready) chat_tail_image_id else 0,
+    });
+    tail.widget.image_src = chatTailRect(point_left);
+    tail.widget.image_fit = .contain;
+    tail.widget.transform = canvas.Affine.translate(x, y);
+    return tail;
 }
 var avatar_agent: [24]u8 = @splat(0);
 var avatar_agent_len: usize = 0;
@@ -1795,16 +1859,13 @@ fn resolveInitialPet(io: std.Io, allocator: std.mem.Allocator, environ_map: *std
             if (hook_server.jsonNumberPub(json, "bubble_lifetime")) |v| {
                 initial_bubble_lifetime_secs = clampBubbleLifetime(@floatCast(v));
             }
-            if (hook_server.jsonNumberPub(json, "bubble_columns")) |v| {
-                if (v >= bubble_columns_min and v <= bubble_columns_max) initial_bubble_columns = @intFromFloat(v);
-            }
-            if (hook_server.jsonNumberPub(json, "bubble_answer_lines")) |v| {
-                if (v >= bubble_answer_lines_min and v <= bubble_answer_lines_max) initial_bubble_answer_lines = @intFromFloat(v);
-            }
             if (hook_server.jsonStringPub(json, "font_path")) |encoded| {
                 if (jsonUnescapeString(encoded, &initial_font_path)) |value| {
                     initial_font_path_len = value.len;
                 }
+            }
+            if (hook_server.jsonStringPub(json, "language")) |value| {
+                initial_language = std.meta.stringToEnum(i18n.Pref, value) orelse .auto;
             }
             if (hook_server.jsonStringPub(json, "bubbles")) |_| {} else if (std.mem.indexOf(u8, json, "\"bubbles\":false") != null) {
                 initial_bubbles = false;
@@ -2039,7 +2100,7 @@ fn shouldEscalate(state: State, waiting_since_ms: i64, escalated: bool, now: i64
     return state == .waiting and !escalated and now - waiting_since_ms >= waiting_escalation_ms;
 }
 
-fn applyState(model: *Model, state: State, duration_ms: u32, fx: *Effects) void {
+pub fn applyState(model: *Model, state: State, duration_ms: u32, fx: *Effects) void {
     if (shouldChime(model.state, state)) {
         model.waiting_since_ms = fx.wallMs();
         model.waiting_escalated = false;
@@ -2145,6 +2206,7 @@ pub fn boot(model: *Model, fx: *Effects) void {
         startRemotes(model, fx);
     }
     loadAuthSession(model, fx);
+    chat_shell.boot(model);
     fx.startTimer(.{
         .key = poll_timer_key,
         .interval_ms = poll_interval_ms,
@@ -2156,18 +2218,14 @@ pub fn boot(model: *Model, fx: *Effects) void {
     // not cost the user their scale, their bubble preference, or the
     // Agents section.
     model.scale = initial_scale;
+    model.language = initial_language;
     model.bubbles_enabled = initial_bubbles;
     model.bubbles_per_conversation = initial_bubbles_per_conversation;
     model.waiting_sound = initial_waiting_sound;
     model.bubble_text_px = initial_bubble_text_px;
     model.bubble_lifetime_secs = initial_bubble_lifetime_secs;
     setUnsignedText(model.bubble_lifetime_text[0..], &model.bubble_lifetime_text_len, @intFromFloat(model.bubble_lifetime_secs));
-    model.bubble_columns = initial_bubble_columns;
-    model.bubble_answer_lines = initial_bubble_answer_lines;
-    setUnsignedText(model.bubble_columns_text[0..], &model.bubble_columns_text_len, model.bubble_columns);
-    setUnsignedText(model.bubble_answer_lines_text[0..], &model.bubble_answer_lines_text_len, model.bubble_answer_lines);
-    @memcpy(model.font_path[0..initial_font_path_len], initial_font_path[0..initial_font_path_len]);
-    model.font_path_len = initial_font_path_len;
+    model.font_path.set(initial_font_path[0..initial_font_path_len]);
     model.font_load_failed = initial_font_load_failed;
     model.agents_prompted = initial_agents_prompted;
     model.hide_dock = initial_hide_dock;
@@ -2299,8 +2357,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .toggle_pets_expanded => model.pets_expanded = !model.pets_expanded,
         .focus_flock_member => |index| {
             // The pane id rode all the way from Herdr on the bubble this
-            // body was built from, so reaching the session is the same
-            // verb the pet window already uses for the front bubble.
+            // body was built from, so Herdr can bring the session forward.
             if (index >= model.flock.len) return;
             const member = &model.flock.members[index];
             const pane = member.herdrPaneSlice();
@@ -2337,7 +2394,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     model.install.manifest_fallback_attempted = true;
                     var path_buf: [512]u8 = undefined;
                     const path = manifestTmpPath(&path_buf) orelse {
-                        model.install.setError("Could not reach petdex.dev", .{});
+                        model.install.setError("Could not reach petdex.dev", "petdex.devに接続できませんでした。", .{});
                         model.install.phase = .idle;
                         model.install.queued = 0;
                         return;
@@ -2352,7 +2409,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     });
                     return;
                 }
-                model.install.setError("Could not reach petdex.dev", .{});
+                model.install.setError("Could not reach petdex.dev", "petdex.devに接続できませんでした。", .{});
                 model.install.phase = .idle;
                 model.install.queued = 0;
                 return;
@@ -2363,12 +2420,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .pet_json_done => |exit| {
             if (model.install.phase != .pet_json) return;
             if (exit.reason != .exited or exit.code != 0) {
-                model.install.setError("{s}: pet.json download failed", .{model.install.currentSlug()});
+                model.install.setError("{s}: pet.json download failed", "{s}：pet.jsonをダウンロードできませんでした。", .{model.install.currentSlug()});
                 advanceInstallQueue(model, fx);
                 return;
             }
             if (!beginSpritesheet(model, fx)) {
-                model.install.setError("{s}: spritesheet unavailable", .{model.install.currentSlug()});
+                model.install.setError("{s}: spritesheet unavailable", "{s}：スプライトシートを取得できません。", .{model.install.currentSlug()});
                 advanceInstallQueue(model, fx);
             }
         },
@@ -2376,12 +2433,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (model.install.phase != .spritesheet) return;
             const slug = model.install.currentSlug();
             if (exit.reason != .exited or exit.code != 0) {
-                model.install.setError("{s}: spritesheet download failed", .{slug});
+                model.install.setError("{s}: spritesheet download failed", "{s}：スプライトシートをダウンロードできませんでした。", .{slug});
                 advanceInstallQueue(model, fx);
                 return;
             }
             if (!mirrorToCodexRoot(slug, model.install.ext_png)) {
-                model.install.setError("{s}: failed to mirror into Codex pets", .{slug});
+                model.install.setError("{s}: failed to mirror into Codex pets", "{s}：Codexのペットにコピーできませんでした。", .{slug});
                 advanceInstallQueue(model, fx);
                 return;
             }
@@ -2520,7 +2577,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (!desktop_auth.available or model.auth.phase == .authorizing or model.auth.phase == .exchanging) return;
             var url_buf: [1024]u8 = undefined;
             const url = desktop_auth.begin(&model.auth, &url_buf) orelse {
-                model.auth.setError("Could not start Petdex sign-in");
+                model.auth.setError(i18n.t("Could not start Petdex sign-in", "Petdexのサインインを開始できませんでした。"));
                 return;
             };
             plat.openExternal(url);
@@ -2594,7 +2651,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .auth_token_response => |response| {
             if (response.outcome != .ok or response.status != 200 or response.truncated or !desktop_auth.applyTokenResponse(&model.auth, boot_allocator, response.body)) {
                 model.auth.refreshing = false;
-                model.auth.setError("Petdex sign-in could not complete");
+                model.auth.setError(i18n.t("Petdex sign-in could not complete", "Petdexのサインインを完了できませんでした。"));
                 return;
             }
             saveAuthSession(model, fx);
@@ -2617,13 +2674,43 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
             if (exit.reason != .exited or exit.code != 0 or exit.output_truncated or status != 200 or !desktop_auth.applyLibrary(&model.auth, boot_allocator, body)) {
                 model.auth.refreshing = false;
-                model.auth.setError("Could not sync your My Petdex library");
+                model.auth.setError(i18n.t("Could not sync your My Petdex library", "マイPetdexのライブラリを同期できませんでした。"));
                 return;
             }
             model.auth.refreshing = false;
             startAuthImages(model, fx);
         },
         .settings_closed => model.settings_open = false,
+        .clear_notifications => clearBubble(model),
+        .set_language => |raw| {
+            model.language = std.enums.fromInt(i18n.Pref, raw) orelse return;
+            applyLanguage(model.language);
+            saveSettings(model);
+        },
+        .open_chat,
+        .show_chat,
+        .chat_brief,
+        .chat_closed,
+        .chat_input,
+        .chat_submit,
+        .chat_stop,
+        .chat_clear,
+        .chat_retry,
+        .chat_toggle_history,
+        .chat_scrolled,
+        .chat_line,
+        .chat_response,
+        .set_chat_provider,
+        .set_chat_stack,
+        .chat_model_input,
+        .chat_url_input,
+        .chat_detect_models,
+        .chat_models_response,
+        .chatgpt_sign_in,
+        .chatgpt_import,
+        .chatgpt_sign_out,
+        .chatgpt_token_response,
+        => chat_shell.update(model, msg, fx),
         .update_boot_check => |timer| {
             if (timer.outcome == .fired and model.update_checks_enabled) startUpdateCheck(model, false, fx);
         },
@@ -2829,24 +2916,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 saveSettings(model);
             }
         },
-        .bubble_columns_input => |edit| {
-            if (editUnsignedText(model.bubble_columns_text[0..], &model.bubble_columns_text_len, edit, bubble_columns_min, bubble_columns_max)) |value| {
-                model.bubble_columns = value;
-                _ = fitWindow(model, fx);
-                syncBubbleWindow(model, fx);
-                saveSettings(model);
-            }
-        },
-        .bubble_answer_lines_input => |edit| {
-            if (editUnsignedText(model.bubble_answer_lines_text[0..], &model.bubble_answer_lines_text_len, edit, bubble_answer_lines_min, bubble_answer_lines_max)) |value| {
-                model.bubble_answer_lines = @intCast(value);
-                _ = fitWindow(model, fx);
-                syncBubbleWindow(model, fx);
-                saveSettings(model);
-            }
-        },
         .font_path_input => |edit| {
-            editPathText(model.font_path[0..], &model.font_path_len, edit);
+            model.font_path.apply(edit);
             model.font_path_dirty = true;
             model.font_load_failed = false;
             saveSettings(model);
@@ -2895,10 +2966,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .open_website => plat.openExternal("https://petdex.dev"),
         .appearance => |a| {
             model.dark = a.color_scheme == .dark;
-            if (newestBubble(model)) |newest| {
-                registerTail(model.dark, fx);
-                loadAgentAvatar(newest.agent[0..newest.agent_len], model.dark, fx);
-            }
+            // The chat bubble's tail rides the same registration, and the
+            // chat can be open with no hook bubble at all.
+            registerTail(model.dark, fx);
+            if (newestBubble(model)) |newest| loadAgentAvatar(newest.agent[0..newest.agent_len], model.dark, fx);
             // The strip is themed, so a stack drawing from it has to
             // re-pack on an appearance flip exactly like settings does.
             if (model.settings_open or model.bubbles_len > 1) loadAgentsAtlas(model.dark, fx);
@@ -2996,6 +3067,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // the whole arc.
                 updateBubbleStackInFlight(model, now);
                 syncBubbleWindow(model, fx);
+                chat_shell.follow(model, fx);
                 if (model.vx >= physics_min_vel) {
                     setThrowState(model, .@"running-right", fx);
                 } else if (model.vx <= -physics_min_vel) {
@@ -3030,6 +3102,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // needs no cursor.
             updateBubbleStack(model, read.cursor_x, read.cursor_y, now, fx);
             syncBubbleWindow(model, fx);
+            chat_shell.follow(model, fx);
             if (model.dragging) {
                 if (read.primary_down) {
                     // Follow the cursor keeping the grab offset, and
@@ -3063,6 +3136,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     // above. Re-anchor the bubble immediately so a drag
                     // across displays does not leave it one frame behind.
                     syncBubbleWindow(model, fx);
+                    chat_shell.follow(model, fx);
                     return;
                 }
                 var release_x = read.x;
@@ -3077,6 +3151,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                         model.pet_y = moved.y;
                         pushSample(model, moved.x, moved.y, now);
                         syncBubbleWindow(model, fx);
+                        chat_shell.follow(model, fx);
                     }
                 }
                 // Release: velocity from our own 100ms sample tail,
@@ -3090,10 +3165,16 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // canned (#557's "pet" interaction).
                 if (isTap(now - model.press_ms, release_x - model.press_x, release_y - model.press_y)) {
                     model.sample_len = 0;
-                    if (newestBubble(model)) |bubble| {
-                        const focused = if (env_home) |home| plat.activateHerdrPane(home, bubble.herdrPaneSlice()) else false;
-                        if (!focused) _ = plat.activateOriginApplication(bubble.origin_app, bubble.ttySlice(), bubble.cwdSlice());
+                    // A second tap soon after the first: the pet catches
+                    // the user up on their agents and the last chat.
+                    if (now - model.chat.last_tap_ms <= chat_shell.double_tap_ms) {
+                        model.chat.last_tap_ms = 0;
+                        chat_shell.update(model, .chat_brief, fx);
+                        return;
                     }
+                    model.chat.last_tap_ms = now;
+                    // A tap opens the chat, and the pet reacts to the touch.
+                    chat_shell.update(model, .show_chat, fx);
                     model.pat_flip = !model.pat_flip;
                     applyState(model, if (model.pat_flip) .jumping else .waving, pat_react_ms, fx);
                     return;
@@ -3142,16 +3223,17 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .poll_tick => |timer| {
             if (timer.outcome != .fired) return;
+            text_measure = fx.textMeasure();
             if (hook_server.auth_mailbox.take()) |callback| {
                 if (model.auth.phase == .authorizing) {
                     if (!std.mem.eql(u8, callback.stateSlice(), model.auth.oauthState())) {
-                        model.auth.setError("Petdex rejected the sign-in callback");
+                        model.auth.setError(i18n.t("Petdex rejected the sign-in callback", "Petdexがサインインの応答を受け付けませんでした。"));
                     } else if (callback.error_len > 0) {
                         model.auth.setError(callback.errorSlice());
                     } else if (callback.code_len > 0) {
                         requestAuthTokens(model, callback.codeSlice(), fx);
                     } else {
-                        model.auth.setError("Petdex rejected the sign-in callback");
+                        model.auth.setError(i18n.t("Petdex rejected the sign-in callback", "Petdexがサインインの応答を受け付けませんでした。"));
                     }
                 }
             }
@@ -3159,6 +3241,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // installed has no sheet, and that is precisely when a
             // `petdex://<slug>` link has work to do.
             drainPendingInstall(model, fx);
+            sdk_log.tick(fx.wallMs());
+            chat_shell.poll(model, fx);
             if (!model.sheet_loaded) return;
             if (model.settings_open and thumbs_built < catalog_mod.catalog_len) buildNextThumb(fx);
             const now = fx.wallMs();
@@ -3212,12 +3296,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 }
             }
             _ = expireBubbles(model, now);
-            // A newly drained bubble is declared as a popup in the same
-            // update pass. Compute Linux's side after expiry and before
-            // that declaration so the first rendered frame uses the same
-            // orientation as the compositor anchor, rather than showing a
-            // flipped tail for one frame until the next frame-clock tick.
-            if (builtin.target.os.tag == .linux and bubbleActive(model)) syncBubbleWindow(model, fx);
+            // Place the bubble on the poll clock too, not only on presented
+            // frames: the pet stops presenting while it sits still, and a
+            // bubble that opened (at the screen center) or a pet that moved
+            // in the meantime would be left behind until something redraws.
+            // On Linux this also computes the side before the popup is
+            // declared, so its first frame matches the compositor anchor.
+            syncBubbleWindow(model, fx);
             if (model.waiting_sound and shouldEscalate(model.state, model.waiting_since_ms, model.waiting_escalated, now)) {
                 model.waiting_escalated = true;
                 playWaitingChime(fx);
@@ -3251,6 +3336,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
 pub fn onKey(keyboard: canvas.WidgetKeyboardEvent) ?Msg {
     if (keyboard.modifiers.hasNavigationModifier() or keyboard.modifiers.shift) return null;
     if (std.ascii.eqlIgnoreCase(keyboard.key, "space")) return .cycle_state;
+    // Dismisses the chat bubble; the composer lets a spare Escape through
+    // (patches/native-sdk-escape-fallthrough.patch). A no-op when closed.
+    // ponytail: on_key has no window label, so Escape in a Settings field
+    // closes the chat too; forward the view label if that matters.
+    if (std.ascii.eqlIgnoreCase(keyboard.key, "escape")) return .chat_closed;
     return null;
 }
 
@@ -3278,6 +3368,8 @@ pub fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "petdex.pet-page")) return .open_active_pet_page;
     if (std.mem.eql(u8, name, "petdex.updates")) return .check_updates;
     if (std.mem.eql(u8, name, "petdex.flock")) return .toggle_flock_window;
+    if (std.mem.eql(u8, name, "petdex.chat")) return .open_chat;
+    if (std.mem.eql(u8, name, "petdex.clear-notifications")) return .clear_notifications;
     return null;
 }
 
@@ -3285,37 +3377,41 @@ pub fn onCommand(name: []const u8) ?Msg {
 
 pub const AppUi = canvas.Ui(Msg);
 
-const pet_menu = [_]AppUi.ContextMenuItem{
-    .{ .label = "Open Settings", .msg = .open_settings },
-    .{ .label = "Open Flock", .msg = .toggle_flock_window },
-    .{ .label = "View Pet on Petdex", .msg = .open_active_pet_page },
-    .{ .label = "Close Pet", .msg = .close_pet },
-};
+fn petMenu(comptime lang: i18n.Lang) [6]AppUi.ContextMenuItem {
+    return .{
+        .{ .label = i18n.pick(lang, "Open Settings", "設定…"), .msg = .open_settings },
+        .{ .label = i18n.pick(lang, "Open Flock", "フロックを開く"), .msg = .toggle_flock_window },
+        .{ .label = i18n.pick(lang, "View Pet on Petdex", "Petdexでペットを見る"), .msg = .open_active_pet_page },
+        .{ .label = i18n.pick(lang, "Chat", "チャット"), .msg = .open_chat },
+        .{ .label = i18n.pick(lang, "Clear Notifications", "通知を消去"), .msg = .clear_notifications },
+        .{ .label = i18n.pick(lang, "Close Pet", "ペットを閉じる"), .msg = .close_pet },
+    };
+}
+const pet_menu_en = petMenu(.en);
+const pet_menu_ja = petMenu(.ja);
+
+fn petMenuFor() *const [6]AppUi.ContextMenuItem {
+    return if (i18n.current == .ja) &pet_menu_ja else &pet_menu_en;
+}
 
 test "pet context menu opens the flock" {
-    try std.testing.expectEqualStrings("Open Flock", pet_menu[1].label);
-    const msg = pet_menu[1].msg orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("Open Flock", pet_menu_en[1].label);
+    const msg = pet_menu_en[1].msg orelse return error.TestUnexpectedResult;
     switch (msg) {
         .toggle_flock_window => {},
         else => return error.TestUnexpectedResult,
     }
 }
 
-// The visible card remains intrinsic and grows only with the text it actually
-// contains. These values size the surrounding transparent canvas generously
-// enough for the configured maximum; one full em per character also covers
-// CJK glyphs, unlike the previous 0.62 Latin-average estimate.
-const bubble_columns_default: u16 = 40;
-pub const bubble_columns_min: u16 = 8;
-pub const bubble_columns_max: u16 = 120;
-const bubble_answer_lines_default: u8 = 2;
-pub const bubble_answer_lines_min: u8 = 1;
-pub const bubble_answer_lines_max: u8 = 8;
+/// Every hook card is this wide and holds two lines, so a stack reads as
+/// one column and never grows into the chat bubble beside the pet.
+/// Fits "Claude Code - Action Required" at the default text size.
+const bubble_card_width: f32 = 260;
+const bubble_window_width: f32 = bubble_card_width + bubble_canvas_margin * 2;
 const bubble_avatar_width: f32 = 20;
-const bubble_busy_width: f32 = 16;
 const bubble_content_gap: f32 = 8;
 const bubble_card_padding: f32 = 12;
-const bubble_card_radius: f32 = 18;
+pub const bubble_card_radius: f32 = 18;
 const bubble_head_gap: f32 = 12;
 const bubble_line_gap: f32 = 2;
 /// Vertical breathing room between stacked conversation cards.
@@ -3370,106 +3466,44 @@ fn bubbleLifetimeExpired(deadline_ms: i64, now_ms: i64, state: State) bool {
     return state != .waiting and deadline_ms >= 0 and now_ms >= deadline_ms;
 }
 
-fn bubbleMaxCardWidth(model: *const Model) f32 {
-    const text_capacity = @as(f32, @floatFromInt(model.bubble_columns)) * bubbleFontSize(model);
-    return @ceil(text_capacity + bubble_avatar_width + bubble_busy_width + bubble_content_gap * 2 + bubble_card_padding * 2);
-}
-
-fn bubbleMaxCardHeight(model: *const Model) f32 {
-    const rows = @as(usize, model.bubble_answer_lines) + 1;
-    return @ceil(bubbleContentHeight(model, rows) + bubble_card_padding * 2);
-}
-
 fn bubbleContentHeight(model: *const Model, row_count: usize) f32 {
     if (row_count == 0) return 0;
     const rows = @as(f32, @floatFromInt(row_count));
     return rows * bubbleFontSize(model) * 1.35 + @as(f32, @floatFromInt(row_count - 1)) * bubble_line_gap;
 }
 
-fn bubbleRowCount(model: *const Model, slot: usize) usize {
-    const bubble = &model.bubbles[slot];
-    const chars_per_line: usize = model.bubble_columns;
-    const answer_lines: usize = model.bubble_answer_lines;
-    const title = clipDisplay(bubble.title[0..bubble.title_len], chars_per_line, &bubble_title_scratch[slot], false);
-    const text = clipDisplay(bubble.text[0..bubble.text_len], chars_per_line * answer_lines, &bubble_text_scratch[slot], true);
-    var count: usize = if (title.len > 0) 1 else 0;
-    for (splitLines(text, chars_per_line, answer_lines)) |line| {
-        if (line.len > 0) count += 1;
-    }
-    return count;
-}
-
-fn bubbleCardHeight(model: *const Model, slot: usize) f32 {
-    const content = bubbleContentHeight(model, bubbleRowCount(model, slot));
-    const inner = @max(content, @max(bubble_avatar_width, bubble_busy_width));
+/// Every card holds the same two lines: the project, then the agent and
+/// what it needs.
+fn bubbleCardHeight(model: *const Model) f32 {
+    const inner = @max(bubbleContentHeight(model, 2), bubble_avatar_width);
     return @ceil(inner + bubble_card_padding * 2);
 }
 
-/// Painted width of the widest line a card holds. The strings are the
-/// ones bubbleCard hands to the view, and the font ids come from
-/// textSpanFontId over the same tokens, which is the SDK's measurement
-/// seam: carry the id the span draws with and measured equals painted.
-///
-/// Character counts cannot stand in here. The column budget uses one em
-/// per character because it only ever had to bound a fixed-width card,
-/// but the sans faces average about half that, so a hugging card built
-/// on the count came out near twice its own text and left the spinner
-/// stranded to the right.
-fn bubbleContentWidth(model: *const Model, slot: usize) f32 {
+/// The card's first line: the project the agent works in (the last part
+/// of its cwd), else the session title, else the agent.
+fn bubbleProject(bubble: *const hook_server.Bubble) []const u8 {
+    const project = std.fs.path.basename(bubble.cwdSlice());
+    if (project.len > 0) return project;
+    if (bubble.title_len > 0) return bubble.title[0..bubble.title_len];
+    return bubbleAgentName(bubble);
+}
+
+fn bubbleAgentName(bubble: *const hook_server.Bubble) []const u8 {
+    const agent = bubble.agent[0..bubble.agent_len];
+    return if (agentKindForName(agent)) |kind| kind.displayName() else agent;
+}
+
+/// What the agent needs, for the card's second line. A sender that does
+/// not report per-agent state leaves the pet's global waiting state,
+/// which belongs to the newest card.
+fn bubbleStatus(model: *const Model, slot: usize) []const u8 {
     const bubble = &model.bubbles[slot];
-    const chars_per_line: usize = model.bubble_columns;
-    const answer_lines: usize = model.bubble_answer_lines;
-    const tokens = petdexTokens(model);
-    const size = bubbleFontSize(model);
-    // The title paints bold and the answer lines regular, and bold is
-    // the wider face, so they cannot share one id.
-    const title_font = canvas.textSpanFontId(.{ .text = "", .weight = .bold }, tokens.typography);
-    const text_font = canvas.textSpanFontId(.{ .text = "" }, tokens.typography);
-
-    const title = clipDisplay(bubble.title[0..bubble.title_len], chars_per_line, &bubble_title_scratch[slot], false);
-    var widest = canvas.measureTextWidthForFont(tokens.text_measure, title_font, title, size);
-    const text_clipped = clipDisplay(bubble.text[0..bubble.text_len], chars_per_line * answer_lines, &bubble_text_scratch[slot], true);
-    for (splitLines(text_clipped, chars_per_line, answer_lines)) |line| {
-        if (line.len == 0) continue;
-        widest = @max(widest, canvas.measureTextWidthForFont(tokens.text_measure, text_font, line, size));
-    }
-    return widest;
-}
-
-/// A card hugs its content, capped by the column budget: short bubbles
-/// stop reserving a full-width card, long ones wrap exactly as before.
-fn bubbleCardWidth(model: *const Model, slot: usize) f32 {
-    const text_w = bubbleContentWidth(model, slot);
-    const natural = @ceil(text_w + bubble_avatar_width + bubble_busy_width + bubble_content_gap * 2 + bubble_card_padding * 2);
-    return @min(natural, bubbleMaxCardWidth(model));
-}
-
-/// The window fits the widest card in the stack, so narrow cards can
-/// center under it and the tail keeps pointing at the pet.
-fn bubbleStackWidth(model: *const Model) f32 {
-    var widest: f32 = 0;
-    for (0..model.bubbles_len) |i| widest = @max(widest, bubbleCardWidth(model, i));
-    return widest;
-}
-
-/// Width a card is actually drawn at.
-///
-/// Collapsed, the cards behind are clamped to the front card's width.
-/// They are decorative at that alpha, and letting a wide one keep its
-/// natural width made it jut out past a narrow front card with its text
-/// still legible, which read as a layout bug rather than a stack. Only
-/// the top edge of each peek should show.
-///
-/// Expanded, every card returns to its slice 1 natural width. The walk
-/// between the two is interpolated so the fan does not snap.
-fn bubbleRenderedCardWidth(model: *const Model, slot: usize) f32 {
-    const natural = bubbleCardWidth(model, slot);
-    if (!bubbleStackable(model)) return natural;
-    const front = bubbleCardWidth(model, model.bubbles_len - 1);
-    // Never widen a peek card to the front's width, only narrow it: a
-    // short card behind a long one should stay short, not stretch.
-    const collapsed = @min(natural, front);
-    return collapsed + (natural - collapsed) * bubbleExpansionEased(model);
+    const state = bubble.agentStateSlice();
+    const newest = slot + 1 == model.bubbles_len;
+    if (std.mem.eql(u8, state, "waiting") or (state.len == 0 and newest and model.state == .waiting)) return i18n.t("Action Required", "対応が必要");
+    if (std.mem.eql(u8, state, "failed")) return i18n.t("Failed", "失敗");
+    if (bubble.busy) return i18n.t("Working", "作業中");
+    return i18n.t("Done", "完了");
 }
 
 /// Height a card is drawn at.
@@ -3481,73 +3515,24 @@ fn bubbleRenderedCardWidth(model: *const Model, slot: usize) f32 {
 /// stacked card left at 0 stretches to fan height and draws as a giant
 /// rounded rect. Outside a stack there is nothing to inherit from and
 /// intrinsic sizing is what the single bubble has always wanted.
-fn bubbleRenderedCardHeight(model: *const Model, slot: usize) f32 {
-    return if (bubbleStackable(model)) bubbleCardHeight(model, slot) else 0;
-}
-
-/// The vertical axis the cards center on, in stack-container local
-/// coordinates, for a given expansion.
-///
-/// NOT the container's center. The window is sized to the widest card
-/// the stack could ever show and then clamped on-screen, so near a
-/// screen edge the window slides inward. With a narrow front card and a
-/// wide hidden peek that left the only VISIBLE card floating far from
-/// the pet: the window had moved, and the card sat in its middle.
-///
-/// The axis therefore tracks the pet, clamped only by what has to fit:
-/// collapsed that is the front card (the only one drawn at full alpha),
-/// expanded it is the widest card in the fan. Against a screen edge the
-/// clamp pushes the fan inward while the stack stays as close to the pet
-/// as it can, which is the popover rule: the content shifts, the anchor
-/// keeps pointing at its target.
-fn bubbleStackAxis(model: *const Model, pet_center_local: f32, expansion: f32) f32 {
-    const stack_w = bubbleStackWidth(model);
-    // Widest card that must fit at this expansion: the front card alone
-    // while collapsed, the whole fan once open.
-    const front = bubbleCardWidth(model, model.bubbles_len - 1);
-    const needed = front + (stack_w - front) * expansion;
-    const half = needed / 2;
-    if (stack_w <= needed) return stack_w / 2;
-    return std.math.clamp(pet_center_local, half, stack_w - half);
-}
-
-/// Horizontal shift that puts a card on the stack axis.
-///
-/// `stackChildFrame` places every overlay child at the container's
-/// origin with no cross-axis alignment, so cards of different widths
-/// would all pin to the left edge and fan out to the right. Centering
-/// each one on the shared axis keeps the stack on a single vertical
-/// line, anchored near the pet.
-fn bubbleCardCenterDx(model: *const Model, slot: usize) f32 {
-    const axis = bubbleStackAxis(model, model.bubble_pet_center_local, bubbleExpansionEased(model));
-    return axis - bubbleRenderedCardWidth(model, slot) / 2;
+fn bubbleRenderedCardHeight(model: *const Model) f32 {
+    return if (bubbleStackable(model)) bubbleCardHeight(model) else 0;
 }
 
 /// Where the speech tail's center belongs inside the front card.
 ///
-/// The companion window is centered over the pet until a screen edge
-/// clamps it. At that point the pet and window centers diverge; keeping
-/// the tail at the card midpoint makes it point into empty space. Follow
+/// The window is centered over the pet until a screen edge clamps it or
+/// an open chat pushes it aside. The pet and window centers then diverge,
+/// and a tail at the card midpoint would point into empty space. Follow
 /// the pet's actual local center instead, with enough inset that the
-/// tail's full base stays off the rounded corner. A conversation stack
-/// uses the newest/front card for the same reason: that is the bubble
-/// visually speaking for the pet.
+/// tail's full base stays off the rounded corner.
 fn bubbleTailCenterX(model: *const Model) f32 {
-    const front = model.bubbles_len - 1;
-    const card_x = bubbleCardCenterDx(model, front);
-    const card_w = bubbleRenderedCardWidth(model, front);
-    const corner_inset = bubble_card_radius + @as(f32, @floatFromInt(tail_w)) / 2;
-    const inset = @min(card_w / 2, corner_inset);
-    return std.math.clamp(model.bubble_pet_center_local, card_x + inset, card_x + card_w - inset);
+    const inset = bubble_card_radius + @as(f32, @floatFromInt(tail_w)) / 2;
+    return std.math.clamp(model.bubble_pet_center_local, inset, bubble_card_width - inset);
 }
 
 fn bubbleTailDx(model: *const Model) f32 {
-    return bubbleTailCenterX(model) - bubbleStackWidth(model) / 2;
-}
-
-fn bubbleWindowWidth(model: *const Model) f32 {
-    const content = if (model.bubbles_len == 0) bubbleMaxCardWidth(model) else bubbleStackWidth(model);
-    return content + bubble_canvas_margin * 2;
+    return bubbleTailCenterX(model) - bubble_card_width / 2;
 }
 
 // -------------------------------------------------- collapsed stack math
@@ -3607,23 +3592,18 @@ fn bubbleCardOffset(model: *const Model, slot: usize) f32 {
     const collapsed = if (model.bubble_flipped)
         peek
     else
-        bubbleExpandedStackHeight(model) - bubbleCardHeight(model, front) - peek;
-    var expanded: f32 = 0;
-    if (model.bubble_flipped) {
-        var i = front;
-        while (i > slot) : (i -= 1) expanded += bubbleCardHeight(model, i) + bubble_stack_gap;
-    } else {
-        for (0..slot) |i| expanded += bubbleCardHeight(model, i) + bubble_stack_gap;
-    }
+        bubbleExpandedStackHeight(model) - bubbleCardHeight(model) - peek;
+    const step = bubbleCardHeight(model) + bubble_stack_gap;
+    const expanded = step * @as(f32, @floatFromInt(if (model.bubble_flipped) front - slot else slot));
     const t = bubbleExpansionEased(model);
     return collapsed + (expanded - collapsed) * t;
 }
 
 fn bubbleExpandedStackHeight(model: *const Model) f32 {
-    if (model.bubbles_len == 0) return bubbleMaxCardHeight(model);
-    var height: f32 = 0;
-    for (0..model.bubbles_len) |slot| height += bubbleCardHeight(model, slot);
-    return height + bubble_stack_gap * @as(f32, @floatFromInt(model.bubbles_len - 1));
+    // At least one card: the window exists a frame before the first
+    // bubble lands.
+    const cards: f32 = @floatFromInt(@max(model.bubbles_len, 1));
+    return cards * bubbleCardHeight(model) + bubble_stack_gap * (cards - 1);
 }
 
 /// Height the window needs at a given expansion. Collapsed only has to
@@ -3631,11 +3611,9 @@ fn bubbleExpandedStackHeight(model: *const Model) f32 {
 /// column. The window is sized to the max of both (see syncBubbleWindow)
 /// so a resize never races the animation.
 fn bubbleStackHeightAt(model: *const Model, expansion: f32) f32 {
-    if (!bubbleStackable(model)) return if (model.bubbles_len == 0) bubbleMaxCardHeight(model) else bubbleCardHeight(model, 0);
-    var tallest: f32 = 0;
-    for (0..model.bubbles_len) |slot| tallest = @max(tallest, bubbleCardHeight(model, slot));
+    if (!bubbleStackable(model)) return bubbleCardHeight(model);
     const behind: f32 = @floatFromInt(model.bubbles_len - 1);
-    const collapsed = tallest + bubble_peek_offset * @min(behind, bubble_peek_max_depth);
+    const collapsed = bubbleCardHeight(model) + bubble_peek_offset * @min(behind, bubble_peek_max_depth);
     const expanded = bubbleExpandedStackHeight(model);
     return collapsed + (expanded - collapsed) * expansion;
 }
@@ -3653,8 +3631,7 @@ fn bubbleStackHeightAt(model: *const Model, expansion: f32) f32 {
 /// the front card, which costs nothing: the window is click-through and
 /// fully transparent already.
 fn bubbleWindowHeight(model: *const Model) f32 {
-    const cards = if (model.bubbles_len == 0) bubbleMaxCardHeight(model) else bubbleExpandedStackHeight(model);
-    return cards + @as(f32, @floatFromInt(tail_h)) + bubble_head_gap + bubble_canvas_margin * 2;
+    return bubbleExpandedStackHeight(model) + @as(f32, @floatFromInt(tail_h)) + bubble_head_gap + bubble_canvas_margin * 2;
 }
 
 fn bubbleFontSize(model: *const Model) f32 {
@@ -3675,81 +3652,6 @@ pub const bubble_text_max_px: f32 = 20;
 pub const bubble_text_default_px: f32 = 13;
 
 /// Count display characters (UTF-8 sequences, not bytes).
-fn charCount(text: []const u8) usize {
-    var n: usize = 0;
-    for (text) |b| {
-        if ((b & 0xC0) != 0x80) n += 1;
-    }
-    return n;
-}
-
-// One scratch pair PER stacked card: the view's byte slices must
-// outlive the frame build, so cards cannot share a buffer the way a
-// single bubble could.
-var bubble_title_scratch: [hook_server.max_bubbles][280]u8 = undefined;
-var bubble_text_scratch: [hook_server.max_bubbles][280]u8 = undefined;
-
-/// Clip to `max_chars` on a safe boundary: never mid UTF-8 sequence,
-/// never splitting a JSON escape, preferring the last word boundary
-/// within reach, optionally appending an ellipsis into `scratch` (globals:
-/// the view's byte slices must outlive the frame build).
-fn clipDisplay(text: []const u8, max_chars: usize, scratch: []u8, append_ellipsis: bool) []const u8 {
-    if (charCount(text) <= max_chars) return text;
-    var n: usize = 0;
-    var cut: usize = text.len;
-    for (text, 0..) |b, i| {
-        if ((b & 0xC0) != 0x80) {
-            if (n == max_chars) {
-                cut = i;
-                break;
-            }
-            n += 1;
-        }
-    }
-    if (std.mem.lastIndexOfScalar(u8, text[0..cut], ' ')) |sp| {
-        if (cut - sp <= 10) cut = sp;
-    }
-    var backslashes: usize = 0;
-    while (cut > backslashes and text[cut - 1 - backslashes] == '\\') backslashes += 1;
-    if (backslashes % 2 == 1) cut -= 1;
-    const ell = if (append_ellipsis) "\u{2026}" else "";
-    const total = @min(cut, scratch.len - ell.len);
-    @memcpy(scratch[0..total], text[0..total]);
-    @memcpy(scratch[total .. total + ell.len], ell);
-    return scratch[0 .. total + ell.len];
-}
-
-/// Split into explicit single-line nodes, so measure equals paint and the
-/// configured answer-line count is an actual layout contract.
-fn splitLines(text: []const u8, max_chars: usize, max_lines: usize) [bubble_answer_lines_max][]const u8 {
-    var lines: [bubble_answer_lines_max][]const u8 = @splat("");
-    var remaining = std.mem.trim(u8, text, " ");
-    var line_index: usize = 0;
-    while (remaining.len > 0 and line_index < @min(max_lines, bubble_answer_lines_max)) : (line_index += 1) {
-        if (charCount(remaining) <= max_chars) {
-            lines[line_index] = remaining;
-            break;
-        }
-        var chars: usize = 0;
-        var hard_cut: usize = remaining.len;
-        for (remaining, 0..) |b, i| {
-            if ((b & 0xC0) != 0x80) {
-                if (chars == max_chars) {
-                    hard_cut = i;
-                    break;
-                }
-                chars += 1;
-            }
-        }
-        var cut = hard_cut;
-        if (std.mem.lastIndexOfScalar(u8, remaining[0..hard_cut], ' ')) |sp| {
-            if (hard_cut - sp <= 14) cut = sp;
-        }
-        lines[line_index] = std.mem.trim(u8, remaining[0..cut], " ");
-        remaining = std.mem.trim(u8, remaining[cut..], " ");
-    }
-    return lines;
-}
 fn bubbleActive(model: *const Model) bool {
     return model.bubbles_enabled and !model.focus_mode and model.bubbles_len > 0;
 }
@@ -3849,42 +3751,34 @@ fn bubbleStackOriginY(model: *const Model) f32 {
 /// The union of the cards as they are ACTUALLY DRAWN, in window-local
 /// coordinates.
 ///
-/// Derived from the same three functions the renderer transforms each
-/// card by — bubbleCardCenterDx for x, bubbleCardOffset for y,
-/// bubbleRenderedCardWidth for width — so the hit region cannot drift
-/// from the pixels. It used to be re-derived from the window edges and
-/// the layout constants, which is how it ended up offset from the cards:
-/// a band running up from the window bottom while the cards sit on an
-/// axis that tracks the pet and an offset that reserves the whole fan.
-/// The visible-but-dead margins around the card were the bug Hunter hit,
-/// where only the middle of the card (the text) reliably answered.
+/// Every card spans the fixed card width, and y comes from the same
+/// bubbleCardOffset the renderer transforms each card by, so the hit
+/// region cannot drift from the pixels. It used to be re-derived from the
+/// window edges and the layout constants, which is how it ended up offset
+/// from the cards: the visible-but-dead margins around the card were the
+/// bug Hunter hit, where only the middle of the card (the text) answered.
 fn bubbleCardsRect(model: *const Model) BubbleRect {
-    // The container is centered horizontally inside the margin, so x
-    // only has to clear the margin; y has a flip-dependent band to clear
-    // as well (see bubbleStackOriginY).
+    // The container sits inside the margin, so x only has to clear the
+    // margin; y has a flip-dependent band to clear as well (see
+    // bubbleStackOriginY).
     const origin_x = bubble_canvas_margin;
     const origin_y = bubbleStackOriginY(model);
-    const front = model.bubbles_len - 1;
-    var min_x = bubbleCardCenterDx(model, front);
-    var max_x = min_x + bubbleRenderedCardWidth(model, front);
-    var min_y = bubbleCardOffset(model, front);
-    var max_y = min_y + bubbleCardHeight(model, front);
+    const card_h = bubbleCardHeight(model);
+    var min_y = bubbleCardOffset(model, model.bubbles_len - 1);
+    var max_y = min_y + card_h;
     // The peeks behind the front card stick out; they are visible and so
     // they are hoverable.
     if (bubbleStackable(model)) {
         for (0..model.bubbles_len) |slot| {
-            const x0 = bubbleCardCenterDx(model, slot);
             const y0 = bubbleCardOffset(model, slot);
-            min_x = @min(min_x, x0);
-            max_x = @max(max_x, x0 + bubbleRenderedCardWidth(model, slot));
             min_y = @min(min_y, y0);
-            max_y = @max(max_y, y0 + bubbleCardHeight(model, slot));
+            max_y = @max(max_y, y0 + card_h);
         }
     }
     return .{
-        .x = origin_x + min_x - bubble_hover_slop,
+        .x = origin_x - bubble_hover_slop,
         .y = origin_y + min_y - bubble_hover_slop,
-        .w = (max_x - min_x) + bubble_hover_slop * 2,
+        .w = bubble_card_width + bubble_hover_slop * 2,
         .h = (max_y - min_y) + bubble_hover_slop * 2,
     };
 }
@@ -4134,7 +4028,7 @@ fn bubbleAboveProbeStale(model: *const Model, bubble_h: f32) bool {
 /// Calculate a global-coordinate move without applying a display clamp.
 /// The caller applies the destination display's visible-frame constraint
 /// only after this move has crossed any monitor boundary.
-fn bubbleMovePlan(cur_x: f64, cur_y: f64, want_x: f64, want_y: f64) ?BubbleMovePlan {
+pub fn bubbleMovePlan(cur_x: f64, cur_y: f64, want_x: f64, want_y: f64) ?BubbleMovePlan {
     const dx = want_x - cur_x;
     const dy = want_y - cur_y;
     if (@abs(dx) <= window_position_epsilon and @abs(dy) <= window_position_epsilon) return null;
@@ -4231,6 +4125,7 @@ fn bubblePetTopY(model: *const Model) f64 {
 fn syncBubbleWindow(model: *Model, fx: *Effects) void {
     if (!bubbleActive(model)) {
         model.bubble_above_blocked = false;
+        model.bubble_placed = false;
         return;
     }
     const bubble_h = bubbleWindowHeight(model);
@@ -4250,7 +4145,7 @@ fn syncBubbleWindow(model: *Model, fx: *Effects) void {
     // what the throw branch did: it drives its own moveWindow and returns
     // before the cursor poll, so it never reached the frame clock's
     // update and flew the whole arc with a stale flag.
-    const bubble_w = bubbleWindowWidth(model);
+    const bubble_w = bubble_window_width;
     if (bubbleAboveProbeStale(model, bubble_h)) model.bubble_above_blocked = false;
     model.bubble_flipped = if (model.bubble_above_blocked)
         true
@@ -4264,9 +4159,13 @@ fn syncBubbleWindow(model: *Model, fx: *Effects) void {
         bubble_window_w = bubble_w;
         bubble_window_h = bubble_h;
     }
-    const cur = fx.moveWindow("bubble", 0, 0, false) orelse return;
-    const pet_w = frame_w * model.scale;
-    const want_x = model.pet_x + pet_w / 2.0 - bubble_w / 2.0;
+    // No window yet: this bubble set was just declared. Whatever window
+    // the flag described is gone, and the new one must open hidden.
+    const cur = fx.moveWindow("bubble", 0, 0, false) orelse {
+        model.bubble_placed = false;
+        return;
+    };
+    const want_x = bubbleWantX(model, bubble_w);
     const want_y = bubbleWantY(model, bubble_h);
     if (bubbleMovePlan(cur.x, cur.y, want_x, want_y)) |plan| {
         // `true` constrains against the display that currently owns the
@@ -4278,6 +4177,7 @@ fn syncBubbleWindow(model: *Model, fx: *Effects) void {
     // taskbar/display-layout changes can invalidate an otherwise unchanged
     // origin and must be reconciled before recording the local anchor.
     if (!settleBubbleWindow(model, fx, bubble_h, want_x)) return;
+    model.bubble_placed = true;
 }
 
 /// Project the pet's center into the stack container's coordinates.
@@ -4290,8 +4190,22 @@ fn syncBubbleWindow(model: *Model, fx: *Effects) void {
 fn recordPetCenterLocal(model: *Model, window_x: f64) void {
     const pet_center = model.pet_x + (frame_w * model.scale) / 2.0;
     // The container sits inside the canvas margin, so strip it to land
-    // in the same space bubbleCardCenterDx works in.
+    // in the same space the card and its tail work in.
     model.bubble_pet_center_local = @floatCast(pet_center - window_x - bubble_canvas_margin);
+}
+
+/// Where the left of the bubble window wants to sit: centered over the
+/// pet, unless the chat bubble is open beside it. Then the card's edge
+/// on that side stops at the pet's, so the stack never covers the chat;
+/// the tail still finds the pet (recordPetCenterLocal).
+fn bubbleWantX(model: *const Model, bubble_w: f32) f64 {
+    const pet_w = frame_w * model.scale;
+    const centered = model.pet_x + pet_w / 2.0 - bubble_w / 2.0;
+    if (!chat_shell.besidePet(&model.chat)) return centered;
+    return if (model.chat.place.left)
+        @max(centered, model.pet_x - bubble_canvas_margin)
+    else
+        @min(centered, model.pet_x + pet_w + bubble_canvas_margin - bubble_w);
 }
 
 /// Where the top of the bubble window wants to sit for the current flip.
@@ -4341,19 +4255,22 @@ fn bubbleShouldFlip(model: *const Model, space_above: f64, needed: f64) bool {
 /// Ubuntu ships none for webp, so every pet fails while sitting right
 /// there on disk. Offering that user a download sends them in exactly
 /// the wrong direction.
+/// The pet window is 192pt wide, so these have to fit a narrow column
+/// rather than a sentence's worth of room: the first attempt read
+/// "Pets found, none could be drawn. Linux needs webp-pixbuf-loader."
+/// and rendered as an ellipsis. Newlines rather than one long line,
+/// since the label truncates instead of wrapping.
+fn emptyStateCopy(os: std.Target.Os.Tag, has_pets: bool) []const u8 {
+    if (!has_pets) return i18n.t("No pet yet", "まだペットが\nいません");
+    return if (os == .linux)
+        i18n.t("Pets found,\nnone could\nbe drawn.\n\nLinux needs\nwebp-pixbuf-\nloader.", "ペットは\nありますが、\n表示できません\n\nLinuxでは\nwebp-pixbuf-\nloaderが必要")
+    else
+        i18n.t("Pets found,\nnone could\nbe drawn.\n\nThe sheet may\nbe corrupt.", "ペットは\nありますが、\n表示できません\n\nシートが\n壊れている\nかもしれません");
+}
+
 fn emptyStateView(ui: *AppUi, model: *const Model) AppUi.Node {
     const has_pets = catalog_mod.catalog_len > 0;
-    // The pet window is 192pt wide, so these have to fit a narrow column
-    // rather than a sentence's worth of room: the first attempt read
-    // "Pets found, none could be drawn. Linux needs webp-pixbuf-loader."
-    // and rendered as an ellipsis. Newlines rather than one long line,
-    // since the label truncates instead of wrapping.
-    const body = if (!has_pets)
-        "No pet yet"
-    else if (builtin.os.tag == .linux)
-        "Pets found,\nnone could\nbe drawn.\n\nLinux needs\nwebp-pixbuf-\nloader."
-    else
-        "Pets found,\nnone could\nbe drawn.\n\nThe sheet may\nbe corrupt.";
+    const body = emptyStateCopy(builtin.os.tag, has_pets);
 
     // style_tokens rather than a literal colour: the muted token already
     // tracks the theme, which is the same reason the settings rows use it.
@@ -4372,7 +4289,7 @@ fn emptyStateView(ui: *AppUi, model: *const Model) AppUi.Node {
             .size = .sm,
             .variant = .primary,
             .on_press = Msg.install_first_pet,
-        }, if (model.install.busy()) "Downloading..." else "Get a pet");
+        }, if (model.install.busy()) i18n.t("Downloading...", "ダウンロード中…") else i18n.t("Get a pet", "ペットを入手"));
         count += 1;
     }
     if (model.install.error_len > 0) {
@@ -4389,7 +4306,7 @@ fn emptyStateView(ui: *AppUi, model: *const Model) AppUi.Node {
         .width = frame_w,
         .height = frame_h,
         .padding = 16,
-        .semantics = .{ .label = "No pet installed" },
+        .semantics = .{ .label = i18n.t("No pet installed", "ペットがインストールされていません") },
     }, .{ui.column(.{ .grow = 1, .main = .center, .cross = .center, .gap = 10 }, children[0..count])});
 }
 
@@ -4401,7 +4318,7 @@ pub fn rootView(ui: *AppUi, model: *const Model) AppUi.Node {
         .width = w,
         .height = h,
         .image = @intCast(model.frame_index + 1),
-        .semantics = .{ .label = "Petdex pet" },
+        .semantics = .{ .label = i18n.t("Petdex pet", "Petdexのペット") },
     });
     node.widget.image_fit = .stretch;
     node.widget.image_sampling = .nearest;
@@ -4411,53 +4328,49 @@ pub fn rootView(ui: *AppUi, model: *const Model) AppUi.Node {
         // Bind the menu to the sprite itself, not only its layout parent.
         // Linux resolves the deepest context-menu node on the right-click
         // hit route before mounting the canvas fallback menu.
-        node.context_menu = &pet_menu;
-        return ui.column(.{ .grow = 1, .main = .end, .cross = .center, .window_drag = true, .context_menu = &pet_menu }, .{
+        node.context_menu = petMenuFor();
+        return ui.column(.{ .grow = 1, .main = .end, .cross = .center, .window_drag = true, .context_menu = petMenuFor() }, .{
             node,
             ui.el(.stack, .{ .width = 1, .height = pet_edge_pad }, .{}),
         });
     }
     // Win/mac keep the upstream sprite-only root and app-owned drag path;
     // their bubble is a separate companion window.
-    return ui.column(.{ .grow = 1, .main = .end, .cross = .center, .on_press = .noop, .context_menu = &pet_menu }, .{node});
+    return ui.column(.{ .grow = 1, .main = .end, .cross = .center, .on_press = .noop, .context_menu = petMenuFor() }, .{node});
 }
 
 // ----------------------------------------------------------- bubble
 
-/// One conversation's card. `slot` indexes the per-card clip scratch and
-/// decides whether this is the newest bubble, which is the only one the
-/// single avatar registry slot can speak for.
+/// The speech-bubble surface the hook bubbles and the chat bubble share.
+pub fn styleSpeechCard(node: *AppUi.Node, dark: bool) void {
+    node.widget.style.radius = bubble_card_radius;
+    node.widget.style.stroke_width = 1;
+    if (dark) {
+        node.widget.style.background = canvas.Color.rgb8(25, 25, 28);
+        node.widget.style.border = canvas.Color.rgba8(255, 255, 255, 26);
+    } else {
+        node.widget.style.background = canvas.Color.rgb8(255, 255, 255);
+        // Light mode needs the outline more than dark does, not less: a
+        // white card floats over a white editor with no silhouette, and
+        // the tail is the first part to disappear because it is the
+        // narrowest. Matches the tail hairline in registerTail.
+        node.widget.style.border = canvas.Color.rgb8(214, 214, 220);
+    }
+}
+
+/// One conversation's card: the project, then the agent and what it
+/// needs, one line each at the card's fixed width. `slot` decides whether
+/// this is the newest bubble, the only one the single avatar registry
+/// slot can speak for.
 fn bubbleCard(ui: *AppUi, model: *const Model, slot: usize) AppUi.Node {
     const bubble = &model.bubbles[slot];
     const newest = slot + 1 == model.bubbles_len;
-    const chars_per_line: usize = model.bubble_columns;
-    const answer_lines: usize = model.bubble_answer_lines;
-    const title_raw = bubble.title[0..bubble.title_len];
-    const text_raw = bubble.text[0..bubble.text_len];
-    const title_clipped = clipDisplay(title_raw, chars_per_line, &bubble_title_scratch[slot], false);
-    const text_clipped = clipDisplay(text_raw, chars_per_line * answer_lines, &bubble_text_scratch[slot], true);
-    const text_lines = splitLines(text_clipped, chars_per_line, answer_lines);
-
     const title_fg = if (model.dark) canvas.Color.rgb8(237, 237, 238) else canvas.Color.rgb8(17, 17, 17);
     const muted_fg = if (model.dark) canvas.Color.rgb8(156, 158, 168) else canvas.Color.rgb8(88, 92, 106);
-    const text_fg = if (title_clipped.len > 0) muted_fg else title_fg;
-
-    // One question/title line plus the configured number of answer lines.
-    var rows: [1 + bubble_answer_lines_max]AppUi.Node = undefined;
-    var row_count: usize = 0;
-    if (title_clipped.len > 0) {
-        var node2 = ui.paragraph(.{ .size = .heading }, &.{.{ .text = title_clipped, .weight = .bold }});
-        node2.widget.style.foreground = title_fg;
-        rows[row_count] = node2;
-        row_count += 1;
-    }
-    for (text_lines) |line| {
-        if (line.len == 0) continue;
-        var node2 = ui.text(.{ .size = .heading }, line);
-        node2.widget.style.foreground = text_fg;
-        rows[row_count] = node2;
-        row_count += 1;
-    }
+    var project = ui.paragraph(.{ .size = .heading, .wrap = false }, &.{.{ .text = bubbleProject(bubble), .weight = .bold }});
+    project.widget.style.foreground = title_fg;
+    var status = ui.text(.{ .size = .heading }, ui.fmt("{s} - {s}", .{ bubbleAgentName(bubble), bubbleStatus(model, slot) }));
+    status.widget.style.foreground = muted_fg;
 
     // The newest card keeps the dedicated registry slot: it is a
     // full-resolution decode of the agent's own PNG (fallback art
@@ -4471,7 +4384,7 @@ fn bubbleCard(ui: *AppUi, model: *const Model, slot: usize) AppUi.Node {
             .width = bubble_avatar_width,
             .height = bubble_avatar_width,
             .image = if (avatar_ready) avatar_image_id else 0,
-            .semantics = .{ .label = "Agent avatar" },
+            .semantics = .{ .label = i18n.t("Agent avatar", "エージェントのアバター") },
         });
         img.widget.image_fit = .contain;
         break :blk img;
@@ -4480,88 +4393,37 @@ fn bubbleCard(ui: *AppUi, model: *const Model, slot: usize) AppUi.Node {
             .width = bubble_avatar_width,
             .height = bubble_avatar_width,
             .image = agent_icon_atlas_id,
-            .semantics = .{ .label = "Agent avatar" },
+            .semantics = .{ .label = i18n.t("Agent avatar", "エージェントのアバター") },
         });
         img.widget.image_src = agentIconRect(agentIconIndex(agent_name));
         img.widget.image_fit = .contain;
         break :blk img;
     } else ui.el(.stack, .{ .width = bubble_avatar_width, .height = bubble_avatar_width }, .{});
-    // Keep a stable trailing slot: active work animates the original
-    // spinner, while a waiting permission/input request shows a static
-    // marker without waking the frame loop or shifting the bubble text.
-    var waiting_marker = ui.text(.{ .size = .heading }, "!");
-    waiting_marker.widget.style.foreground = canvas.Color.rgb8(250, 170, 48);
-    // Busy is per-conversation, but the pet's `waiting` state is global:
-    // it belongs to the newest card only, or every settled card in the
-    // stack would grow a marker for one session's prompt.
-    const spinner_slot = if (bubble.busy)
-        ui.el(.spinner, .{ .width = bubble_busy_width, .height = bubble_busy_width, .semantics = .{ .label = "Working" } }, .{})
-    else if (newest and model.state == .waiting)
-        ui.el(.stack, .{
-            .width = bubble_busy_width,
-            .height = bubble_busy_width,
-            .main = .center,
-            .cross = .center,
-            .semantics = .{ .label = "Approval or input required" },
-        }, .{waiting_marker})
-    else
-        ui.el(.stack, .{ .width = bubble_busy_width, .height = bubble_busy_width }, .{});
 
-    // Explicit width instead of letting the row size itself: the window
-    // is sized off bubbleCardWidth, so the card has to agree with that
-    // number or a stack of mixed lengths drifts against its own window.
-    // The outer column centers whatever is narrower than the widest.
-    const card_width = bubbleRenderedCardWidth(model, slot);
-    // A card clamped narrower than its text is drawn as an empty rounded
-    // rect: only the top edge of a peek is visible and at alpha 0.72 or
-    // less nobody reads it, so rendering the row anyway would just spill
-    // half a sentence past the front card's edge, which is precisely how
-    // the collapsed stack looked wrong. The front card is never clamped,
-    // and the expansion restores every card's content before the fan is
-    // wide enough to read.
-    const clamped = card_width + 0.5 < bubbleCardWidth(model, slot);
-    const content = [_]AppUi.Node{
-        ui.row(.{ .gap = bubble_content_gap, .cross = .center }, .{
-            avatar,
-            ui.column(.{ .grow = 1, .height = bubbleContentHeight(model, row_count), .gap = bubble_line_gap, .main = .start, .cross = .start }, @as([]const AppUi.Node, rows[0..row_count])),
-            spinner_slot,
-        }),
-    };
     var card = ui.el(.panel, .{
         .padding = bubble_card_padding,
-        .width = card_width,
-        .height = bubbleRenderedCardHeight(model, slot),
-    }, @as([]const AppUi.Node, if (clamped) content[0..0] else content[0..1]));
-    card.widget.style.radius = bubble_card_radius;
-    if (model.dark) {
-        card.widget.style.background = canvas.Color.rgb8(25, 25, 28);
-        card.widget.style.border = canvas.Color.rgba8(255, 255, 255, 26);
-        card.widget.style.stroke_width = 1;
-    } else {
-        card.widget.style.background = canvas.Color.rgb8(255, 255, 255);
-        // Light mode needs the outline more than dark does, not less: a
-        // white card floats over a white editor with no silhouette, and
-        // the tail is the first part to disappear because it is the
-        // narrowest. Matches the tail hairline in registerTail.
-        card.widget.style.border = canvas.Color.rgb8(214, 214, 220);
-        card.widget.style.stroke_width = 1;
-    }
+        .width = bubble_card_width,
+        .height = bubbleRenderedCardHeight(model),
+    }, .{
+        ui.row(.{ .gap = bubble_content_gap, .cross = .center }, .{
+            avatar,
+            ui.column(.{ .grow = 1, .height = bubbleContentHeight(model, 2), .gap = bubble_line_gap, .main = .start, .cross = .start }, .{ project, status }),
+        }),
+    });
+    styleSpeechCard(&card, model.dark);
 
-    // Depth: shift up, shrink, and fade with distance from the front,
-    // plus the horizontal shift that centers this card in the stack.
+    // Depth: shift up, shrink, and fade with distance from the front.
     //
     // Affine.scale is canvas-origin anchored (it is applied raw, see
     // widget_tree.widgetTransform), so scaling alone would also drag the
     // card toward the canvas corner. Translating the card's center to
     // the origin, scaling, and translating back keeps it centered, and
-    // the offsets compose on top of that.
+    // the offset composes on top of that.
     if (bubbleStackable(model)) {
         const scale = bubbleCardScale(model, slot);
-        const w = bubbleRenderedCardWidth(model, slot);
-        const h = bubbleCardHeight(model, slot);
-        const cx = w / 2;
-        const cy = h / 2;
-        card.widget.transform = canvas.Affine.translate(bubbleCardCenterDx(model, slot), bubbleCardOffset(model, slot))
+        const cx = bubble_card_width / 2;
+        const cy = bubbleCardHeight(model) / 2;
+        card.widget.transform = canvas.Affine.translate(0, bubbleCardOffset(model, slot))
             .multiply(canvas.Affine.translate(cx, cy))
             .multiply(canvas.Affine.scale(scale, scale))
             .multiply(canvas.Affine.translate(-cx, -cy));
@@ -4590,7 +4452,7 @@ fn bubbleView(ui: *AppUi, model: *const Model) AppUi.Node {
         var overlay: [hook_server.max_bubbles]AppUi.Node = undefined;
         for (0..model.bubbles_len) |i| overlay[i] = bubbleCard(ui, model, i);
         cards[count] = ui.el(.stack, .{
-            .width = bubbleStackWidth(model),
+            .width = bubble_card_width,
             // The container has to reserve the FULL fan, not one card.
             // Cards are placed by transform, and `.stack` does not clip
             // (widget_tree.widgetClipsContent covers scroll_view and an
@@ -4636,10 +4498,15 @@ fn bubbleView(ui: *AppUi, model: *const Model) AppUi.Node {
     // into a large, theme- or text-dependent distance from the pet.
     const gap = ui.el(.stack, .{ .width = 1, .height = bubble_head_gap }, .{});
     const group = ui.column(.{ .cross = .center }, @as([]const AppUi.Node, cards[0..count]));
-    if (model.bubble_flipped) {
-        return ui.column(.{ .grow = 1, .main = .start, .cross = .center }, .{ gap, group });
-    }
-    return ui.column(.{ .grow = 1, .main = .end, .cross = .center }, .{ group, gap });
+    var root = if (model.bubble_flipped)
+        ui.column(.{ .grow = 1, .main = .start, .cross = .center }, .{ gap, group })
+    else
+        ui.column(.{ .grow = 1, .main = .end, .cross = .center }, .{ group, gap });
+    // A new window opens where the platform puts it (screen center on
+    // macOS); stay invisible until syncBubbleWindow has moved it to the
+    // pet. Linux's compositor places its popup itself.
+    if (builtin.target.os.tag != .linux and !model.bubble_placed) root.widget.opacity = 0;
+    return root;
 }
 
 // --------------------------------------------------------- settings window
@@ -4678,7 +4545,7 @@ fn flockView(ui: *AppUi, model: *const Model) AppUi.Node {
         var root = ui.column(.{ .grow = 1 }, .{
             ui.el(.stack, .{ .height = companion_header_h, .window_drag = true }, .{}),
             ui.column(.{ .grow = 1, .main = .center, .cross = .center }, .{
-                ui.text(.{ .size = .sm, .text_alignment = .center }, "No agents running"),
+                ui.text(.{ .size = .sm, .text_alignment = .center }, i18n.t("No agents running", "実行中のエージェントはありません")),
             }),
         });
         root.widget.style.background = settingsBackground(model);
@@ -4709,12 +4576,12 @@ fn flockView(ui: *AppUi, model: *const Model) AppUi.Node {
 
 fn flockSemanticLabel(state: State) []const u8 {
     return switch (state) {
-        .waiting => "Agent blocked",
-        .running, .@"running-right", .@"running-left" => "Agent working",
-        .failed => "Agent failed",
-        .review => "Agent reading",
-        .waving, .jumping => "Agent finished",
-        else => "Agent idle",
+        .waiting => i18n.t("Agent blocked", "エージェントが入力待ち"),
+        .running, .@"running-right", .@"running-left" => i18n.t("Agent working", "エージェントが作業中"),
+        .failed => i18n.t("Agent failed", "エージェントが失敗"),
+        .review => i18n.t("Agent reading", "エージェントが確認中"),
+        .waving, .jumping => i18n.t("Agent finished", "エージェントが完了"),
+        else => i18n.t("Agent idle", "エージェントは待機中"),
     };
 }
 
@@ -4787,7 +4654,7 @@ const settings_canvas_label = "settings-canvas";
 fn petdexWindows(model: *const Model, scratch: *PetdexApp.WindowsScratch) []const PetdexApp.WindowDescriptor {
     var count: usize = 0;
     if (bubbleActive(model)) {
-        const bubble_w = bubbleWindowWidth(model);
+        const bubble_w = bubble_window_width;
         const bubble_h = bubbleWindowHeight(model);
         if (comptime builtin.target.os.tag == .linux) {
             // A popup is created before the next frame-clock sync can
@@ -4841,7 +4708,7 @@ fn petdexWindows(model: *const Model, scratch: *PetdexApp.WindowsScratch) []cons
         scratch.windows[count] = .{
             .label = flock_window_label,
             .canvas_label = flock_canvas_label,
-            .title = "Petdex Flock",
+            .title = i18n.t("Petdex Flock", "Petdexフロック"),
             .width = size.w,
             .height = size.h + companion_header_h,
             .resizable = false,
@@ -4854,7 +4721,7 @@ fn petdexWindows(model: *const Model, scratch: *PetdexApp.WindowsScratch) []cons
         scratch.windows[count] = .{
             .label = settings_window_label,
             .canvas_label = settings_canvas_label,
-            .title = "Petdex Settings",
+            .title = i18n.t("Petdex Settings", "Petdex設定"),
             .width = 420,
             .height = 680,
             .resizable = false,
@@ -4863,7 +4730,54 @@ fn petdexWindows(model: *const Model, scratch: *PetdexApp.WindowsScratch) []cons
         };
         count += 1;
     }
+    if (model.chat.open) {
+        scratch.windows[count] = .{
+            .label = chat_shell.window_label,
+            .canvas_label = chat_shell.canvas_label,
+            .title = i18n.t("Chat", "チャット"),
+            // macOS: a speech bubble beside the pet. Not an overlay panel
+            // like the hook bubble, which never becomes key: the composer
+            // needs the keyboard. Elsewhere a titled window (Windows'
+            // transparency is a black color key; Linux cannot move one).
+            .width = chat_view.window_w,
+            .height = chat_view.windowHeight(model),
+            .resizable = false,
+            .titlebar = if (chat_view.bubble) .chromeless else .hidden_inset,
+            .floating = chat_view.bubble,
+            .transparent = chat_view.bubble,
+            .on_close = .chat_closed,
+        };
+        count += 1;
+    }
     return scratch.windows[0..count];
+}
+
+test "chat opens as a speech bubble beside the pet on macOS" {
+    var model: Model = .{};
+    model.chat.open = true;
+    var scratch: PetdexApp.WindowsScratch = undefined;
+    const windows = petdexWindows(&model, &scratch);
+    try std.testing.expectEqual(@as(usize, 1), windows.len);
+    try std.testing.expectEqualStrings(chat_shell.window_label, windows[0].label);
+    const bubble = builtin.target.os.tag == .macos;
+    try std.testing.expectEqual(bubble, windows[0].transparent);
+    try std.testing.expectEqual(bubble, windows[0].floating);
+    try std.testing.expect(!windows[0].fullscreen_overlay);
+    try std.testing.expectEqual(if (bubble) .chromeless else .hidden_inset, windows[0].titlebar);
+}
+
+test "the chat tail's cells point left and right" {
+    const left = chatTailRect(true);
+    const right = chatTailRect(false);
+    try std.testing.expectEqual(@as(f32, 0), left.x);
+    try std.testing.expectEqual(@as(f32, @floatFromInt(tail_h)), right.x);
+    try std.testing.expectEqual(left.width, right.width);
+    try std.testing.expectEqual(@as(f32, @floatFromInt(tail_w)), left.height);
+}
+
+test "Escape dismisses the chat and Space still cycles the pet" {
+    try std.testing.expect(onKey(.{ .phase = .key_down, .key = "escape" }).? == .chat_closed);
+    try std.testing.expect(onKey(.{ .phase = .key_down, .key = "space" }).? == .cycle_state);
 }
 
 test "companion windows use the unified opaque shell" {
@@ -4886,6 +4800,7 @@ test "companion windows use the unified opaque shell" {
 fn petdexWindowView(ui: *PetdexApp.Ui, model: *const Model, window_label: []const u8) PetdexApp.Ui.Node {
     if (std.mem.eql(u8, window_label, "bubble")) return bubbleView(ui, model);
     if (std.mem.eql(u8, window_label, flock_window_label)) return flockView(ui, model);
+    if (std.mem.eql(u8, window_label, chat_shell.window_label)) return chat_view.view(ui, model);
     std.debug.assert(std.mem.eql(u8, window_label, settings_window_label));
     return settings_view.settingsView(ui, model, .{
         .ready = agents_icons_ready,
@@ -4944,31 +4859,33 @@ fn refreshHookEntry(argv0: []const u8) void {
 /// its state in the label; the static options keep icon and tooltip.
 fn petdexStatusItem(model: *const Model, scratch: *PetdexApp.StatusItemScratch) PetdexApp.StatusItemState {
     const update_label = switch (model.update_phase) {
-        .checking => "Checking for Updates…",
-        .available => std.fmt.bufPrint(&scratch.title_buffer, "Update to Petdex {s}…", .{model.latest_version[0..model.latest_version_len]}) catch "Update Petdex…",
-        .current => std.fmt.bufPrint(&scratch.title_buffer, "Petdex is up to date · {s}", .{updates.current_version}) catch "Petdex is up to date",
-        .idle, .failed => std.fmt.bufPrint(&scratch.title_buffer, "Check for Updates… · {s}", .{updates.current_version}) catch "Check for Updates…",
+        .checking => i18n.t("Checking for Updates…", "アップデートを確認中…"),
+        .available => i18n.bufPrint(&scratch.title_buffer, "Update to Petdex {s}…", "Petdex {s}にアップデート…", .{model.latest_version[0..model.latest_version_len]}) catch i18n.t("Update Petdex…", "Petdexをアップデート…"),
+        .current => i18n.bufPrint(&scratch.title_buffer, "Petdex is up to date · {s}", "Petdexは最新です · {s}", .{updates.current_version}) catch i18n.t("Petdex is up to date", "Petdexは最新です"),
+        .idle, .failed => i18n.bufPrint(&scratch.title_buffer, "Check for Updates… · {s}", "アップデートを確認… · {s}", .{updates.current_version}) catch i18n.t("Check for Updates…", "アップデートを確認…"),
     };
-    scratch.items[0] = .{ .id = 1, .label = "Open Settings", .command = "petdex.settings" };
-    scratch.items[1] = .{ .id = 2, .label = "Open petdex.dev", .command = "petdex.website" };
-    scratch.items[2] = .{ .id = 3, .separator = true };
-    scratch.items[3] = .{
+    scratch.items[0] = .{ .id = 1, .label = i18n.t("Open Settings", "設定…"), .command = "petdex.settings" };
+    scratch.items[1] = .{ .id = 12, .label = i18n.t("Chat…", "チャット…"), .command = "petdex.chat" };
+    scratch.items[2] = .{ .id = 2, .label = i18n.t("Open petdex.dev", "petdex.devを開く"), .command = "petdex.website" };
+    scratch.items[3] = .{ .id = 3, .separator = true };
+    scratch.items[4] = .{
         .id = 4,
-        .label = if (model.focus_mode) "Focus Mode: On" else "Focus Mode: Off",
+        .label = if (model.focus_mode) i18n.t("Focus Mode: On", "集中モード：オン") else i18n.t("Focus Mode: Off", "集中モード：オフ"),
         .command = "petdex.focus",
     };
-    scratch.items[4] = .{ .id = 5, .label = "Shuffle Pet", .command = "petdex.shuffle" };
-    scratch.items[5] = .{
+    scratch.items[5] = .{ .id = 13, .label = i18n.t("Clear Notifications", "通知を消去"), .command = "petdex.clear-notifications", .enabled = model.bubbles_len > 0 };
+    scratch.items[6] = .{ .id = 5, .label = i18n.t("Shuffle Pet", "ペットをシャッフル"), .command = "petdex.shuffle" };
+    scratch.items[7] = .{
         .id = 6,
-        .label = if (model.flock.open) "Hide Flock" else "Show Flock",
+        .label = if (model.flock.open) i18n.t("Hide Flock", "フロックを隠す") else i18n.t("Show Flock", "フロックを表示"),
         .command = "petdex.flock",
     };
-    scratch.items[6] = .{ .id = 7, .label = "View Pet on Petdex", .command = "petdex.pet-page" };
-    scratch.items[7] = .{ .id = 8, .separator = true };
-    scratch.items[8] = .{ .id = 9, .label = update_label, .command = "petdex.updates", .enabled = model.update_phase != .checking };
-    scratch.items[9] = .{ .id = 10, .separator = true };
-    scratch.items[10] = .{ .id = 11, .label = "Quit Petdex", .command = "petdex.quit" };
-    return .{ .items = scratch.items[0..11] };
+    scratch.items[8] = .{ .id = 7, .label = i18n.t("View Pet on Petdex", "Petdexでペットを見る"), .command = "petdex.pet-page" };
+    scratch.items[9] = .{ .id = 8, .separator = true };
+    scratch.items[10] = .{ .id = 9, .label = update_label, .command = "petdex.updates", .enabled = model.update_phase != .checking };
+    scratch.items[11] = .{ .id = 10, .separator = true };
+    scratch.items[12] = .{ .id = 11, .label = i18n.t("Quit Petdex", "Petdexを終了"), .command = "petdex.quit" };
+    return .{ .items = scratch.items[0..13] };
 }
 
 /// The menu-bar button icon: the brand mark's silhouette with the face
@@ -4994,14 +4911,20 @@ fn materializeTrayIcon() void {
     if (plat.writeFile(path, tray_icon_png)) tray_icon_path = path;
 }
 
-const app_menus = [_]native_sdk.platform.Menu{.{
-    .title = "Pet",
-    .items = &.{
-        .{ .label = "Settings...", .command = "petdex.settings", .key = ",", .modifiers = .{ .primary = true } },
-        .{ .separator = true },
-        .{ .label = "Close Pet", .command = "petdex.close", .key = "w", .modifiers = .{ .primary = true } },
-    },
-}};
+/// Built once at launch, so a language change reaches it after a restart.
+fn appMenus(comptime lang: i18n.Lang) [1]native_sdk.platform.Menu {
+    return .{.{
+        .title = i18n.pick(lang, "Pet", "ペット"),
+        .items = &.{
+            .{ .label = i18n.pick(lang, "Settings...", "設定…"), .command = "petdex.settings", .key = ",", .modifiers = .{ .primary = true } },
+            .{ .label = i18n.pick(lang, "Chat...", "チャット…"), .command = "petdex.chat", .key = "k", .modifiers = .{ .primary = true } },
+            .{ .separator = true },
+            .{ .label = i18n.pick(lang, "Close Pet", "ペットを閉じる"), .command = "petdex.close", .key = "w", .modifiers = .{ .primary = true } },
+        },
+    }};
+}
+const app_menus_en = appMenus(.en);
+const app_menus_ja = appMenus(.ja);
 
 const PetdexApp = native_sdk.UiApp(Model, Msg);
 
@@ -5036,6 +4959,7 @@ pub fn main(init: std.process.Init) !void {
     agent_hooks.env_qoder_cn_cli_home = init.environ_map.get("QODERCN_CLI_HOME");
     agent_hooks.env_hermes_home = init.environ_map.get("HERMES_HOME");
     dsh_integration.env_dsh_home = init.environ_map.get("DSH_HOME");
+    chat_shell.env_codex_home = init.environ_map.get("CODEX_HOME");
     // Hook hot path: `<binary> bubble <phase> [agent]` runs the
     // in-binary runner and exits before any UI machinery spins up.
     // initAllocator, not init: on Windows the command line arrives as
@@ -5053,6 +4977,14 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
     }
+    // After the hook hot path: hooks run per tool call and must not stat
+    // log files. The same HOME/XDG/LOCALAPPDATA lookups the SDK makes.
+    sdk_log.init(.{
+        .home = init.environ_map.get("HOME"),
+        .xdg_state_home = init.environ_map.get("XDG_STATE_HOME"),
+        .local_app_data = init.environ_map.get("LOCALAPPDATA"),
+        .log_dir = init.environ_map.get("NATIVE_SDK_LOG_DIR"),
+    });
     if (argv0) |a0| refreshHookEntry(a0);
     materializeTrayIcon();
     env_wanted_pet = init.environ_map.get("PETDEX_PET");
@@ -5084,6 +5016,10 @@ pub fn main(init: std.process.Init) !void {
             initial_font_load_failed = true;
         }
     }
+    // After the hook fast path (hooks never pay for the lookup) and the
+    // custom font (it decides whether Japanese can be drawn).
+    os_japanese = plat.systemPrefersJapanese(.{ init.environ_map.get("LC_ALL"), init.environ_map.get("LC_MESSAGES"), init.environ_map.get("LANG") });
+    applyLanguage(initial_language);
     const app_state = try PetdexApp.create(std.heap.page_allocator, .{
         .name = "petdex-desktop-native",
         .scene = shell_scene,
@@ -5125,7 +5061,7 @@ pub fn main(init: std.process.Init) !void {
         // chromeless desktop pet that looks like a titlebar and also
         // steals vertical space; Linux already exposes these commands
         // through the pet's context menu.
-        .menus = if (builtin.target.os.tag == .linux) &.{} else &app_menus,
+        .menus = if (builtin.target.os.tag == .linux) &.{} else if (i18n.current == .ja) &app_menus_ja else &app_menus_en,
         .security = .{
             .permissions = &app_permissions,
             .navigation = .{ .allowed_origins = &.{ "zero://inline", "zero://app" } },
@@ -5371,12 +5307,56 @@ test "install queue keeps activation per pet" {
 test "empty-state copy fits the pet window" {
     // The label truncates rather than wrapping, and the window is 192pt,
     // so a sentence renders as an ellipsis (which is how the first
-    // attempt shipped). Every line has to stand alone.
-    const longest = "Pets found,\nnone could\nbe drawn.\n\nLinux needs\nwebp-pixbuf-\nloader.";
-    var it = std.mem.splitScalar(u8, longest, '\n');
-    while (it.next()) |line| {
-        try std.testing.expect(line.len <= 14);
+    // attempt shipped). Every line has to stand alone; a full-width
+    // character takes two columns.
+    defer i18n.current = .en;
+    for ([_]i18n.Lang{ .en, .ja }) |lang| {
+        i18n.current = lang;
+        for ([_]std.Target.Os.Tag{ .linux, .macos }) |os| {
+            for ([_]bool{ false, true }) |has_pets| {
+                var it = std.mem.splitScalar(u8, emptyStateCopy(os, has_pets), '\n');
+                while (it.next()) |line| {
+                    var columns: usize = 0;
+                    var codepoints = (try std.unicode.Utf8View.init(line)).iterator();
+                    while (codepoints.nextCodepoint()) |cp| columns += if (cp < 0x80) 1 else 2;
+                    try std.testing.expect(columns <= 14);
+                }
+            }
+        }
     }
+}
+
+test "menus fit the SDK's label limits in both languages" {
+    for ([_][6]AppUi.ContextMenuItem{ pet_menu_en, pet_menu_ja }) |menu| {
+        for (menu) |item| try std.testing.expect(item.label.len <= 128);
+    }
+    for ([_][1]native_sdk.platform.Menu{ app_menus_en, app_menus_ja }) |menus| {
+        try std.testing.expect(menus[0].title.len <= 64);
+        for (menus[0].items) |item| try std.testing.expect(item.label.len <= 128);
+    }
+}
+
+test "the tray speaks Japanese and keeps the version in its update label" {
+    i18n.current = .ja;
+    defer i18n.current = .en;
+    var model: Model = .{};
+    var scratch: PetdexApp.StatusItemScratch = undefined;
+    const tray = petdexStatusItem(&model, &scratch);
+    try std.testing.expectEqualStrings("設定…", tray.items[0].label);
+    var buf: [96]u8 = undefined;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "アップデートを確認… · {s}", .{updates.current_version}), tray.items[10].label);
+    for (tray.items) |item| try std.testing.expect(item.label.len <= 128);
+}
+
+test "hook cards and install errors in Japanese" {
+    i18n.current = .ja;
+    defer i18n.current = .en;
+    var model: Model = .{};
+    testPushBubble(&model, "alpha", "Refactored the parser.", true, -1);
+    try std.testing.expectEqualStrings("作業中", bubbleStatus(&model, 0));
+    // The longest install error, with a slug at the length limit.
+    model.install.setError("{s}: spritesheet download failed", "{s}：スプライトシートをダウンロードできませんでした。", .{"a" ** 64});
+    try std.testing.expect(model.install.error_len > 0);
 }
 
 test "update checks stay daily across a long-lived process" {
@@ -5408,17 +5388,25 @@ test "tray exposes website active pet and updater commands" {
     var model: Model = .{};
     var scratch: PetdexApp.StatusItemScratch = .{};
     var state = petdexStatusItem(&model, &scratch);
-    try std.testing.expectEqual(@as(usize, 11), state.items.len);
-    try std.testing.expectEqualStrings("Open petdex.dev", state.items[1].label);
-    try std.testing.expectEqualStrings("Show Flock", state.items[5].label);
-    try std.testing.expectEqualStrings("View Pet on Petdex", state.items[6].label);
-    try std.testing.expect(std.mem.startsWith(u8, state.items[8].label, "Check for Updates"));
+    try std.testing.expectEqual(@as(usize, 13), state.items.len);
+    try std.testing.expectEqualStrings("petdex.chat", state.items[1].command);
+    try std.testing.expectEqualStrings("Open petdex.dev", state.items[2].label);
+    try std.testing.expectEqualStrings("petdex.clear-notifications", state.items[5].command);
+    // Nothing to clear, nothing to press.
+    try std.testing.expect(!state.items[5].enabled);
+    try std.testing.expectEqualStrings("Show Flock", state.items[7].label);
+    try std.testing.expectEqualStrings("View Pet on Petdex", state.items[8].label);
+    try std.testing.expect(std.mem.startsWith(u8, state.items[10].label, "Check for Updates"));
+    try std.testing.expectEqual(std.meta.Tag(Msg).open_chat, std.meta.activeTag(onCommand("petdex.chat").?));
+    try std.testing.expectEqual(std.meta.Tag(Msg).clear_notifications, std.meta.activeTag(onCommand("petdex.clear-notifications").?));
 
+    testPushBubble(&model, "alpha", "waiting", false, -1);
     model.update_phase = .available;
     @memcpy(model.latest_version[0.."0.10.0".len], "0.10.0");
     model.latest_version_len = "0.10.0".len;
     state = petdexStatusItem(&model, &scratch);
-    try std.testing.expectEqualStrings("Update to Petdex 0.10.0…", state.items[8].label);
+    try std.testing.expect(state.items[5].enabled);
+    try std.testing.expectEqualStrings("Update to Petdex 0.10.0…", state.items[10].label);
 }
 
 test "bubble text default is its own value, not the range floor" {
@@ -5465,30 +5453,81 @@ test {
     // block is the standard aggregator: referencing the imports forces
     // their semantic analysis, which is what registers their tests.
     _ = agent_hooks;
+    _ = chat;
+    _ = chat_history;
+    _ = chat_shell;
+    _ = desktop_auth;
     _ = hook_runner;
     _ = hook_server;
+    _ = i18n;
     _ = installer;
     _ = plat;
     _ = remote_agents;
     _ = remote_runtime;
     _ = remote_ssh;
     _ = remote_writeback;
+    _ = sdk_log;
     _ = settings_view;
 }
 
-test "bubble geometry follows columns lines and font size" {
+test "bubble cards keep one size whatever the text, and grow with the text size" {
     var model: Model = .{};
-    try std.testing.expectEqual(bubble_columns_default, model.bubble_columns);
-    try std.testing.expectEqual(bubble_answer_lines_default, model.bubble_answer_lines);
-    const default_width = bubbleWindowWidth(&model);
-    const default_height = bubbleWindowHeight(&model);
-    model.bubble_columns = 60;
-    try std.testing.expect(bubbleWindowWidth(&model) > default_width);
-    model.bubble_answer_lines = 4;
-    try std.testing.expect(bubbleWindowHeight(&model) > default_height);
+    const empty = bubbleWindowHeight(&model);
+    testPushBubble(&model, "alpha", "a much longer line of bubble text than any card could hold on one line", false, -1);
+    try std.testing.expectEqual(empty, bubbleWindowHeight(&model));
     model.bubble_text_px = bubble_text_max_px;
-    try std.testing.expect(bubbleWindowWidth(&model) > default_width);
-    try std.testing.expect(bubbleWindowHeight(&model) > default_height);
+    try std.testing.expect(bubbleWindowHeight(&model) > empty);
+}
+
+test "a hook card names the project, the agent and what it needs" {
+    var model: Model = .{};
+    testPushBubble(&model, "alpha", "Refactored the parser.", true, -1);
+    const b = &model.bubbles[0];
+    const cwd = "/Users/me/src/petdex";
+    @memcpy(b.source_cwd[0..cwd.len], cwd);
+    b.source_cwd_len = cwd.len;
+    @memcpy(b.agent[0.."codex".len], "codex");
+    b.agent_len = "codex".len;
+    try std.testing.expectEqualStrings("petdex", bubbleProject(b));
+    try std.testing.expectEqualStrings("Codex", bubbleAgentName(b));
+    try std.testing.expectEqualStrings("Working", bubbleStatus(&model, 0));
+    b.busy = false;
+    try std.testing.expectEqualStrings("Done", bubbleStatus(&model, 0));
+    @memcpy(b.agent_state[0.."waiting".len], "waiting");
+    b.agent_state_len = "waiting".len;
+    try std.testing.expectEqualStrings("Action Required", bubbleStatus(&model, 0));
+    // Without a cwd: the session title, then the agent.
+    b.source_cwd_len = 0;
+    try std.testing.expectEqualStrings("Codex", bubbleProject(b));
+}
+
+test "the hook stack keeps clear of an open chat bubble" {
+    var model: Model = .{};
+    model.pet_x = 1000;
+    const pet_w: f64 = frame_w * model.scale;
+    const w = bubble_window_width;
+    try std.testing.expectApproxEqAbs(1000 + pet_w / 2 - w / 2, bubbleWantX(&model, w), 0.001);
+    if (!chat_view.bubble) return;
+    model.chat.open = true;
+    model.chat.place.want_x = 0;
+    // Chat on the right: the card's right edge stops at the pet's.
+    try std.testing.expectApproxEqAbs(1000 + pet_w + bubble_canvas_margin - w, bubbleWantX(&model, w), 0.001);
+    // Chat on the left: the card's left edge stops at the pet's.
+    model.chat.place.left = true;
+    try std.testing.expectApproxEqAbs(1000 - bubble_canvas_margin, bubbleWantX(&model, w), 0.001);
+}
+
+test "settings JSON keeps the language and fits the worst-case font path" {
+    var model: Model = .{};
+    model.language = .ja;
+    model.window_fitted = true;
+    model.pet_x = -123456;
+    model.pet_y = -123456;
+    // Every byte a quote: the longest escape the font path can take.
+    model.font_path.set("\"" ** 512);
+    var buf: [settings_json_bytes]u8 = undefined;
+    const json = settingsJson(&model, &buf).?;
+    try std.testing.expectEqual(i18n.Pref.ja, std.meta.stringToEnum(i18n.Pref, hook_server.jsonStringPub(json, "language").?).?);
 }
 
 test "custom font path round-trips through settings JSON escaping" {
@@ -5664,74 +5703,6 @@ test "switching per-conversation bubbles off collapses the stack already on scre
     try std.testing.expectEqualStrings("newest", model.bubbles[0].text[0..model.bubbles[0].text_len]);
 }
 
-test "a card hugs its content instead of always taking the column budget" {
-    var model: Model = .{};
-    testPushBubble(&model, "alpha", "hi", false, -1);
-    const short = bubbleCardWidth(&model, 0);
-    try std.testing.expect(short < bubbleMaxCardWidth(&model));
-
-    // Longer content widens the card, and the column budget is still the
-    // ceiling: text past it wraps rather than growing the card forever.
-    var long: Model = .{};
-    testPushBubble(&long, "beta", "a much longer line of bubble text", false, -1);
-    try std.testing.expect(bubbleCardWidth(&long, 0) > short);
-
-    // The column budget stays a ceiling no card can cross. It is not an
-    // equality: the budget reserves one em per character and real text
-    // paints narrower, so even a full card measures under it.
-    var overflow: Model = .{};
-    testPushBubble(&overflow, "gamma", "x" ** 199, false, -1);
-    try std.testing.expect(bubbleCardWidth(&overflow, 0) <= bubbleMaxCardWidth(&overflow));
-    try std.testing.expect(bubbleCardWidth(&overflow, 0) > bubbleCardWidth(&long, 0));
-}
-
-test "a wrapping card measures its painted line, not its character count" {
-    // The regression this pins: width came from charCount * font size,
-    // one em per character, while the sans faces paint about half that.
-    // A card that wraps was coming out near twice its own text, which is
-    // what left the spinner stranded far to the right of the last word.
-    var model: Model = .{};
-    const text = "a much longer line of bubble text that has to wrap across lines";
-    testPushBubble(&model, "alpha", text, false, -1);
-
-    const tokens = petdexTokens(&model);
-    const size = bubbleFontSize(&model);
-    const chrome = bubble_avatar_width + bubble_busy_width + bubble_content_gap * 2 + bubble_card_padding * 2;
-
-    // Widest line the view actually paints, measured the way it paints.
-    const clipped = clipDisplay(text, model.bubble_columns * model.bubble_answer_lines, &bubble_text_scratch[0], true);
-    var painted: f32 = 0;
-    var chars: usize = 0;
-    for (splitLines(clipped, model.bubble_columns, model.bubble_answer_lines)) |line| {
-        if (line.len == 0) continue;
-        painted = @max(painted, canvas.measureTextWidthForFont(tokens.text_measure, canvas.textSpanFontId(.{ .text = "" }, tokens.typography), line, size));
-        chars = @max(chars, charCount(line));
-    }
-    try std.testing.expect(painted > 0);
-
-    // Within a pixel of the painted line plus the fixed chrome.
-    const got = bubbleCardWidth(&model, 0);
-    try std.testing.expect(@abs(got - @ceil(painted + chrome)) <= 1);
-
-    // And meaningfully narrower than the old count-based number, which
-    // is the whole point: proportional text is not one em per glyph.
-    const naive = @ceil(@as(f32, @floatFromInt(chars)) * size + chrome);
-    try std.testing.expect(got < naive - 20);
-}
-
-test "the window takes the widest card in the stack" {
-    var model: Model = .{};
-    testPushBubble(&model, "alpha", "hi", false, -1);
-    const solo = bubbleWindowWidth(&model);
-    testPushBubble(&model, "beta", "a much longer line of bubble text", false, -1);
-    const widest = bubbleCardWidth(&model, 1);
-    try std.testing.expect(bubbleWindowWidth(&model) > solo);
-    try std.testing.expectEqual(widest + bubble_canvas_margin * 2, bubbleWindowWidth(&model));
-    // The narrow card keeps its own width and gets centered by the view;
-    // it must not be stretched to the window.
-    try std.testing.expect(bubbleCardWidth(&model, 0) < widest);
-}
-
 test "one bubble is not a stack: no peek, no hover, no animation" {
     var model: Model = .{};
     testPushBubble(&model, "alpha", "solo", true, -1);
@@ -5758,7 +5729,7 @@ test "collapsed cards recede behind the front one" {
     try std.testing.expectEqual(@as(f32, 1), bubbleCardAlpha(&model, 1));
     // The container reserves the whole fan, and unflipped the front card
     // sits at its bottom edge, nearest the pet.
-    try std.testing.expectEqual(bubbleStackHeightAt(&model, 1) - bubbleCardHeight(&model, 1), bubbleCardOffset(&model, 1));
+    try std.testing.expectEqual(bubbleStackHeightAt(&model, 1) - bubbleCardHeight(&model), bubbleCardOffset(&model, 1));
 
     // The one behind is smaller, dimmer and pushed up by the peek offset.
     try std.testing.expect(bubbleCardScale(&model, 0) < 1);
@@ -5783,8 +5754,8 @@ test "expanded restores the slice 1 column" {
         try std.testing.expectEqual(@as(f32, 1), bubbleCardScale(&model, i));
         try std.testing.expectEqual(@as(f32, 1), bubbleCardAlpha(&model, i));
     }
-    try std.testing.expectEqual(bubbleStackHeightAt(&model, 1) - bubbleCardHeight(&model, 1), bubbleCardOffset(&model, 1));
-    try std.testing.expectEqual(bubbleCardHeight(&model, 0) + bubble_stack_gap, bubbleCardOffset(&model, 1) - bubbleCardOffset(&model, 0));
+    try std.testing.expectEqual(bubbleStackHeightAt(&model, 1) - bubbleCardHeight(&model), bubbleCardOffset(&model, 1));
+    try std.testing.expectEqual(bubbleCardHeight(&model) + bubble_stack_gap, bubbleCardOffset(&model, 1) - bubbleCardOffset(&model, 0));
 }
 
 test "hover waits out the delay, and leaving collapses at once" {
@@ -5866,42 +5837,6 @@ test "hover hit tests the drawn cards, not the tall transparent window" {
     const high_x = win_x + @as(f64, @floatCast(expanded_rect.x + expanded_rect.w / 2));
     const high_y = win_y + @as(f64, @floatCast(expanded_rect.y + 2));
     try std.testing.expect(bubbleHoverHit(&model, win_x, win_y, win_height, high_x, high_y));
-}
-
-test "collapsed peeks are clamped to the front card and centered" {
-    var model: Model = .{};
-    // A wide card behind a narrow front one: the case that looked wrong
-    // on screen, with the peek jutting out past the front card's edge
-    // and its text still legible.
-    testPushBubble(&model, "alpha", "a much longer line of bubble text", false, -1);
-    testPushBubble(&model, "beta", "eve", true, -1);
-
-    const front = bubbleCardWidth(&model, 1);
-    try std.testing.expect(bubbleCardWidth(&model, 0) > front);
-    // Collapsed, the peek is trimmed to the front card's width.
-    try std.testing.expectEqual(front, bubbleRenderedCardWidth(&model, 0));
-    try std.testing.expectEqual(front, bubbleRenderedCardWidth(&model, 1));
-
-    // Every card centers on the SAME axis: stackChildFrame pins overlay
-    // children to the container's left edge, so without this the narrow
-    // card sat left and the wide ones fanned right. The axis itself
-    // tracks the pet rather than the container center, so this compares
-    // the cards against each other, not against a fixed midpoint.
-    const axis = bubbleCardCenterDx(&model, 0) + bubbleRenderedCardWidth(&model, 0) / 2;
-    for (0..model.bubbles_len) |i| {
-        const dx = bubbleCardCenterDx(&model, i);
-        const w = bubbleRenderedCardWidth(&model, i);
-        try std.testing.expect(@abs((dx + w / 2) - axis) < 0.01);
-    }
-
-    // Expanded, each card is back to its own natural width.
-    model.bubble_expansion = 1;
-    try std.testing.expectEqual(bubbleCardWidth(&model, 0), bubbleRenderedCardWidth(&model, 0));
-    // A card SHORTER than the front one is never stretched to match.
-    var short: Model = .{};
-    testPushBubble(&short, "alpha", "hi", false, -1);
-    testPushBubble(&short, "beta", "a much longer line of bubble text", true, -1);
-    try std.testing.expectEqual(bubbleCardWidth(&short, 0), bubbleRenderedCardWidth(&short, 0));
 }
 
 test "flipping sends the stack below the pet, clear of the sprite" {
@@ -6032,50 +5967,11 @@ test "a flipped stack grows downward and is hit tested from the top" {
     try std.testing.expect(!bubbleHoverHit(&model, win_x, win_y, win_height, win_x + 20, win_y + win_height - 2));
 }
 
-test "the stack axis follows the pet when the window is clamped off-center" {
-    // Hunter's screen-edge case: narrow front card, wide hidden peek.
-    // The window is sized for the wide one and then clamped inward by
-    // the screen edge, so the window center is nowhere near the pet.
-    var model: Model = .{};
-    testPushBubble(&model, "alpha", "a much longer line of bubble text", false, -1);
-    testPushBubble(&model, "beta", "eve", true, -1);
-
-    const stack_w = bubbleStackWidth(&model);
-    const front = bubbleCardWidth(&model, 1);
-    try std.testing.expect(front < stack_w);
-
-    // Pet hard against the right edge of the window's content box: the
-    // collapsed axis must follow it, NOT sit at the container center,
-    // which is what left the only visible card stranded mid-window.
-    const axis_right = bubbleStackAxis(&model, stack_w, 0);
-    try std.testing.expect(axis_right > stack_w / 2);
-    // Clamped so the front card still fits inside the container.
-    try std.testing.expectEqual(stack_w - front / 2, axis_right);
-
-    // Same on the other side.
-    const axis_left = bubbleStackAxis(&model, 0, 0);
-    try std.testing.expect(axis_left < stack_w / 2);
-    try std.testing.expectEqual(front / 2, axis_left);
-
-    // A pet comfortably inside gets its exact center, no clamp.
-    try std.testing.expectEqual(stack_w / 2, bubbleStackAxis(&model, stack_w / 2, 0));
-
-    // Expanded the clamp has to fit the WIDEST card, so a pet at the
-    // edge pushes the fan inward: the axis lands at the container
-    // center because the widest card fills it.
-    try std.testing.expectEqual(stack_w / 2, bubbleStackAxis(&model, stack_w, 1));
-
-    // The axis therefore slides between the two during the animation
-    // rather than jumping when the fan opens.
-    const mid = bubbleStackAxis(&model, stack_w, 0.5);
-    try std.testing.expect(mid < axis_right and mid > stack_w / 2);
-}
-
 test "a single bubble tail follows the pet after a screen-edge clamp" {
     var model: Model = .{};
     testPushBubble(&model, "codex", "running tests", true, -1);
 
-    const card_w = bubbleCardWidth(&model, 0);
+    const card_w = bubble_card_width;
     const inset = bubble_card_radius + @as(f32, @floatFromInt(tail_w)) / 2;
 
     model.bubble_pet_center_local = card_w / 2;
@@ -6089,26 +5985,6 @@ test "a single bubble tail follows the pet after a screen-edge clamp" {
 
     model.bubble_pet_center_local = card_w;
     try std.testing.expectEqual(card_w - inset, bubbleTailCenterX(&model));
-    try std.testing.expect(bubbleTailDx(&model) > 0);
-}
-
-test "a stacked bubble keeps its tail attached to the front card" {
-    var model: Model = .{};
-    testPushBubble(&model, "alpha", "a much wider card behind the front one", false, -1);
-    testPushBubble(&model, "codex", "working", true, -1);
-
-    const front = model.bubbles_len - 1;
-    const front_w = bubbleRenderedCardWidth(&model, front);
-    const inset = bubble_card_radius + @as(f32, @floatFromInt(tail_w)) / 2;
-
-    model.bubble_pet_center_local = 0;
-    const left_x = bubbleCardCenterDx(&model, front);
-    try std.testing.expectEqual(left_x + inset, bubbleTailCenterX(&model));
-    try std.testing.expect(bubbleTailDx(&model) < 0);
-
-    model.bubble_pet_center_local = bubbleStackWidth(&model);
-    const right_x = bubbleCardCenterDx(&model, front);
-    try std.testing.expectEqual(right_x + front_w - inset, bubbleTailCenterX(&model));
     try std.testing.expect(bubbleTailDx(&model) > 0);
 }
 
@@ -6196,7 +6072,7 @@ test "bubble clamp correction reconciles a reported-only host clamp" {
 test "the hover rect covers the whole visible card, not just its text" {
     // Hunter hit this live: the fan only opened over the TEXT. The hit
     // region was re-derived from the window edges and layout constants
-    // while the cards are placed by bubbleCardCenterDx/bubbleCardOffset,
+    // while the cards are placed by bubbleCardOffset,
     // so the two drifted: a band running up from the window bottom, and
     // cards sitting on an axis that tracks the pet. The overlap was the
     // middle of the card, which is where the text is.
@@ -6216,10 +6092,10 @@ test "the hover rect covers the whole visible card, not just its text" {
         // the property that was violated, and it is checked against the
         // SAME functions the renderer transforms by.
         for (0..model.bubbles_len) |slot| {
-            const cx = bubble_canvas_margin + bubbleCardCenterDx(&model, slot);
+            const cx = bubble_canvas_margin;
             const cy = bubbleStackOriginY(&model) + bubbleCardOffset(&model, slot);
-            const cw = bubbleRenderedCardWidth(&model, slot);
-            const chh = bubbleCardHeight(&model, slot);
+            const cw = bubble_card_width;
+            const chh = bubbleCardHeight(&model);
             try std.testing.expect(r.x <= cx);
             try std.testing.expect(r.y <= cy);
             try std.testing.expect(r.x + r.w >= cx + cw);
@@ -6233,19 +6109,19 @@ test "the hover rect covers the whole visible card, not just its text" {
         // plus slop — NOT the full stack width, which is reserved for the
         // widest hidden card and is mostly transparent while collapsed.
         try std.testing.expectApproxEqAbs(
-            bubbleRenderedCardWidth(&model, model.bubbles_len - 1) + bubble_hover_slop * 2,
+            bubble_card_width + bubble_hover_slop * 2,
             r.w,
             0.01,
         );
-        try std.testing.expect(r.w < bubbleWindowWidth(&model));
+        try std.testing.expect(r.w < bubble_window_width);
         try std.testing.expect(r.h < bubbleWindowHeight(&model));
 
         // The corners of the front card answer, which is the actual
         // complaint: not just the text in the middle.
-        const fx0 = bubble_canvas_margin + bubbleCardCenterDx(&model, model.bubbles_len - 1);
+        const fx0 = bubble_canvas_margin;
         const fy0 = bubbleStackOriginY(&model) + bubbleCardOffset(&model, model.bubbles_len - 1);
-        const fw = bubbleRenderedCardWidth(&model, model.bubbles_len - 1);
-        const fh = bubbleCardHeight(&model, model.bubbles_len - 1);
+        const fw = bubble_card_width;
+        const fh = bubbleCardHeight(&model);
         const wh: f64 = @floatCast(bubbleWindowHeight(&model));
         for ([_][2]f32{
             .{ fx0 + 1, fy0 + 1 },
@@ -6328,8 +6204,8 @@ test "the hover rect starts at the stack container, not at the canvas margin" {
         const origin_y = if (flipped) flipped_origin else unflipped_origin;
         const front = model.bubbles_len - 1;
         const fy0 = origin_y + bubbleCardOffset(&model, front);
-        const fx = bubble_canvas_margin + bubbleCardCenterDx(&model, front) + 4;
-        const bottom = fy0 + bubbleCardHeight(&model, front);
+        const fx = bubble_canvas_margin + 4;
+        const bottom = fy0 + bubbleCardHeight(&model);
         const wh: f64 = @floatCast(bubbleWindowHeight(&model));
         // One point inside the bottom edge: live.
         try std.testing.expect(bubbleHoverHit(&model, 0, 0, wh, fx, bottom - 1));
@@ -6339,11 +6215,11 @@ test "the hover rect starts at the stack container, not at the canvas margin" {
         // card unflipped and the deepest peek once flipped: the peeks are
         // drawn, so they are hoverable, and the rect is their union.
         var drawn_top = origin_y + bubbleCardOffset(&model, 0);
-        var drawn_bottom = drawn_top + bubbleCardHeight(&model, 0);
+        var drawn_bottom = drawn_top + bubbleCardHeight(&model);
         for (0..model.bubbles_len) |slot| {
             const top = origin_y + bubbleCardOffset(&model, slot);
             drawn_top = @min(drawn_top, top);
-            drawn_bottom = @max(drawn_bottom, top + bubbleCardHeight(&model, slot));
+            drawn_bottom = @max(drawn_bottom, top + bubbleCardHeight(&model));
         }
         // Well past the slop below everything drawn: dead, so the fix
         // widened the rect onto the cards rather than onto the window.
@@ -6353,43 +6229,6 @@ test "the hover rect starts at the stack container, not at the canvas margin" {
         // answered live in a band above the stack.
         try std.testing.expect(!bubbleHoverHit(&model, 0, 0, wh, fx, drawn_top - bubble_hover_slop - 8));
     }
-}
-
-test "the hover rect tracks the cards when a screen edge shifts the axis" {
-    // The clamp case: pet near a screen edge slides the stack axis off
-    // the window center. A hit rect centered on the window would only
-    // partly overlap the cards, which is hypothesis (a) for the same bug.
-    var model: Model = .{};
-    testPushBubble(&model, "alpha", "a much wider card than the front one", false, -1);
-    testPushBubble(&model, "eve", "ok", false, -1);
-    model.bubble_expansion = 0;
-    model.bubble_expansion_target = 0;
-
-    // Pet hard against the left edge, then hard against the right. The
-    // expected x is computed HERE from the clamp rule rather than by
-    // calling the same helper the implementation uses, so a rect that
-    // ignored the axis and centered on the window would not be able to
-    // agree with it.
-    const front = model.bubbles_len - 1;
-    const stack_w = bubbleStackWidth(&model);
-    const front_w = bubbleRenderedCardWidth(&model, front);
-    for ([_]f32{ 0, stack_w }) |center| {
-        model.bubble_pet_center_local = center;
-        const r = bubbleCardsRect(&model);
-        // Collapsed, only the front card has to fit, so the axis is the
-        // pet center clamped into [front_w/2, stack_w - front_w/2].
-        const axis = std.math.clamp(center, front_w / 2, stack_w - front_w / 2);
-        const want_x = bubble_canvas_margin + axis - front_w / 2 - bubble_hover_slop;
-        try std.testing.expectApproxEqAbs(want_x, r.x, 0.01);
-        try std.testing.expectApproxEqAbs(front_w + bubble_hover_slop * 2, r.w, 0.01);
-    }
-
-    // The two edges must actually land the rect in different places,
-    // otherwise the clamp was never exercised.
-    model.bubble_pet_center_local = 0;
-    const left = bubbleCardsRect(&model).x;
-    model.bubble_pet_center_local = stack_w;
-    try std.testing.expect(bubbleCardsRect(&model).x > left + 1);
 }
 
 test "a thrown pet keeps its flip and collapse current through the flight" {
@@ -6486,18 +6325,14 @@ test "a stacked card keeps its own height, never the container's" {
     testPushBubble(&model, "beta", "newer", true, -1);
 
     const container = bubbleStackHeightAt(&model, 1);
-    for (0..model.bubbles_len) |i| {
-        const card_h = bubbleCardHeight(&model, i);
-        try std.testing.expectEqual(card_h, bubbleRenderedCardHeight(&model, i));
-        try std.testing.expect(card_h < bubbleMaxCardHeight(&model));
-        try std.testing.expect(bubbleRenderedCardHeight(&model, i) < container);
-    }
+    try std.testing.expectEqual(bubbleCardHeight(&model), bubbleRenderedCardHeight(&model));
+    try std.testing.expect(bubbleRenderedCardHeight(&model) < container);
 
     // A single bubble has no container to inherit from, so it keeps
     // sizing itself to its content: height 0 means intrinsic there.
     var solo: Model = .{};
     testPushBubble(&solo, "alpha", "solo", false, -1);
-    try std.testing.expectEqual(@as(f32, 0), bubbleRenderedCardHeight(&solo, 0));
+    try std.testing.expectEqual(@as(f32, 0), bubbleRenderedCardHeight(&solo));
 }
 
 test "a flipped stack stays inside its container at both ends" {
@@ -6521,7 +6356,7 @@ test "a flipped stack stays inside its container at both ends" {
         for (0..model.bubbles_len) |i| {
             const top = bubbleCardOffset(&model, i);
             try std.testing.expect(top >= -0.01);
-            try std.testing.expect(top + bubbleCardHeight(&model, i) <= container + 0.01);
+            try std.testing.expect(top + bubbleCardHeight(&model) <= container + 0.01);
         }
         // Flipped, the FRONT card leads at the top, hard against the
         // head gap, and the rest hang below it.
@@ -6535,10 +6370,10 @@ test "a flipped stack stays inside its container at both ends" {
         for (0..model.bubbles_len) |i| {
             const top = bubbleCardOffset(&model, i);
             try std.testing.expect(top >= -0.01);
-            try std.testing.expect(top + bubbleCardHeight(&model, i) <= container + 0.01);
+            try std.testing.expect(top + bubbleCardHeight(&model) <= container + 0.01);
         }
         const front = model.bubbles_len - 1;
-        try std.testing.expectEqual(container - bubbleCardHeight(&model, front), bubbleCardOffset(&model, front));
+        try std.testing.expectEqual(container - bubbleCardHeight(&model), bubbleCardOffset(&model, front));
     }
 }
 
@@ -6577,12 +6412,12 @@ test "two conversations stack and grow the window vertically" {
     var model: Model = .{};
     testPushBubble(&model, "alpha", "reading", true, -1);
     const one_high = bubbleWindowHeight(&model);
-    const one_wide = bubbleWindowWidth(&model);
+    const one_wide = bubble_window_width;
     testPushBubble(&model, "beta", "testing", true, -1);
     try std.testing.expect(bubbleWindowHeight(&model) > one_high);
     // Only the vertical axis grows: cards keep the configured column
     // budget, they do not sit side by side.
-    try std.testing.expectEqual(one_wide, bubbleWindowWidth(&model));
+    try std.testing.expectEqual(one_wide, bubble_window_width);
     try std.testing.expectEqualStrings("beta", newestBubble(&model).?.sessionSlice());
 }
 
@@ -6613,7 +6448,8 @@ test "an empty stack still reserves one card of window height" {
     var model: Model = .{};
     const empty = bubbleWindowHeight(&model);
     testPushBubble(&model, "alpha", "reading", true, -1);
-    try std.testing.expect(bubbleWindowHeight(&model) < empty);
+    // Every card is the same height, so the reserve is exactly one card.
+    try std.testing.expectEqual(empty, bubbleWindowHeight(&model));
 }
 
 test "expiry drops only the bubbles past their deadline" {

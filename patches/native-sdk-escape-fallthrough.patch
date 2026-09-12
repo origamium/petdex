@@ -1,0 +1,17 @@
+diff --git a/src/runtime/ui_app.zig b/src/runtime/ui_app.zig
+index bedf1c3..b23c3f3 100644
+--- a/src/runtime/ui_app.zig
++++ b/src/runtime/ui_app.zig
+@@ -3467,7 +3467,11 @@ pub fn UiAppWithFeatures(comptime ModelT: type, comptime MsgT: type, comptime fe
+                 }
+                 if (tree.findWidget(target.id)) |widget| {
+                     if (!widget.state.disabled) {
+-                        if (canvas.isWidgetTextEntry(widget)) return;
++                        // petdex: an Escape the field left unused (no
++                        // composition to cancel, no search to clear)
++                        // falls through to on_key, so it can dismiss.
++                        const spare_escape = keyboard_event.keyboard.edit == null and std.ascii.eqlIgnoreCase(keyboard_event.keyboard.key, "escape");
++                        if (canvas.isWidgetTextEntry(widget) and !spare_escape) return;
+                         if (canvas.widgetKeyboardControlIntent(widget, keyboard_event.keyboard) != null) return;
+                     }
+                 }

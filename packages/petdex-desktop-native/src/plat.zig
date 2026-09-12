@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const i18n = @import("i18n.zig");
 
 /// One Io per calling thread. Cheap to build (no worker threads spin
 /// up until an async call asks for them) and never shared, so the
@@ -204,6 +205,15 @@ pub fn fileExists(path: []const u8) bool {
     var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return false;
     file.close(io);
     return true;
+}
+
+/// Size in bytes; null when the path is missing or not a regular file.
+pub fn fileSize(path: []const u8) ?u64 {
+    var scope = Scope.init();
+    defer scope.deinit();
+    const stat = std.Io.Dir.cwd().statFile(scope.io(), path, .{}) catch return null;
+    if (stat.kind != .file) return null;
+    return stat.size;
 }
 
 pub fn dirExists(path: []const u8) bool {
@@ -549,6 +559,63 @@ pub fn processId() u32 {
         .linux => @intCast(std.os.linux.getpid()),
         else => @intCast(std.c.getpid()),
     };
+}
+
+/// Whether the user's language is Japanese. macOS reads the preferred
+/// languages (an app launched from Finder gets no LANG), Windows the UI
+/// language; elsewhere the POSIX locale variables, in the order
+/// LC_ALL, LC_MESSAGES, LANG, which main() passes in.
+pub fn systemPrefersJapanese(posix_locale: [3]?[]const u8) bool {
+    switch (builtin.os.tag) {
+        .macos => {
+            const languages = mac_cf.CFLocaleCopyPreferredLanguages() orelse return false;
+            defer mac_cf.CFRelease(languages);
+            const count = mac_cf.CFArrayGetCount(languages);
+            var index: isize = 0;
+            while (index < count) : (index += 1) {
+                var buf: [64]u8 = undefined;
+                const value = mac_cf.CFArrayGetValueAtIndex(languages, index) orelse continue;
+                if (mac_cf.CFStringGetCString(value, &buf, buf.len, mac_cf.utf8) == 0) continue;
+                const tag = std.mem.sliceTo(&buf, 0);
+                // The first English or Japanese entry decides; others are
+                // skipped, so a French-then-Japanese list still gets Japanese.
+                if (i18n.fromTag(tag)) |lang| return lang == .ja;
+            }
+            return false;
+        },
+        .windows => return win_locale.GetUserDefaultUILanguage() & 0x3ff == 0x11,
+        else => return posixPrefersJapanese(posix_locale),
+    }
+}
+
+fn posixPrefersJapanese(locale: [3]?[]const u8) bool {
+    for (locale) |value| {
+        const tag = value orelse continue;
+        if (tag.len == 0) continue;
+        return i18n.fromTag(tag) == .ja;
+    }
+    return false;
+}
+
+const mac_cf = struct {
+    const utf8: u32 = 0x08000100;
+    extern "c" fn CFLocaleCopyPreferredLanguages() ?*const anyopaque;
+    extern "c" fn CFArrayGetCount(array: *const anyopaque) isize;
+    extern "c" fn CFArrayGetValueAtIndex(array: *const anyopaque, index: isize) ?*const anyopaque;
+    extern "c" fn CFStringGetCString(string: *const anyopaque, buffer: [*]u8, size: isize, encoding: u32) u8;
+    extern "c" fn CFRelease(value: *const anyopaque) void;
+};
+
+const win_locale = if (builtin.os.tag == .windows) struct {
+    extern "kernel32" fn GetUserDefaultUILanguage() callconv(.winapi) u16;
+} else struct {};
+
+test "the first set POSIX locale variable decides the language" {
+    try std.testing.expect(posixPrefersJapanese(.{ null, null, "ja_JP.UTF-8" }));
+    try std.testing.expect(posixPrefersJapanese(.{ "", "ja_JP.UTF-8", "en_US.UTF-8" }));
+    try std.testing.expect(!posixPrefersJapanese(.{ "C", null, "ja_JP.UTF-8" }));
+    try std.testing.expect(!posixPrefersJapanese(.{ "en_US.UTF-8", null, "ja_JP.UTF-8" }));
+    try std.testing.expect(!posixPrefersJapanese(.{ null, null, null }));
 }
 
 /// GUI application that owns the terminal hosting the latest agent event.

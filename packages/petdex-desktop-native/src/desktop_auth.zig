@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const plat = @import("plat.zig");
+const pkce = @import("pkce.zig");
+const secret_store = @import("secret_store.zig");
 
 pub const available = builtin.os.tag == .macos;
 pub const issuer = "https://clerk.petdex.dev";
@@ -8,37 +9,10 @@ pub const client_id = "LcThwEayl6KAA1Qm";
 pub const redirect_uri = "http://127.0.0.1:7777/callback";
 pub const scopes = "profile email openid offline_access";
 pub const library_url = "https://petdex.dev/api/desktop/library";
-pub const service = "dev.petdex.desktop-native";
+/// Keychain account under secret_store.service. Renaming it signs every
+/// existing user out.
 pub const account = "oauth";
 pub const max_pets = 64;
-
-const err_sec_success: c_int = 0;
-const err_sec_item_not_found: c_int = -25300;
-
-extern "c" fn SecKeychainFindGenericPassword(
-    keychain_or_array: ?*const anyopaque,
-    service_name_length: u32,
-    service_name: [*]const u8,
-    account_name_length: u32,
-    account_name: [*]const u8,
-    password_length: ?*u32,
-    password_data: ?*?*anyopaque,
-    item_ref: ?*?*anyopaque,
-) c_int;
-extern "c" fn SecKeychainAddGenericPassword(
-    keychain: ?*const anyopaque,
-    service_name_length: u32,
-    service_name: [*]const u8,
-    account_name_length: u32,
-    account_name: [*]const u8,
-    password_length: u32,
-    password_data: *const anyopaque,
-    item_ref: ?*?*anyopaque,
-) c_int;
-extern "c" fn SecKeychainItemModifyAttributesAndData(item_ref: *anyopaque, attr_list: ?*const anyopaque, length: u32, data: *const anyopaque) c_int;
-extern "c" fn SecKeychainItemDelete(item_ref: *anyopaque) c_int;
-extern "c" fn SecKeychainItemFreeContent(attr_list: ?*anyopaque, data: ?*anyopaque) c_int;
-extern "c" fn CFRelease(value: *const anyopaque) void;
 
 pub const Phase = enum { signed_out, loading, authorizing, exchanging, syncing, signed_in, failed, unavailable };
 pub const PetStatus = enum { pending, approved, rejected, caught };
@@ -72,9 +46,9 @@ pub const State = struct {
     access_token_len: usize = 0,
     refresh_token: [8192]u8 = @splat(0),
     refresh_token_len: usize = 0,
-    verifier: [86]u8 = @splat(0),
+    verifier: [pkce.verifier_len]u8 = @splat(0),
     verifier_len: usize = 0,
-    oauth_state: [43]u8 = @splat(0),
+    oauth_state: [pkce.state_len]u8 = @splat(0),
     oauth_state_len: usize = 0,
     email: [160]u8 = @splat(0),
     email_len: usize = 0,
@@ -172,19 +146,12 @@ fn copyField(dest: []u8, len: *usize, value: []const u8) bool {
 }
 
 pub fn begin(state: *State, url_buf: []u8) ?[]const u8 {
-    var verifier_raw: [64]u8 = undefined;
-    var state_raw: [32]u8 = undefined;
-    plat.fillRandom(&verifier_raw) catch return null;
-    plat.fillRandom(&state_raw) catch return null;
-    state.verifier_len = std.base64.url_safe_no_pad.Encoder.calcSize(verifier_raw.len);
-    _ = std.base64.url_safe_no_pad.Encoder.encode(state.verifier[0..state.verifier_len], &verifier_raw);
-    state.oauth_state_len = std.base64.url_safe_no_pad.Encoder.calcSize(state_raw.len);
-    _ = std.base64.url_safe_no_pad.Encoder.encode(state.oauth_state[0..state.oauth_state_len], &state_raw);
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(state.verifierSlice(), &digest, .{});
-    var challenge: [43]u8 = undefined;
-    const encoded = std.base64.url_safe_no_pad.Encoder.encode(&challenge, &digest);
-    const url = std.fmt.bufPrint(url_buf, "{s}/oauth/authorize?client_id={s}&response_type=code&redirect_uri=http%3A%2F%2F127.0.0.1%3A7777%2Fcallback&scope=profile%20email%20openid%20offline_access&code_challenge={s}&code_challenge_method=S256&state={s}", .{ issuer, client_id, encoded, state.oauthState() }) catch return null;
+    const p = pkce.generate() orelse return null;
+    state.verifier = p.verifier;
+    state.verifier_len = p.verifier.len;
+    state.oauth_state = p.state;
+    state.oauth_state_len = p.state.len;
+    const url = std.fmt.bufPrint(url_buf, "{s}/oauth/authorize?client_id={s}&response_type=code&redirect_uri=http%3A%2F%2F127.0.0.1%3A7777%2Fcallback&scope=profile%20email%20openid%20offline_access&code_challenge={s}&code_challenge_method=S256&state={s}", .{ issuer, client_id, &p.challenge, state.oauthState() }) catch return null;
     state.phase = .authorizing;
     state.error_len = 0;
     return url;
@@ -235,42 +202,21 @@ pub fn storedTokens(state: *const State, out: []u8) ?[]const u8 {
     return std.fmt.bufPrint(out, "{{\"access_token\":\"{s}\",\"refresh_token\":\"{s}\"}}", .{ state.accessToken(), state.refreshToken() }) catch null;
 }
 
+// Petdex sign-in stays macOS-only (`available`), so these only ever reach
+// the Keychain backend, which ignores the home argument.
 pub fn loadStoredSession(out: []u8) ?[]const u8 {
     if (!available) return null;
-    var password_len: u32 = 0;
-    var password_data: ?*anyopaque = null;
-    var item_ref: ?*anyopaque = null;
-    const status = SecKeychainFindGenericPassword(null, service.len, service.ptr, account.len, account.ptr, &password_len, &password_data, &item_ref);
-    defer {
-        if (password_data != null) _ = SecKeychainItemFreeContent(null, password_data);
-        if (item_ref) |item| CFRelease(item);
-    }
-    if (status != err_sec_success or password_len == 0 or password_len > out.len) return null;
-    const source: [*]const u8 = @ptrCast(password_data.?);
-    @memcpy(out[0..password_len], source[0..password_len]);
-    return out[0..password_len];
+    return secret_store.load("", account, out);
 }
 
 pub fn saveStoredSession(session: []const u8) bool {
-    if (!available or session.len == 0 or session.len > std.math.maxInt(u32)) return false;
-    var item_ref: ?*anyopaque = null;
-    const status = SecKeychainFindGenericPassword(null, service.len, service.ptr, account.len, account.ptr, null, null, &item_ref);
-    if (status == err_sec_success) {
-        defer CFRelease(item_ref.?);
-        return SecKeychainItemModifyAttributesAndData(item_ref.?, null, @intCast(session.len), session.ptr) == err_sec_success;
-    }
-    if (status != err_sec_item_not_found) return false;
-    return SecKeychainAddGenericPassword(null, service.len, service.ptr, account.len, account.ptr, @intCast(session.len), session.ptr, null) == err_sec_success;
+    if (!available) return false;
+    return secret_store.save("", account, session);
 }
 
 pub fn deleteStoredSession() bool {
     if (!available) return false;
-    var item_ref: ?*anyopaque = null;
-    const status = SecKeychainFindGenericPassword(null, service.len, service.ptr, account.len, account.ptr, null, null, &item_ref);
-    if (status == err_sec_item_not_found) return true;
-    if (status != err_sec_success) return false;
-    defer CFRelease(item_ref.?);
-    return SecKeychainItemDelete(item_ref.?) == err_sec_success;
+    return secret_store.delete("", account);
 }
 
 fn petStatus(value: []const u8) ?PetStatus {
@@ -322,6 +268,11 @@ pub fn applyLibrary(state: *State, allocator: std.mem.Allocator, body: []const u
     state.phase = .signed_in;
     state.error_len = 0;
     return true;
+}
+
+test {
+    _ = pkce;
+    _ = secret_store;
 }
 
 test "PKCE authorization uses a fresh verifier and state" {

@@ -9,6 +9,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PATCHES=(
   "$ROOT/patches/native-sdk-macos-headerpad.patch"
   "$ROOT/patches/native-sdk-windows-pet-input.patch"
+  "$ROOT/patches/native-sdk-escape-fallthrough.patch"
+  "$ROOT/patches/native-sdk-macos-ime-cursor.patch"
+  "$ROOT/patches/native-sdk-effects-text-measure.patch"
 )
 SDK="${NATIVE_SDK_PATH:-}"
 

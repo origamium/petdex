@@ -18,23 +18,67 @@ Runtime-loaded pet animating its real atlas in a chromeless window:
 
 ## Build & run
 
+Needs Zig 0.16.0 and git. From this directory:
+
 ```bash
-native build -Dautomation
-PETDEX_PET=boba ./zig-out/bin/petdex-desktop-native
-native automate screenshot pet-canvas
+make                         # release-flag build (what CI builds)
+make dev PETDEX_PET=boba     # automation build, then run it
+make test                    # unit tests
+make restart                 # macOS: rebuild and relaunch "Petdex Dev.app"
 ```
 
-Requires the `@native-sdk/cli` global (`bun add -g @native-sdk/cli`).
+The first `make` clones the Native SDK at the commit
+`.github/workflows/desktop-native-ci.yml` pins, applies the Petdex patches
+from `/patches`, and builds its `native` CLI into
+`~/.cache/petdex/native-sdk-<ref>`. Later runs reuse it; bumping the pin in
+the workflow switches to a fresh checkout.
 
-For the pinned desktop build, set `NATIVE_CLI` and `NATIVE_SDK_PATH` to the
-CLI and SDK checkout used by the matching release workflow. The build scripts
-apply the Petdex-owned macOS Mach-O headerpad patch before compiling; they
-fail if the SDK source no longer matches the pinned patch.
+`DEV_HOME=/tmp/petdex-home` runs against an isolated home, keeping your real
+settings, pets and chat history untouched. The installed Petdex app owns
+`127.0.0.1:7777`, so agent hooks keep reaching it until you quit it.
+
+With the automation build running, drive it with the SDK's CLI, e.g.
+`~/.cache/petdex/native-sdk-<ref>/zig-out/bin/native automate screenshot pet-canvas`.
+
+Builds pass `-Dtrace=off`. Without it the SDK appends a trace record per frame
+and timer to `native-sdk.jsonl` in the platform log directory (#714); the app
+deletes that file once it passes 32 MB.
+
+## Chat
+
+Click the pet to talk to it; double-click it for a catch-up on your coding
+agents and your last conversation, in its own voice. Cmd+K, the tray and the
+pet's menu toggle the chat. Choose ChatGPT or a local OpenAI-compatible server
+(LM Studio, Ollama) under Settings → Chat.
+
+The persona comes from the pet's `pet.json` (`displayName`, `description`). A
+`persona.md` next to `pet.json` describes the character in more depth, and
+`~/.petdex/personas/<slug>.md` overrides it for your own copy; either stands in
+for the description. The app keeps the framing: a desktop pet that answers in
+one to three short sentences of plain text. Until a reply's first words arrive,
+the chat shows one of the pet's `thinking` lines, picked at random, or
+"Thinking…" when it has none:
+
+```json
+{ "displayName": "古関ウイ", "thinking": ["眠いなあ…", "先生、何考えてるんだろう…"] }
+```
+
+History lives in `~/.petdex/petdex.db`, up to 400 messages per pet.
+
+## Language
+
+The app speaks English or Japanese. Settings → Appearance → Language offers
+Auto, English and 日本語. Auto follows the macOS preferred languages, the Windows
+display language, or `LC_ALL`, `LC_MESSAGES` and `LANG` on Linux. Windows and
+Linux draw Japanese only with a Japanese font set under Custom font file, so
+Auto stays English there without one. The menu bar changes after a restart;
+everything else changes at once. Prompts sent to the model stay English.
 
 ## Herdr
 
 The local Herdr plugin mirrors agent attention from Herdr into Petdex and
-preserves the exact pane ID so clicking the pet can focus that pane. Direct
+preserves the exact pane ID so clicking the agent in the Flock window can
+focus that pane. Direct
 Petdex hooks remain preferred for supported agents. See
 [`integrations/herdr`](integrations/herdr/README.md) for setup and filtering.
 
@@ -46,9 +90,7 @@ a task; Petdex reports the integration as connected only after receiving a real
 event. One top-level DSH session becomes one task card, while subagents,
 workflows, goals, and compaction update their parent card.
 
-Clicking the pet activates the currently running default browser without
-navigating to a URL or opening a tab. See
-[`integrations/dsh`](integrations/dsh/README.md) for setup, behavior, and
+See [`integrations/dsh`](integrations/dsh/README.md) for setup, behavior, and
 troubleshooting.
 
 ## Remote agents (SSH)
