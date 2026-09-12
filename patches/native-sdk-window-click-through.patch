@@ -1,0 +1,168 @@
+diff --git a/src/platform/types.zig b/src/platform/types.zig
+--- a/src/platform/types.zig
++++ b/src/platform/types.zig
+@@ -2136,6 +2136,9 @@
+     /// controls — chromeless windows have no system button to click.
+     /// Platforms without the concept leave this null.
+     minimize_window_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId) anyerror!void = null,
++    /// petdex: follow a live window's click-through (it is created with
++    /// `click_through`). Platforms that fix it at creation leave this null.
++    set_window_click_through_fn: ?*const fn (context: ?*anyopaque, window_id: WindowId, click_through: bool) anyerror!void = null,
+     /// Hand the ACTIVE pointer-down to the platform as a window-drag
+     /// gesture (the hidden-titlebar drag-region channel): the window
+     /// moves once the pointer actually moves — a plain click moves
+@@ -2460,6 +2463,12 @@
+         return set_fn(self.context, window_id, label, regions);
+     }
+ 
++    /// No-op where click-through is fixed at creation.
++    pub fn setWindowClickThrough(self: PlatformServices, window_id: WindowId, click_through: bool) anyerror!void {
++        const set_fn = self.set_window_click_through_fn orelse return;
++        return set_fn(self.context, window_id, click_through);
++    }
++
+     pub fn createView(self: PlatformServices, options: ViewOptions) anyerror!void {
+         if (self.create_view_fn) |create_fn| return create_fn(self.context, options);
+         if (options.kind == .webview) return self.createWebView(options.webViewOptions());
+diff --git a/src/platform/macos/root.zig b/src/platform/macos/root.zig
+--- a/src/platform/macos/root.zig
++++ b/src/platform/macos/root.zig
+@@ -154,6 +154,7 @@
+ extern fn native_sdk_appkit_resize_window(host: *AppKitHost, window_id: u64, width: f64, height: f64, anchor_bottom_center: c_int) c_int;
+ extern fn native_sdk_appkit_close_window(host: *AppKitHost, window_id: u64) c_int;
+ extern fn native_sdk_appkit_minimize_window(host: *AppKitHost, window_id: u64) c_int;
++extern fn native_sdk_appkit_set_window_click_through(host: *AppKitHost, window_id: u64, click_through: c_int) c_int;
+ extern fn native_sdk_appkit_start_window_drag(host: *AppKitHost, window_id: u64) c_int;
+ extern fn native_sdk_appkit_window_chrome_insets(host: *AppKitHost, window_id: u64, top: *f64, left: *f64, bottom: *f64, right: *f64, buttons_x: *f64, buttons_y: *f64, buttons_width: *f64, buttons_height: *f64) c_int;
+ extern fn native_sdk_appkit_create_view(host: *AppKitHost, window_id: u64, label: [*]const u8, label_len: usize, kind: c_int, parent: [*]const u8, parent_len: usize, x: f64, y: f64, width: f64, height: f64, layer: c_int, visible: c_int, enabled: c_int, role: [*]const u8, role_len: usize, accessibility_label: [*]const u8, accessibility_label_len: usize, text: [*]const u8, text_len: usize, command: [*]const u8, command_len: usize) c_int;
+@@ -592,6 +593,7 @@
+                 .move_window_fn = moveWindow,
+                 .resize_window_fn = resizeWindow,
+                 .minimize_window_fn = minimizeWindow,
++                .set_window_click_through_fn = setWindowClickThrough,
+                 .start_window_drag_fn = startWindowDrag,
+                 .window_chrome_fn = windowChrome,
+                 .create_view_fn = createView,
+@@ -1133,6 +1135,11 @@
+     if (native_sdk_appkit_minimize_window(self.host, window_id) == 0) return error.WindowNotFound;
+ }
+ 
++fn setWindowClickThrough(context: ?*anyopaque, window_id: platform_mod.WindowId, click_through: bool) anyerror!void {
++    const self: *MacPlatform = @ptrCast(@alignCast(context.?));
++    if (native_sdk_appkit_set_window_click_through(self.host, window_id, @intFromBool(click_through)) == 0) return error.WindowNotFound;
++}
++
+ fn startWindowDrag(context: ?*anyopaque, window_id: platform_mod.WindowId) anyerror!void {
+     const self: *MacPlatform = @ptrCast(@alignCast(context.?));
+     if (native_sdk_appkit_start_window_drag(self.host, window_id) == 0) return error.WindowNotFound;
+diff --git a/src/platform/macos/appkit_host.h b/src/platform/macos/appkit_host.h
+--- a/src/platform/macos/appkit_host.h
++++ b/src/platform/macos/appkit_host.h
+@@ -372,6 +372,10 @@
+ // window controls on chromeless windows. Returns 0 when the window id
+ // is unknown.
+ int native_sdk_appkit_minimize_window(native_sdk_appkit_host_t *host, uint64_t window_id);
++// petdex: click-through on a live window (NSWindow ignoresMouseEvents),
++// so an overlay takes clicks only while something is under the cursor.
++// Returns 0 when the window id is unknown.
++int native_sdk_appkit_set_window_click_through(native_sdk_appkit_host_t *host, uint64_t window_id, int click_through);
+ // Window-drag region channel: called during dispatch of the pointer-down
+ // that starts the gesture. Single click hands the event to
+ // -[NSWindow performWindowDragWithEvent:] (moves only on actual
+diff --git a/src/platform/macos/appkit_host.m b/src/platform/macos/appkit_host.m
+--- a/src/platform/macos/appkit_host.m
++++ b/src/platform/macos/appkit_host.m
+@@ -5513,6 +5513,12 @@
+ }
+ 
+ - (BOOL)acceptsFirstResponder {
++    return YES;
++}
++
++// petdex: a click on a window that is not key (a non-activating overlay
++// panel) lands on the first press instead of only focusing the window.
++- (BOOL)acceptsFirstMouse:(NSEvent *)event {
+     return YES;
+ }
+ 
+@@ -10361,6 +10367,20 @@
+     if (!object.windows[@(window_id)]) return 0;
+     [object miniaturizeWindowWithId:window_id];
+     return 1;
++}
++
++int native_sdk_appkit_set_window_click_through(native_sdk_appkit_host_t *host, uint64_t window_id, int click_through) {
++    NativeSdkAppKitHost *object = (__bridge NativeSdkAppKitHost *)host;
++    __block int ok = 0;
++    void (^work)(void) = ^{
++        NSWindow *window = object.windows[@(window_id)];
++        if (!window) return;
++        window.ignoresMouseEvents = click_through != 0;
++        ok = 1;
++    };
++    if (NSThread.isMainThread) work();
++    else dispatch_sync(dispatch_get_main_queue(), work);
++    return ok;
+ }
+ 
+ int native_sdk_appkit_start_window_drag(native_sdk_appkit_host_t *host, uint64_t window_id) {
+diff --git a/src/platform/macos/cef_host.mm b/src/platform/macos/cef_host.mm
+--- a/src/platform/macos/cef_host.mm
++++ b/src/platform/macos/cef_host.mm
+@@ -2165,6 +2165,14 @@
+     dispatch_async(dispatch_get_main_queue(), ^{
+         [window miniaturize:nil];
+     });
++    return 1;
++}
++
++// petdex: this host ignores companion chrome flags, click-through included.
++int native_sdk_appkit_set_window_click_through(native_sdk_appkit_host_t *host, uint64_t window_id, int click_through) {
++    (void)host;
++    (void)window_id;
++    (void)click_through;
+     return 1;
+ }
+ 
+diff --git a/src/runtime/ui_app.zig b/src/runtime/ui_app.zig
+--- a/src/runtime/ui_app.zig
++++ b/src/runtime/ui_app.zig
+@@ -286,7 +286,8 @@
+             resizable: bool = true,
+             /// Companion-window chrome, fixed at create time like
+             /// `resizable` (see the manifest window fields of the same
+-            /// names).
++            /// names). petdex: `click_through` alone also follows a live
++            /// window where the platform can (see `applyWindows`).
+             floating: bool = false,
+             fullscreen_overlay: bool = false,
+             transparent: bool = false,
+@@ -726,6 +727,7 @@
+             popup_anchor_x: f32 = 0,
+             popup_anchor_y: f32 = 0,
+             is_popup: bool = false,
++            click_through: bool = false,
+             /// The device scale of THIS window's surface, adopted from
+             /// its own frame and resize events. Secondary windows can sit
+             /// on a different-density monitor than the main canvas, so
+@@ -1856,6 +1858,12 @@
+                     // Already live: the close Msg follows the model.
+                     const slot = &self.window_slots[slot_index];
+                     slot.on_close = descriptor.on_close;
++                    if (slot.click_through != descriptor.click_through) {
++                        runtime.options.platform.services.setWindowClickThrough(slot.window_id, descriptor.click_through) catch |err| {
++                            ui_app_log.warn("declared window '{s}' click-through update failed: {s}", .{ descriptor.label, @errorName(err) });
++                        };
++                        slot.click_through = descriptor.click_through;
++                    }
+                     if (descriptor.popup_parent != null) {
+                         const anchor_x = descriptor.x orelse 0;
+                         const anchor_y = descriptor.y orelse 0;
+@@ -1984,6 +1992,7 @@
+             slot.popup_anchor_x = descriptor.x orelse 0;
+             slot.popup_anchor_y = descriptor.y orelse 0;
+             slot.is_popup = descriptor.popup_parent != null;
++            slot.click_through = descriptor.click_through;
+             // Until this window's first frame reports its real density,
+             // assume the main canvas's — new windows usually open on the
+             // same monitor, and the installing frame corrects the guess.
