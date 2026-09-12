@@ -97,6 +97,35 @@ pub fn briefing(out: []u8, notes: []const Note) []const u8 {
     return domain.utf8Floor(w.buffered(), out.len);
 }
 
+/// Unprompted small talk: one line out of nowhere, in the pet's voice.
+/// Sent as the only turn, so it stays light; the pet's last lines are
+/// quoted instead, so it keeps its language and doesn't repeat itself.
+pub fn chatter(out: []u8, recent: []const []const u8) []const u8 {
+    var w: std.Io.Writer = .fixed(out);
+    w.writeAll("(From the app, not the user: nobody asked you anything.) " ++
+        "In character, say one short line of small talk to the user, out of nowhere: " ++
+        "a passing thought, a feeling, something you noticed. Don't ask them to do anything. " ++
+        "One sentence of plain text, in the language of your last lines below, " ++
+        "or of your description if there are none.") catch {};
+    lastLines(&w, recent);
+    return domain.utf8Floor(w.buffered(), out.len);
+}
+
+fn lastLines(w: *std.Io.Writer, recent: []const []const u8) void {
+    if (recent.len == 0) return;
+    w.writeAll("\nYour last lines, not to repeat:") catch {};
+    for (recent) |line| w.print("\n- {s}", .{line}) catch {};
+}
+
+test "small talk asks for one unprompted line and quotes the last ones" {
+    const t = std.testing;
+    var out: [1024]u8 = undefined;
+    const c = chatter(&out, &.{ "おはよう、先生。", "眠い…" });
+    try t.expect(std.mem.startsWith(u8, c, "(From the app, not the user"));
+    try t.expect(std.mem.endsWith(u8, c, "\n- おはよう、先生。\n- 眠い…"));
+    try t.expect(std.mem.indexOf(u8, chatter(&out, &.{}), "not to repeat") == null);
+}
+
 test "a briefing lists each agent after the request" {
     const t = std.testing;
     var out: [4096]u8 = undefined;

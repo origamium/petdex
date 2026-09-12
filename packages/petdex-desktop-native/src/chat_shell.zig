@@ -54,6 +54,8 @@ const chatgpt_account = "chatgpt";
 const reply_wave_ms: u32 = 1500;
 const failed_ms: u32 = 2500;
 const excerpt_bytes = 190;
+/// The small-talk intervals Settings offers, in minutes; 0 is off.
+pub const chatter_choices = [_]u16{ 0, 5, 15, 30, 60 };
 
 pub const ChatgptPhase = enum { signed_out, authorizing, exchanging, signed_in, failed };
 const TokenPurpose = enum { none, sign_in, refresh };
@@ -119,6 +121,13 @@ pub const State = struct {
     /// Past exchanges instead of the latest reply.
     history: bool = false,
     place: Place = .{},
+    /// Minutes between unprompted small talk; 0 is off (Settings).
+    chatter_minutes: u16 = 0,
+    /// When the next small talk is due; 0 until scheduled.
+    next_chatter_ms: i64 = 0,
+    /// Something the pet said unprompted just went to its bubble; main
+    /// opens that bubble as a card on its next drain.
+    speak_pending: bool = false,
 
     pub fn petSlug(self: *const State) []const u8 {
         return self.pet[0..self.pet_len];
@@ -188,6 +197,7 @@ pub fn boot(model: *Model) void {
 pub fn poll(model: *Model, fx: *Effects) void {
     if (model.chat.open) syncPet(model, fx);
     follow(model, fx);
+    chatterTick(model, fx);
     const callback = hook_server.chatgpt_mailbox.take() orelse return;
     const st = &model.chat;
     if (st.chatgpt != .authorizing) return;
@@ -221,6 +231,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .chat_response => |response| onResponse(model, response, fx),
         .set_chat_stack => |raw| {
             st.stack = @intCast(std.math.clamp(raw, 1, max_stack));
+            saveConfig(st);
+        },
+        .set_chatter => |raw| {
+            st.chatter_minutes = @intCast(@min(raw, chatter_choices[chatter_choices.len - 1]));
+            // The clock restarts from the new interval.
+            st.next_chatter_ms = 0;
             saveConfig(st);
         },
         .set_chat_provider => |raw| {
@@ -282,11 +298,86 @@ fn brief(model: *Model, fx: *Effects) void {
     const st = &model.chat;
     // Unconfigured, the reply card already points at Settings.
     if (!st.ready() or st.session.busy()) return;
-    const action = st.session.brief(needsRefresh(st, fx));
+    const action = st.session.brief(.briefing, needsRefresh(st, fx));
     if (action == .none) return;
     st.history = false;
     st.scroll = 0;
     begin(model, action, fx);
+}
+
+/// The pet speaks first, unprompted: into its own bubble, never the chat
+/// window, and without touching its pose. False when it can't right now:
+/// unconfigured, the chat is open (the user is already there), bubbles
+/// are off or in Focus, or a request is still on the wire.
+pub fn speak(model: *Model, prompt: session.Prompt, fx: *Effects) bool {
+    const st = &model.chat;
+    if (st.open or !model.bubbles_enabled or model.focus_mode or !st.ready()) return false;
+    // A chat never opened since launch has no pet or persona loaded yet.
+    if (st.pet_len == 0) syncPet(model, fx);
+    if (st.pet_len == 0) return false;
+    const action = st.session.brief(prompt, needsRefresh(st, fx));
+    if (action == .none) return false;
+    run(model, action, fx);
+    return true;
+}
+
+/// Small talk on its clock, checked on every poll tick: no timer, and a
+/// Mac waking from sleep past the due time just talks once.
+fn chatterTick(model: *Model, fx: *Effects) void {
+    const st = &model.chat;
+    if (st.chatter_minutes == 0) {
+        st.next_chatter_ms = 0;
+        return;
+    }
+    const now = fx.wallMs();
+    if (st.next_chatter_ms != 0 and now < st.next_chatter_ms) return;
+    // Scheduling the first time; talking (or not, when it can't) after.
+    if (st.next_chatter_ms != 0) _ = speak(model, .chatter, fx);
+    st.next_chatter_ms = nextChatterMs(now, st.chatter_minutes, randomU64());
+}
+
+/// The interval give or take a quarter, so the pet never ticks like a
+/// clock.
+pub fn nextChatterMs(now: i64, minutes: u16, rand: u64) i64 {
+    const base: i64 = @as(i64, minutes) * std.time.ms_per_min;
+    const spread: u64 = @intCast(@divTrunc(base, 2));
+    const offset: i64 = if (spread > 0) @intCast(rand % spread) else 0;
+    return now + base - @divTrunc(base, 4) + offset;
+}
+
+test "small talk comes due within a quarter of its interval" {
+    const t = std.testing;
+    const five: i64 = 5 * std.time.ms_per_min;
+    try t.expectEqual(@as(i64, 1000 + five * 3 / 4), nextChatterMs(1000, 5, 0));
+    try t.expect(nextChatterMs(1000, 5, std.math.maxInt(u64)) < 1000 + five * 5 / 4);
+    try t.expect(nextChatterMs(1000, 5, 12345) >= 1000 + five * 3 / 4);
+}
+
+fn randomU64() u64 {
+    var seed: [8]u8 = @splat(0);
+    plat.fillRandom(&seed) catch {};
+    return std.mem.readInt(u64, &seed, .little);
+}
+
+/// Small talk's prompt, the pet's last few lines quoted in it.
+fn chatterPrompt(st: *const State) []const u8 {
+    var lines: [3][]const u8 = undefined;
+    return persona.chatter(&brief_buf, lastLines(st, &lines));
+}
+
+/// The pet's newest replies, newest first, each cut to a quotable length.
+fn lastLines(st: *const State, out: [][]const u8) []const []const u8 {
+    const transcript = &st.session.transcript;
+    var n: usize = 0;
+    var i = transcript.len();
+    while (i > 0 and n < out.len) {
+        i -= 1;
+        const m = transcript.get(i);
+        if (m.role != .assistant) continue;
+        out[n] = domain.utf8Floor(m.text, 200);
+        n += 1;
+    }
+    return out[0..n];
 }
 
 var brief_buf: [4096]u8 = undefined;
@@ -460,9 +551,7 @@ fn keepThinking(lines: []const []const u8) void {
 fn pickThinking(st: *State) void {
     st.thinking_len = 0;
     if (thinking_count == 0) return;
-    var seed: [8]u8 = @splat(0);
-    plat.fillRandom(&seed) catch {};
-    setField(&st.thinking, &st.thinking_len, thinking_lines[std.mem.readInt(u64, &seed, .little) % thinking_count]);
+    setField(&st.thinking, &st.thinking_len, thinking_lines[randomU64() % thinking_count]);
 }
 
 // ── Conversation ──────────────────────────────────────────────────────
@@ -502,7 +591,8 @@ fn run(model: *Model, action: session.Action, fx: *Effects) void {
         .request => startRequest(model, fx),
         .refresh => startRefresh(model, fx),
         .done => finishReply(model, fx),
-        .failed => app.applyState(model, .failed, failed_ms, fx),
+        // Unprompted, a failure is nobody's business: no pose, no error row.
+        .failed => if (model.chat.session.proactive()) model.chat.session.quiet() else app.applyState(model, .failed, failed_ms, fx),
     }
 }
 
@@ -511,13 +601,21 @@ fn startRequest(model: *Model, fx: *Effects) void {
     st.stream_kind = st.kind;
     var context: [session.context_messages]domain.Message = undefined;
     const recent = st.session.context(&context);
-    // A briefing ends the context with the app's prompt, never stored.
-    var with_brief: [session.context_messages + 1]domain.Message = undefined;
-    const turns: []const domain.Message = if (st.session.briefing) blk: {
-        @memcpy(with_brief[0..recent.len], recent);
-        with_brief[recent.len] = .{ .role = .user, .text = briefingPrompt(model) };
-        break :blk with_brief[0 .. recent.len + 1];
-    } else recent;
+    // The pet speaking first ends the context with the app's prompt, never
+    // stored. Small talk is light: that prompt alone, no history.
+    var with_prompt: [session.context_messages + 1]domain.Message = undefined;
+    const turns: []const domain.Message = switch (st.session.prompt) {
+        .none => recent,
+        .briefing => blk: {
+            @memcpy(with_prompt[0..recent.len], recent);
+            with_prompt[recent.len] = .{ .role = .user, .text = briefingPrompt(model) };
+            break :blk with_prompt[0 .. recent.len + 1];
+        },
+        .chatter => blk: {
+            with_prompt[0] = .{ .role = .user, .text = chatterPrompt(st) };
+            break :blk with_prompt[0..1];
+        },
+    };
     var cache_key: [80]u8 = undefined;
     const target: provider.Target = switch (st.kind) {
         .codex => .{
@@ -576,12 +674,20 @@ fn finishReply(model: *Model, fx: *Effects) void {
         _ = h.append(st.petSlug(), .assistant, reply, st.stream_kind, fx.wallMs());
         h.prune(st.petSlug());
     }
-    app.applyState(model, .waving, reply_wave_ms, fx);
-    if (!st.open and st.bubble_excerpt) {
+    // ponytail: unprompted lines are saved like any reply above; small talk
+    // every 5 minutes pushes real history past the 400-message cap in about
+    // a day and a half. Skip saving them if that bites.
+    const unprompted = st.session.proactive();
+    // Unprompted, the pet keeps its pose: one waiting on an agent stays
+    // waiting, and its chime escalation with it.
+    if (!unprompted) app.applyState(model, .waving, reply_wave_ms, fx);
+    if (unprompted or (!st.open and st.bubble_excerpt)) {
         var buf: [excerpt_bytes + 3]u8 = undefined;
         const cut = domain.utf8Floor(reply, excerpt_bytes);
         const text = if (cut.len < reply.len) std.fmt.bufPrint(&buf, "{s}…", .{cut}) catch cut else cut;
         _ = hook_server.mailbox.setBubble("petdex-chat", text, "petdex", st.petName(), false);
+        // Said unprompted, it opens as a card, read without a click.
+        st.speak_pending = unprompted;
     }
 }
 
@@ -785,12 +891,13 @@ fn loadConfig(st: *State) void {
     setText(&st.codex_model, cfg.codex.model);
     st.bubble_excerpt = cfg.bubble_excerpt;
     st.stack = std.math.clamp(cfg.stack, 1, max_stack);
+    st.chatter_minutes = @min(cfg.chatter_minutes, chatter_choices[chatter_choices.len - 1]);
 }
 
 fn saveConfig(st: *const State) void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    var cfg: config.Config = .{ .provider = st.kind, .bubble_excerpt = st.bubble_excerpt, .stack = st.stack };
+    var cfg: config.Config = .{ .provider = st.kind, .bubble_excerpt = st.bubble_excerpt, .stack = st.stack, .chatter_minutes = st.chatter_minutes };
     cfg.codex.model = st.codexModel();
     cfg.openai_compat.base_url = st.localUrl();
     cfg.openai_compat.model = st.localModel();

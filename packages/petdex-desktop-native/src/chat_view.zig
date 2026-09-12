@@ -467,7 +467,28 @@ pub fn settingsSection(ui: *AppUi, model: *const Model) AppUi.Node {
             }),
             stackPicker(ui, st),
         })),
+        panel(ui, ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
+            ui.column(.{ .grow = 1 }, .{
+                ui.text(.{}, i18n.t("Small talk", "ひとりごと")),
+                muted(ui, i18n.t("Now and then, your pet says something on its own", "ときどき、ペットが自分から話しかけます")),
+            }),
+            chatterPicker(ui, st),
+        })),
     });
+}
+
+fn chatterPicker(ui: *AppUi, st: *const State) AppUi.Node {
+    var buttons: [chat_shell.chatter_choices.len]AppUi.Node = undefined;
+    for (&buttons, chat_shell.chatter_choices) |*button, minutes| button.* = ui.button(.{
+        .size = .sm,
+        .variant = if (st.chatter_minutes == minutes) .primary else .secondary,
+        .on_press = Msg{ .set_chatter = minutes },
+    }, switch (minutes) {
+        0 => i18n.t("Off", "オフ"),
+        60 => i18n.t("1 h", "1時間"),
+        else => i18n.fmt(ui, "{d} min", "{d}分", .{minutes}),
+    });
+    return ui.row(.{ .gap = 4 }, @as([]const AppUi.Node, &buttons));
 }
 
 fn stackPicker(ui: *AppUi, st: *const State) AppUi.Node {
@@ -635,7 +656,7 @@ test "the reply card thinks until the first words, a briefing included" {
     try std.testing.expectEqualStrings("hey", speech(st, &buf).text);
     // A briefing adds no user turn: the old reply joins the stack and
     // the card thinks.
-    try std.testing.expectEqual(chat.session.Action.request, s.brief(false));
+    try std.testing.expectEqual(chat.session.Action.request, s.brief(.briefing, false));
     try std.testing.expectEqualStrings(st.thinkingText(), speech(st, &buf).text);
     try std.testing.expectEqual(@as(usize, 2), stacked(&model).to);
     // The first words replace the thinking line; the old reply stays stacked.

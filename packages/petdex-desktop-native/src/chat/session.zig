@@ -24,6 +24,16 @@ pub const stream_key_base: u64 = @as(u64, 1) << 41;
 
 pub const Phase = enum { idle, refreshing, streaming, failed };
 
+/// What the app asks the pet for when it speaks first; `none` for a reply
+/// to the user.
+pub const Prompt = enum {
+    none,
+    /// A double tap: catch the user up.
+    briefing,
+    /// Unprompted small talk, on the chatter clock.
+    chatter,
+};
+
 pub const Action = enum {
     none,
     /// Build the request from `context()` and start streaming it.
@@ -136,9 +146,9 @@ pub const Session = struct {
     stream_failed: bool = false,
     /// Part of the last reply was lost to the SDK's line bounds.
     lost_text: bool = false,
-    /// The pet speaks first: the shell ends the request's context with
-    /// its briefing prompt, and no user turn enters the transcript.
-    briefing: bool = false,
+    /// The pet speaks first: the shell ends the request with the app's
+    /// prompt of this kind, and no user turn enters the transcript.
+    prompt: Prompt = .none,
     /// The key of the request still open on the wire, until its terminal
     /// Msg arrives. A stopped or reset request keeps it: its fetch winds
     /// down asynchronously, and nothing new goes out before it has, so the
@@ -159,6 +169,19 @@ pub const Session = struct {
     /// The fetch with `key` has ended, a cancelled one included.
     pub fn settle(self: *Session, key: u64) void {
         if (self.wire == key) self.wire = null;
+    }
+
+    /// Nothing on screen asked for this request: the pet spoke unprompted.
+    pub fn proactive(self: *const Session) bool {
+        return self.prompt == .chatter;
+    }
+
+    /// Let a failed unprompted request pass as if it never went out: no
+    /// error row and no Retry for something the user never asked for.
+    pub fn quiet(self: *Session) void {
+        if (self.phase == .failed) self.phase = .idle;
+        self.err_len = 0;
+        self.prompt = .none;
     }
 
     /// The effect key of the current stream. Anything tagged with an
@@ -204,7 +227,7 @@ pub const Session = struct {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return .none;
         self.transcript.append(.user, trimmed);
-        self.briefing = false;
+        self.prompt = .none;
         return self.begin(needs_refresh);
     }
 
@@ -212,7 +235,7 @@ pub const Session = struct {
     /// or the failed request was a briefing.
     pub fn retry(self: *Session, needs_refresh: bool) Action {
         if (self.phase != .failed or !self.canSend()) return .none;
-        if (!self.briefing) {
+        if (self.prompt == .none) {
             const m = self.transcript.last() orelse return .none;
             if (m.role != .user) return .none;
         }
@@ -220,11 +243,11 @@ pub const Session = struct {
     }
 
     /// Let the pet speak first: a request with no new user turn, which
-    /// the shell completes with its briefing prompt. The reply lands like
+    /// the shell completes with the app's `prompt`. The reply lands like
     /// any other.
-    pub fn brief(self: *Session, needs_refresh: bool) Action {
+    pub fn brief(self: *Session, prompt: Prompt, needs_refresh: bool) Action {
         if (!self.canSend()) return .none;
-        self.briefing = true;
+        self.prompt = prompt;
         return self.begin(needs_refresh);
     }
 
@@ -357,7 +380,7 @@ test "the current reply is the one being said, none while thinking or failed" {
     s.transcript.append(.user, "hi");
     s.transcript.append(.assistant, "hey");
     try t.expectEqualStrings("hey", s.currentReply().?);
-    _ = s.brief(false);
+    _ = s.brief(.briefing, false);
     try t.expect(s.currentReply() == null);
     _ = s.onResponse(.openai_compat, s.streamKey(), 0, "down");
     try t.expect(s.currentReply() == null);
@@ -372,8 +395,8 @@ test "a briefing streams a reply without a user turn and can be retried" {
 
     s.transcript.append(.user, "hi");
     s.transcript.append(.assistant, "hey");
-    try t.expectEqual(Action.request, s.brief(false));
-    try t.expect(s.briefing);
+    try t.expectEqual(Action.request, s.brief(.briefing, false));
+    try t.expectEqual(Prompt.briefing, s.prompt);
     try t.expectEqual(@as(usize, 2), s.transcript.len());
     try t.expectEqual(Action.failed, s.onResponse(.openai_compat, s.streamKey(), 0, "down"));
     try t.expectEqual(Action.request, s.retry(false));
@@ -382,7 +405,22 @@ test "a briefing streams a reply without a user turn and can be retried" {
     try t.expectEqual(Action.done, s.onResponse(.openai_compat, key, 200, null));
     try t.expectEqualStrings("Claude is waiting.", s.lastReply().?);
     try t.expectEqual(Action.request, s.submit("thanks", false));
-    try t.expect(!s.briefing);
+    try t.expectEqual(Prompt.none, s.prompt);
+}
+
+test "unprompted small talk that fails passes quietly" {
+    const s = newSession();
+    defer t.allocator.destroy(s);
+    s.transcript.append(.user, "hi");
+    s.transcript.append(.assistant, "hey");
+    try t.expectEqual(Action.request, s.brief(.chatter, false));
+    try t.expect(s.proactive());
+    try t.expectEqual(Action.failed, s.onResponse(.openai_compat, s.streamKey(), 0, "down"));
+    s.quiet();
+    try t.expectEqual(Phase.idle, s.phase);
+    try t.expectEqualStrings("", s.errorText());
+    try t.expectEqual(Action.none, s.retry(false));
+    try t.expectEqualStrings("hey", s.currentReply().?);
 }
 
 test "one request on the wire at a time" {
@@ -392,11 +430,11 @@ test "one request on the wire at a time" {
     try t.expectEqual(Action.request, s.submit("hi", false));
     const first = s.streamKey();
     // A double tap while the reply streams.
-    try t.expectEqual(Action.none, s.brief(false));
+    try t.expectEqual(Action.none, s.brief(.briefing, false));
     // Stopped, but its fetch has not wound down yet.
     s.cancel();
     try t.expectEqual(Action.none, s.submit("again", false));
-    try t.expectEqual(Action.none, s.brief(false));
+    try t.expectEqual(Action.none, s.brief(.briefing, false));
     // New Chat and a pet switch reset the transcript, not the wire.
     s.load(&.{});
     try t.expectEqual(Action.none, s.submit("again", false));
