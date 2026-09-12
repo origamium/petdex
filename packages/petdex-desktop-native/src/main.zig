@@ -4123,7 +4123,12 @@ fn syncBubbleWindow(model: *Model, fx: *Effects) void {
         bubble_window_w = bubble_w;
         bubble_window_h = bubble_h;
     }
-    const cur = fx.moveWindow("bubble", 0, 0, false) orelse return;
+    // No window yet: this bubble set was just declared. Whatever window
+    // the flag described is gone, and the new one must open hidden.
+    const cur = fx.moveWindow("bubble", 0, 0, false) orelse {
+        model.bubble_placed = false;
+        return;
+    };
     const want_x = bubbleWantX(model, bubble_w);
     const want_y = bubbleWantY(model, bubble_h);
     if (bubbleMovePlan(cur.x, cur.y, want_x, want_y)) |plan| {
