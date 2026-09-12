@@ -298,6 +298,10 @@ pub const Mailbox = struct {
         const model_len = slot.model_len;
         const effort = slot.effort;
         const effort_len = slot.effort_len;
+        // So does the Warp pane: a sender that has to look it up does so
+        // at a turn's start and end, not on every tool call.
+        const focus_url = slot.focus_url;
+        const focus_url_len = slot.focus_url_len;
         // Senders without a session id share the "" key; another agent
         // landing there must not wear this one's model.
         const same_agent = std.mem.eql(u8, slot.agent[0..slot.agent_len], agent[0..@min(agent.len, slot.agent.len)]);
@@ -307,6 +311,8 @@ pub const Mailbox = struct {
             slot.model_len = model_len;
             slot.effort = effort;
             slot.effort_len = effort_len;
+            slot.focus_url = focus_url;
+            slot.focus_url_len = focus_url_len;
         }
         const sn = @min(session.len, slot.session.len);
         @memcpy(slot.session[0..sn], session[0..sn]);
@@ -1365,9 +1371,12 @@ test "a conversation keeps its model and effort across updates, and a new one st
     var mb: Mailbox = .{};
     _ = mb.setBubble("s1", "Thinking…", "claude", "", true);
     mb.setBubbleModel("s1", "claude-opus-5", "high");
+    mb.setBubbleFocusUrl("s1", "warp://session/0123456789abcdef0123456789abcdef");
     _ = mb.setBubble("s1", "Reading main.zig", "claude", "", true);
     try std.testing.expectEqualStrings("claude-opus-5", mb.bubbles[0].modelSlice());
     try std.testing.expectEqualStrings("high", mb.bubbles[0].effortSlice());
+    // The Warp pane stays too: Codex looks it up at a turn's ends only.
+    try std.testing.expectEqualStrings("warp://session/0123456789abcdef0123456789abcdef", mb.bubbles[0].focusUrlSlice());
     // An empty value leaves the one already known.
     mb.setBubbleModel("s1", "", "max");
     try std.testing.expectEqualStrings("claude-opus-5", mb.bubbles[0].modelSlice());
@@ -1379,6 +1388,7 @@ test "a conversation keeps its model and effort across updates, and a new one st
     // Another agent on the same key starts blank.
     _ = mb.setBubble("s1", "Reading", "codex", "", true);
     try std.testing.expectEqualStrings("", mb.bubbles[0].modelSlice());
+    try std.testing.expectEqualStrings("", mb.bubbles[0].focusUrlSlice());
     _ = mb.setBubble("s2", "Thinking…", "codex", "", true);
     try std.testing.expectEqualStrings("", mb.bubbles[1].modelSlice());
 }

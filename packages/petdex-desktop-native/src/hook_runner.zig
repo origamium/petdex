@@ -92,8 +92,14 @@ pub fn run(phase: []const u8, arg_agent: ?[]const u8, origin_app: plat.OriginApp
     var effort_buf: [16]u8 = undefined;
     var settings: Settings = if (isPromptPhase(phase) or isStopPhase(phase)) modelSettings(payload, &scan_buf, &model_buf, &effort_buf) else .{};
     // Warp hands each pane a link back to itself. Every event carries it,
-    // so the card can bring that pane forward.
-    settings.focus_url = plat.safeWarpFocusUrl(warp_focus_raw) orelse "";
+    // so the card can bring that pane forward. Codex's terminal UI runs its
+    // sessions, hooks included, in a shared background app-server started
+    // outside Warp: there the link is looked up from the terminal UI at a
+    // turn's start and end, and the server keeps it in between.
+    var focus_buf: [64]u8 = undefined;
+    const hosted = std.mem.eql(u8, agent, "codex") and (isPromptPhase(phase) or isStopPhase(phase));
+    settings.focus_url = plat.safeWarpFocusUrl(warp_focus_raw) orelse
+        (if (hosted) plat.warpFocusUrlOf("codex", jsonString(payload, "cwd") orelse "", &focus_buf) else null) orelse "";
 
     var text_buf: [256]u8 = undefined;
     var text = formatBubble(phase, payload, &text_buf) orelse "";

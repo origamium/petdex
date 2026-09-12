@@ -711,6 +711,10 @@ const mac_c = struct {
     extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
     extern "c" fn close(fd: c_int) c_int;
     extern "c" fn ttyname_r(fd: c_int, buf: [*]u8, len: usize) c_int;
+    // libproc
+    extern "c" fn proc_listallpids(buffer: ?*anyopaque, buffersize: c_int) c_int;
+    extern "c" fn proc_name(pid: c_int, buffer: *anyopaque, buffersize: u32) c_int;
+    extern "c" fn proc_pidinfo(pid: c_int, flavor: c_int, arg: u64, buffer: ?*anyopaque, buffersize: c_int) c_int;
 };
 
 pub fn controllingTty(buf: []u8) ?[]const u8 {
@@ -777,6 +781,107 @@ pub fn safeWarpFocusUrl(value: ?[]const u8) ?[]const u8 {
         return url;
     }
     return null;
+}
+
+/// libproc's `struct proc_vnodepathinfo` (sys/proc_info.h): the current
+/// directory's `vnode_info` (152 bytes) and path, then the root's.
+const VnodePathInfo = extern struct {
+    cdir_vnode: [152]u8 align(8),
+    cdir_path: [1024]u8,
+    rdir_vnode: [152]u8,
+    rdir_path: [1024]u8,
+};
+const proc_pidvnodepathinfo: c_int = 9;
+const ctl_kern: c_int = 1;
+const kern_procargs2: c_int = 49;
+
+/// The Warp pane of this user's one `name` process that runs in Warp from
+/// `cwd`. Codex's terminal UI hands its sessions to a shared background
+/// app-server started outside Warp, and that server runs the hooks with its
+/// own environment: only the terminal UI knows its pane, so a hook finds it
+/// by the session's directory. Null unless exactly one pane matches.
+// ponytail: two Codex panes in one directory can't be told apart, so neither
+// gets a link; doing better needs the app-server to name its client.
+pub fn warpFocusUrlOf(name: []const u8, cwd: []const u8, out: *[64]u8) ?[]const u8 {
+    if (comptime builtin.os.tag != .macos) return null;
+    if (cwd.len == 0) return null;
+    var pids: [4096]c_int = undefined;
+    const listed = mac_c.proc_listallpids(&pids, @sizeOf(@TypeOf(pids)));
+    if (listed <= 0) return null;
+    var found: ?[]const u8 = null;
+    var info: VnodePathInfo = undefined;
+    var args: [128 * 1024]u8 = undefined;
+    for (pids[0..@min(@as(usize, @intCast(listed)), pids.len)]) |pid| {
+        var name_buf: [64]u8 = undefined;
+        const name_len = mac_c.proc_name(pid, &name_buf, name_buf.len);
+        if (name_len <= 0 or !std.mem.eql(u8, name_buf[0..@intCast(name_len)], name)) continue;
+        if (!std.mem.eql(u8, processCwd(pid, &info) orelse continue, cwd)) continue;
+        const env = processArgs(pid, &args) orelse continue;
+        if (!std.mem.eql(u8, procArgsEnv(env, "TERM_PROGRAM") orelse continue, "WarpTerminal")) continue;
+        const url = safeWarpFocusUrl(procArgsEnv(env, "WARP_FOCUS_URL")) orelse continue;
+        if (found) |f| {
+            if (!std.mem.eql(u8, f, url)) return null;
+            continue;
+        }
+        @memcpy(out[0..url.len], url);
+        found = out[0..url.len];
+    }
+    return found;
+}
+
+fn processCwd(pid: c_int, info: *VnodePathInfo) ?[]const u8 {
+    if (mac_c.proc_pidinfo(pid, proc_pidvnodepathinfo, 0, info, @sizeOf(VnodePathInfo)) != @sizeOf(VnodePathInfo)) return null;
+    return std.mem.sliceTo(&info.cdir_path, 0);
+}
+
+/// A process's KERN_PROCARGS2 block; only this user's processes answer.
+fn processArgs(pid: c_int, buf: []u8) ?[]const u8 {
+    var mib = [_]c_int{ ctl_kern, kern_procargs2, pid };
+    var len: usize = buf.len;
+    if (std.c.sysctl(&mib, mib.len, buf.ptr, &len, null, 0) != 0) return null;
+    return buf[0..len];
+}
+
+/// One variable out of a KERN_PROCARGS2 block: argc, the executable's path
+/// and its NUL padding, argv, then the environment, each NUL-terminated.
+fn procArgsEnv(args: []const u8, key: []const u8) ?[]const u8 {
+    if (args.len < 4) return null;
+    const argc = std.mem.readInt(i32, args[0..4], builtin.cpu.arch.endian());
+    if (argc < 0) return null;
+    var rest = args[4..];
+    rest = rest[(std.mem.indexOfScalar(u8, rest, 0) orelse return null)..];
+    while (rest.len > 0 and rest[0] == 0) rest = rest[1..];
+    var it = std.mem.splitScalar(u8, rest, 0);
+    for (0..@intCast(argc)) |_| _ = it.next() orelse return null;
+    while (it.next()) |entry| {
+        if (entry.len == 0) return null;
+        if (entry.len > key.len and entry[key.len] == '=' and std.mem.startsWith(u8, entry, key)) return entry[key.len + 1 ..];
+    }
+    return null;
+}
+
+test "a process's environment is read past its argv" {
+    var buf: [160]u8 = undefined;
+    std.mem.writeInt(i32, buf[0..4], 2, builtin.cpu.arch.endian());
+    const tail = "/bin/codex\x00\x00\x00codex\x00TERM_PROGRAM=argv\x00TERM_PROGRAM=WarpTerminal\x00WARP_FOCUS_URL=warp://session/x\x00\x00";
+    @memcpy(buf[4..][0..tail.len], tail);
+    const args = buf[0 .. 4 + tail.len];
+    try std.testing.expectEqualStrings("WarpTerminal", procArgsEnv(args, "TERM_PROGRAM").?);
+    try std.testing.expectEqualStrings("warp://session/x", procArgsEnv(args, "WARP_FOCUS_URL").?);
+    try std.testing.expect(procArgsEnv(args, "TERM") == null);
+    try std.testing.expect(procArgsEnv(args[0..3], "TERM_PROGRAM") == null);
+}
+
+test "this process's own directory and environment read back" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const pid = std.c.getpid();
+    var info: VnodePathInfo = undefined;
+    var cwd_buf: [1024]u8 = undefined;
+    const cwd = std.mem.sliceTo(std.c.getcwd(&cwd_buf, cwd_buf.len).?, 0);
+    try std.testing.expectEqualStrings(cwd, processCwd(pid, &info).?);
+    var args: [128 * 1024]u8 = undefined;
+    const home = std.mem.span(std.c.getenv("HOME").?);
+    try std.testing.expectEqualStrings(home, procArgsEnv(processArgs(pid, &args).?, "HOME").?);
 }
 
 /// Bring a Warp pane to the front from its link.
