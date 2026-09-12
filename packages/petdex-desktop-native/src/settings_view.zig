@@ -650,7 +650,7 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
             ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
                 ui.column(.{ .grow = 1 }, .{
                     ui.text(.{}, i18n.t("One bubble per conversation", "会話ごとに吹き出しを分ける")),
-                    mutedParagraph(ui, i18n.t("Stack a card per agent; off shows one bubble at a time", "エージェントごとにカードを重ねます。オフにすると吹き出しは1つずつ表示されます")),
+                    mutedParagraph(ui, i18n.t("A bubble for each agent; off shows one bubble at a time", "エージェントごとにバブルを出します。オフにするとバブルは1つだけになります")),
                 }),
                 ui.el(.switch_control, .{
                     .selected = model.bubbles_per_conversation,

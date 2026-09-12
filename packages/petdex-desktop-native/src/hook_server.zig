@@ -121,9 +121,10 @@ pub const Bubble = struct {
     }
 };
 
-/// How many conversations can narrate at once. Fixed because the
-/// mailbox holds them inline: no allocator runs on the hook hot path.
-pub const max_bubbles = 8;
+/// How many conversations can narrate at once, and float as bubbles over
+/// the pet. Fixed because the mailbox holds them inline: no allocator runs
+/// on the hook hot path.
+pub const max_bubbles = 10;
 
 /// Shared mailbox between the server thread (producer) and the app's
 /// poll timer (consumer). Everything behind one mutex; operations are

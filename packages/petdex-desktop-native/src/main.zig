@@ -188,9 +188,12 @@ pub const Msg = union(enum) {
     chatgpt_import,
     chatgpt_sign_out,
     chatgpt_token_response: native_sdk.EffectResponse,
+    // Hook bubbles (bubble_sim.zig).
+    bubble_tick: native_sdk.EffectTimer,
+    hook_press,
     noop,
 
-    pub const view_unbound = .{ "frame_tick", "poll_tick", "physics_tick", "frame_clock", "cycle_state", "native_drag_watchdog", "chime_done", "quit_app", "toggle_focus_mode", "shuffle_pet", "dsh_install_done", "dsh_remove_done", "remote_line", "remote_done", "remote_backoff", "update_boot_check", "update_response", "homebrew_done", "homebrew_timeout", "brew_command_copied", "auth_token_response", "auth_avatar_response", "auth_preview_response", "auth_library_done", "chat_line", "chat_response", "chat_models_response", "chatgpt_token_response" };
+    pub const view_unbound = .{ "frame_tick", "poll_tick", "bubble_tick", "frame_clock", "cycle_state", "native_drag_watchdog", "chime_done", "quit_app", "toggle_focus_mode", "shuffle_pet", "dsh_install_done", "dsh_remove_done", "remote_line", "remote_done", "remote_backoff", "update_boot_check", "update_response", "homebrew_done", "homebrew_timeout", "brew_command_copied", "auth_token_response", "auth_avatar_response", "auth_preview_response", "auth_library_done", "chat_line", "chat_response", "chat_models_response", "chatgpt_token_response" };
 };
 
 pub const Model = struct {
@@ -205,38 +208,24 @@ pub const Model = struct {
     shown_at_ms: i64 = 0,
     shown_dwell_ms: u32 = 0,
     /// One bubble per live conversation, mirrored from the mailbox and
-    /// ordered oldest first: the view stacks them in this order, so the
-    /// most recently updated sits at the bottom, next to the tail.
+    /// ordered oldest first by update counter.
     bubbles: [hook_server.max_bubbles]hook_server.Bubble = @splat(.{}),
     bubbles_len: usize = 0,
     /// Per-bubble deadlines, parallel to `bubbles`. Kept alongside
     /// rather than inside hook_server.Bubble because expiry is a display
     /// decision the app owns; the server has no clock for it.
     bubble_expires_at_ms: [hook_server.max_bubbles]i64 = @splat(-1),
-    /// Sonner-style stack: 0 is fully collapsed (only the front card
-    /// readable, the rest peeking behind it), 1 is the fan from slice 1.
-    /// Everything the view needs for a frame is derived from this one
-    /// number, so the animation has a single source of truth.
-    bubble_expansion: f32 = 0,
-    /// When the cursor entered the bubble window, or -1 while outside.
-    /// Expanding waits `bubble_hover_delay_ms` from here so crossing the
-    /// stack on the way somewhere else does not fan it open.
-    bubble_hover_since_ms: i64 = -1,
-    /// Where the expansion is heading, 1 while the hover is honored.
-    /// Leaving drops it to 0 with no delay: sticky is worse than eager.
-    bubble_expansion_target: f32 = 0,
-    bubble_anim_last_ms: i64 = 0,
-    /// Where the pet's center falls inside the bubble window, in the
-    /// stack container's local coordinates. The window is centered on
-    /// the pet until the screen edge clamps it; from then on the two
-    /// diverge, and the cards follow this rather than the window so the
-    /// stack stays anchored to the pet. Updated every frame from the real
-    /// window origin the platform reports.
-    bubble_pet_center_local: f32 = 0,
-    /// Popover-style vertical flip: false puts the stack above the pet
+    /// The bubbles' motion (bubble_sim.zig), one body per conversation.
+    hook_sim: bubble_sim.Sim = .{},
+    /// The simulation's clock runs while a bubble is on screen.
+    hook_ticking: bool = false,
+    hook_last_tick_ms: i64 = 0,
+    /// A bubble is under the cursor, so the bubble window takes clicks.
+    hook_hover: bool = false,
+    /// Popover-style vertical flip: false puts the bubbles above the pet
     /// (the default), true below it, for when the pet sits too close to
-    /// the top of the screen for the expanded height to fit. Flipped,
-    /// the front card is the TOP one and the stack grows downward.
+    /// the top of the screen for the window to fit. Flipped, the rows
+    /// fill from the top edge, nearest the pet.
     bubble_flipped: bool = false,
     /// The bubble window has been moved beside the pet since it opened;
     /// until then it stays invisible.
@@ -1542,8 +1531,6 @@ var initial_pet_y: ?f64 = null;
 // One slot for the CURRENT bubble's agent avatar (claude-code, codex,
 // gemini, opencode, antigravity), 40x40 PNGs committed under
 // assets/agents/, re-registered only when the agent changes.
-const avatar_image_id: u64 = 13;
-const tail_image_id: u64 = 14;
 const auth_avatar_image_id: u64 = 15;
 const chat_tail_image_id: u64 = 17;
 const auth_preview_atlas_id: u64 = 16;
@@ -1651,20 +1638,16 @@ fn loadAgentsAtlas(dark: bool, fx: *Effects) void {
 }
 pub const tail_w: usize = 18;
 pub const tail_h: usize = 9;
-const tail_atlas_h: usize = tail_h * 2;
 /// The chat's side tail image: two cells, each tail_h wide.
 const side_tail_w: usize = tail_h * 2;
 var tail_dark: bool = false;
 var tail_ready: bool = false;
 
-/// Register both speech-bubble tail directions in one image slot. The
-/// upper atlas cell points down for a bubble above the pet; the lower
-/// cell points up for a bubble that has flipped below it. The chat
-/// bubble beside the pet gets the same triangle turned sideways, in its
-/// own image.
+/// Register the tail of the chat bubble beside the pet: a downward
+/// triangle, turned sideways into a left and a right cell.
 pub fn registerTail(dark: bool, fx: *Effects) void {
     if (tail_ready and tail_dark == dark) return;
-    var pixels: [tail_w * tail_atlas_h * 4]u8 = @splat(0);
+    var pixels: [tail_w * tail_h * 4]u8 = @splat(0);
     var side: [side_tail_w * tail_w * 4]u8 = @splat(0);
     const cr: u8 = if (dark) 25 else 255;
     const cg: u8 = if (dark) 25 else 255;
@@ -1691,12 +1674,6 @@ pub fn registerTail(dark: bool, fx: *Effects) void {
                     pixels[i + 1] = eg;
                     pixels[i + 2] = eb;
                 }
-                // Mirror the downward cell into the lower half. Its
-                // full-width base then sits at the bottom, where it can
-                // tuck under the top edge of a flipped card.
-                const mirror_y = tail_atlas_h - y - 1;
-                const mirror_i = (mirror_y * tail_w + x) * 4;
-                @memcpy(pixels[mirror_i..][0..4], pixels[i..][0..4]);
                 // Transposed for the chat: the left cell points left and
                 // the right one right, each with its plain base column
                 // against the card.
@@ -1705,23 +1682,9 @@ pub fn registerTail(dark: bool, fx: *Effects) void {
             }
         }
     }
-    fx.registerImage(tail_image_id, tail_w, tail_atlas_h, &pixels) catch return;
     fx.registerImage(chat_tail_image_id, side_tail_w, tail_w, &side) catch return;
     tail_dark = dark;
     tail_ready = true;
-}
-
-fn tailSourceRect(flipped: bool) geometry.RectF {
-    // Canvas source rectangles address the registered texture from the
-    // opposite vertical origin to the row-major RGBA buffer above. The
-    // visually downward cell is therefore the lower source rectangle,
-    // and the upward cell is the upper one.
-    return geometry.RectF.init(
-        0,
-        @floatFromInt(if (flipped) 0 else tail_h),
-        @floatFromInt(tail_w),
-        @floatFromInt(tail_h),
-    );
 }
 
 /// The chat tail's cell: `point_left` for a bubble right of the pet.
@@ -1743,19 +1706,6 @@ pub fn chatTail(ui: *AppUi, point_left: bool, x: f32, y: f32) AppUi.Node {
     tail.widget.transform = canvas.Affine.translate(x, y);
     return tail;
 }
-var avatar_agent: [24]u8 = @splat(0);
-var avatar_agent_len: usize = 0;
-var avatar_ready: bool = false;
-var avatar_theme_dark: bool = false;
-
-/// The bubble names its agent at runtime (a hook payload), so the art
-/// is looked up by name rather than by enum. An unknown name is the
-/// normal case for an agent we do not ship a glyph for, not an error.
-fn agentArtBytes(agent: []const u8, dark: bool) []const u8 {
-    const index = if (std.mem.eql(u8, agent, "herdr")) herdr_icon_index else if (agentKindForName(agent)) |kind| @intFromEnum(kind) else agent_fallback_index;
-    const art = agent_art[index];
-    return if (dark) art.dark else art.light;
-}
 
 /// Which cell of the packed logo strip belongs to this agent.
 fn agentIconIndex(agent: []const u8) usize {
@@ -1773,16 +1723,6 @@ fn agentKindForName(agent: []const u8) ?agent_hooks.AgentKind {
     if (std.mem.eql(u8, agent, "qodercli")) return .qoder;
     if (std.mem.eql(u8, agent, "kimi")) return .kimi_code;
     return null;
-}
-
-fn loadAgentAvatar(agent: []const u8, dark: bool, fx: *Effects) void {
-    if (avatar_ready and avatar_theme_dark == dark and std.mem.eql(u8, avatar_agent[0..avatar_agent_len], agent)) return;
-    if (agent.len > avatar_agent.len) return;
-    _ = fx.registerImageBytes(avatar_image_id, agentArtBytes(agent, dark)) catch return;
-    @memcpy(avatar_agent[0..agent.len], agent);
-    avatar_agent_len = agent.len;
-    avatar_theme_dark = dark;
-    avatar_ready = true;
 }
 
 // ------------------------------------------------------------- thumbnails
@@ -2844,15 +2784,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .toggle_bubbles_per_conversation => {
             model.bubbles_per_conversation = !model.bubbles_per_conversation;
             // Turning it off has to act on what is ALREADY on screen, not
-            // just on the next event: a visible stack would otherwise sit
-            // there fanned out until some agent happened to speak. Fold
-            // it now, close the fan, and resize the window to the single
-            // card the view will draw.
+            // just on the next event: the extra bubbles would otherwise
+            // float there until some agent happened to speak. Fold them
+            // now; the ones that left pop on the next tick.
             if (!model.bubbles_per_conversation and model.bubbles_len > 1) {
                 collapseModelToNewest(model);
-                // The stacked view draws no tail, so switching to the
-                // single card is the first moment this run may need one.
-                registerTail(model.dark, fx);
                 syncBubbleWindow(model, fx);
             }
             saveSettings(model);
@@ -2967,13 +2903,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .open_website => plat.openExternal("https://petdex.dev"),
         .appearance => |a| {
             model.dark = a.color_scheme == .dark;
-            // The chat bubble's tail rides the same registration, and the
-            // chat can be open with no hook bubble at all.
             registerTail(model.dark, fx);
-            if (newestBubble(model)) |newest| loadAgentAvatar(newest.agent[0..newest.agent_len], model.dark, fx);
-            // The strip is themed, so a stack drawing from it has to
+            // The strip is themed, so bubbles drawing from it have to
             // re-pack on an appearance flip exactly like settings does.
-            if (model.settings_open or model.bubbles_len > 1) loadAgentsAtlas(model.dark, fx);
+            if (model.settings_open or model.bubbles_len > 0) loadAgentsAtlas(model.dark, fx);
             model.high_contrast = a.high_contrast;
             model.reduce_motion = a.reduce_motion;
         },
@@ -3004,6 +2937,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 applyState(model, .waving, 1200, fx);
         },
         .noop => {},
+        .bubble_tick => |timer| {
+            if (timer.outcome != .fired) return;
+            tickHookBubbles(model, fx);
+        },
+        .hook_press => pressHookBubble(model, fx),
         .open_pets_folder => {
             if (env_home) |home| {
                 var buf: [512]u8 = undefined;
@@ -3062,11 +3000,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     model.pet_x = result.x;
                     model.pet_y = result.y;
                 }
-                // Before the sync, not after: syncBubbleWindow places the
-                // window from bubble_flipped, so a flag left over from
-                // where the pet WAS puts the window on the wrong side for
-                // the whole arc.
-                updateBubbleStackInFlight(model, now);
                 syncBubbleWindow(model, fx);
                 chat_shell.follow(model, fx);
                 if (model.vx >= physics_min_vel) {
@@ -3091,17 +3024,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const read = fx.moveWindow("main", 0, 0, false) orelse return;
             model.pet_x = read.x;
             model.pet_y = read.y;
-            // Hover and the fan animation ride here, ahead of the drag
-            // branch, which returns early: a stack frozen mid-expansion
-            // because the pet was being dragged would be a bug nobody
-            // could explain from the code.
-            //
-            // The throw branch above cannot reach this: it returns before
-            // the cursor is polled, because it drives its own movement
-            // from the velocity rather than from a cursor sample. It runs
-            // updateBubbleStackInFlight instead, which does the half that
-            // needs no cursor.
-            updateBubbleStack(model, read.cursor_x, read.cursor_y, now, fx);
             syncBubbleWindow(model, fx);
             chat_shell.follow(model, fx);
             if (model.dragging) {
@@ -3262,13 +3184,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 } else {
                     // With per-conversation bubbles off, every session
                     // folds into one slot before the model ever sees the
-                    // set, so the rest of the pipeline (deadlines, view,
-                    // hover) runs the single-bubble path unchanged.
+                    // set, so the rest of the pipeline (deadlines, view)
+                    // runs the single-bubble path unchanged.
                     const count = if (model.bubbles_per_conversation) blk: {
                         // Mailbox slots retain first-seen session order while
-                        // updates happen in place. The renderer treats the
-                        // final slot as the front card, so sort by the
-                        // monotonic event counter before copying the stack.
+                        // updates happen in place. The final slot is the
+                        // newest (bubbleState reads the pet's waiting state
+                        // into it), so sort by the monotonic event counter.
                         sortBubblesByCounter(drained[0..raw_count]);
                         break :blk raw_count;
                     } else collapseToNewest(&drained, raw_count);
@@ -3285,18 +3207,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     // pet window shows.
                     flock_mod.reconcile(&model.flock, model.bubbles[0..count]);
                     syncBubbleDeadlines(model, previous[0..previous_len], previous_deadlines[0..previous_len], now);
-                    if (newestBubble(model)) |newest| {
-                        loadAgentAvatar(newest.agent[0..newest.agent_len], model.dark, fx);
-                        registerTail(model.dark, fx);
-                    }
-                    // The stacked cards read their logos out of the
-                    // shared strip, which until now only settings ever
-                    // loaded. A second conversation must not have to
-                    // wait for the settings window to get its avatar.
-                    if (model.bubbles_len > 1) loadAgentsAtlas(model.dark, fx);
+                    // Every bubble draws its logo out of the shared strip,
+                    // which otherwise only settings loads.
+                    if (model.bubbles_len > 0) loadAgentsAtlas(model.dark, fx);
                 }
             }
             _ = expireBubbles(model, now);
+            syncHookSim(model);
+            startHookTicks(model, fx);
             // Place the bubble on the poll clock too, not only on presented
             // frames: the pet stops presenting while it sits still, and a
             // bubble that opened (at the screen center) or a pet that moved
@@ -3404,38 +3322,28 @@ test "pet context menu opens the flock" {
     }
 }
 
-/// Every hook card is this wide and holds two lines, so a stack reads as
-/// one column and never grows into the chat bubble beside the pet.
-/// Fits "Claude Code - Action Required" at the default text size.
+/// An opened bubble's card holds two lines at this width. Fits "Claude
+/// Code - Action Required" at the default text size.
 const bubble_card_width: f32 = 260;
-const bubble_window_width: f32 = bubble_card_width + bubble_canvas_margin * 2;
+/// A full row of bubbles, or the card with a bubble's lane on each side.
+const bubble_window_width: f32 = bubble_sim.contentWidth(bubble_card_width);
 const bubble_avatar_width: f32 = 20;
 const bubble_content_gap: f32 = 8;
 const bubble_card_padding: f32 = 12;
 pub const bubble_card_radius: f32 = 18;
-const bubble_head_gap: f32 = 12;
 const bubble_line_gap: f32 = 2;
-/// Vertical breathing room between stacked conversation cards.
-const bubble_stack_gap: f32 = 6;
-const bubble_canvas_margin: f32 = 16;
+const bubble_canvas_margin: f32 = bubble_sim.margin;
+/// The logo inside a bubble, and its status dot.
+const hook_bubble_icon: f32 = 22;
+const hook_dot: f32 = 9;
+/// The simulation's clock, running only while a bubble is on screen.
+const hook_tick_key: u64 = 0xb0bb1e;
+const hook_tick_interval_ms: u32 = 33;
 
-// ---- Sonner-style collapsed stack (slice 2) ----
-/// How far each card behind the front one peeks out, and how much it
-/// shrinks per step of depth. Only the front card is meant to be
-/// readable collapsed; the rest just say "there are others".
-const bubble_peek_offset: f32 = 8;
-const bubble_peek_scale_step: f32 = 0.05;
-const bubble_peek_alpha_step: f32 = 0.28;
-/// Depth past which a card stops receding: beyond a few steps the
-/// shrink stops reading as depth and starts reading as a rendering bug.
-const bubble_peek_max_depth: f32 = 3;
-/// Hover has to persist this long before the stack fans out, so a
-/// cursor crossing the bubble on its way elsewhere does not open it.
-/// Leaving collapses immediately, with no matching delay.
-const bubble_hover_delay_ms: i64 = 200;
-/// Expand/collapse duration. Interpolated on the frame clock off
-/// wallMs, the same way the throw physics integrates.
-const bubble_anim_ms: f32 = 180;
+comptime {
+    std.debug.assert(bubble_sim.capacity == hook_server.max_bubbles);
+}
+
 /// Extra headroom required to flip back ABOVE the pet once the stack has
 /// flipped below it. Without it a pet parked exactly on the threshold
 /// flips every frame.
@@ -3494,145 +3402,33 @@ fn bubbleAgentName(bubble: *const hook_server.Bubble) []const u8 {
     return if (agentKindForName(agent)) |kind| kind.displayName() else agent;
 }
 
-/// What the agent needs, for the card's second line. A sender that does
-/// not report per-agent state leaves the pet's global waiting state,
-/// which belongs to the newest card.
-fn bubbleStatus(model: *const Model, slot: usize) []const u8 {
+/// What the agent needs. A sender that does not report per-agent state
+/// leaves the pet's global waiting state, which belongs to the newest
+/// bubble.
+fn bubbleState(model: *const Model, slot: usize) bubble_sim.Status {
     const bubble = &model.bubbles[slot];
     const state = bubble.agentStateSlice();
     const newest = slot + 1 == model.bubbles_len;
-    if (std.mem.eql(u8, state, "waiting") or (state.len == 0 and newest and model.state == .waiting)) return i18n.t("Action Required", "対応が必要");
-    if (std.mem.eql(u8, state, "failed")) return i18n.t("Failed", "失敗");
-    if (bubble.busy) return i18n.t("Working", "作業中");
-    return i18n.t("Done", "完了");
+    if (std.mem.eql(u8, state, "waiting") or (state.len == 0 and newest and model.state == .waiting)) return .waiting;
+    if (std.mem.eql(u8, state, "failed")) return .failed;
+    if (bubble.busy) return .working;
+    return .done;
 }
 
-/// Height a card is drawn at.
-///
-/// Explicit for every STACKED card and 0 (intrinsic) for a lone bubble.
-/// In a `.stack` a child with no height of its own inherits the
-/// container's (widget_layout.stackChildFrame), and the container
-/// reserves the whole expanded fan so cards have room to travel, so a
-/// stacked card left at 0 stretches to fan height and draws as a giant
-/// rounded rect. Outside a stack there is nothing to inherit from and
-/// intrinsic sizing is what the single bubble has always wanted.
-fn bubbleRenderedCardHeight(model: *const Model) f32 {
-    return if (bubbleStackable(model)) bubbleCardHeight(model) else 0;
+/// The card's second line.
+fn bubbleStatus(model: *const Model, slot: usize) []const u8 {
+    return switch (bubbleState(model, slot)) {
+        .waiting => i18n.t("Action Required", "対応が必要"),
+        .failed => i18n.t("Failed", "失敗"),
+        .working => i18n.t("Working", "作業中"),
+        .done => i18n.t("Done", "完了"),
+    };
 }
 
-/// Where the speech tail's center belongs inside the front card.
-///
-/// The window is centered over the pet until a screen edge clamps it or
-/// an open chat pushes it aside. The pet and window centers then diverge,
-/// and a tail at the card midpoint would point into empty space. Follow
-/// the pet's actual local center instead, with enough inset that the
-/// tail's full base stays off the rounded corner.
-fn bubbleTailCenterX(model: *const Model) f32 {
-    const inset = bubble_card_radius + @as(f32, @floatFromInt(tail_w)) / 2;
-    return std.math.clamp(model.bubble_pet_center_local, inset, bubble_card_width - inset);
-}
-
-fn bubbleTailDx(model: *const Model) f32 {
-    return bubbleTailCenterX(model) - bubble_card_width / 2;
-}
-
-// -------------------------------------------------- collapsed stack math
-
-/// A single bubble is not a stack: no peek, no hover, no animation. The
-/// whole stack interaction hangs off this so the speech-bubble path only
-/// adds its own pet-anchored tail behavior.
-fn bubbleStackable(model: *const Model) bool {
-    return model.bubbles_len > 1;
-}
-
-fn easeOutCubic(t: f32) f32 {
-    const inv = 1 - std.math.clamp(t, 0, 1);
-    return 1 - inv * inv * inv;
-}
-
-/// Depth of a card measured from the front. The front card is the most
-/// recently updated one, which slice 1 keeps last in `bubbles`, so depth
-/// counts backwards from the end.
-fn bubbleDepth(model: *const Model, slot: usize) f32 {
-    const from_front = model.bubbles_len - 1 - slot;
-    return @min(@as(f32, @floatFromInt(from_front)), bubble_peek_max_depth);
-}
-
-/// Scale for a card at `slot`, interpolated between its collapsed peek
-/// scale and full size. Collapsed cards shrink with depth; expansion
-/// pulls every card back to 1.
-fn bubbleCardScale(model: *const Model, slot: usize) f32 {
-    if (!bubbleStackable(model)) return 1;
-    const collapsed = 1 - bubble_peek_scale_step * bubbleDepth(model, slot);
-    return collapsed + (1 - collapsed) * bubbleExpansionEased(model);
-}
-
-/// Opacity for a card at `slot`. The front card is always solid; the
-/// ones behind fade with depth until expansion brings them back.
-fn bubbleCardAlpha(model: *const Model, slot: usize) f32 {
-    if (!bubbleStackable(model)) return 1;
-    const collapsed = @max(0.0, 1 - bubble_peek_alpha_step * bubbleDepth(model, slot));
-    return collapsed + (1 - collapsed) * bubbleExpansionEased(model);
-}
-
-/// Vertical placement of a card's center relative to the front card's.
-///
-/// Collapsed, cards sit `bubble_peek_offset` apart so only a sliver of
-/// each shows. Expanded, they sit a full card plus the stack gap apart,
-/// which is the slice 1 column. The animation is exactly the walk
-/// between those two spacings.
-///
-/// The sign follows the flip: above the pet the stack grows upward, away
-/// from the front card at the bottom; flipped below the pet the front
-/// card is on top and the others grow downward.
-fn bubbleCardOffset(model: *const Model, slot: usize) f32 {
-    if (!bubbleStackable(model)) return 0;
-    const from_front: f32 = @floatFromInt(model.bubbles_len - 1 - slot);
-    const peek = bubble_peek_offset * @min(from_front, bubble_peek_max_depth);
-    const front = model.bubbles_len - 1;
-    const collapsed = if (model.bubble_flipped)
-        peek
-    else
-        bubbleExpandedStackHeight(model) - bubbleCardHeight(model) - peek;
-    const step = bubbleCardHeight(model) + bubble_stack_gap;
-    const expanded = step * @as(f32, @floatFromInt(if (model.bubble_flipped) front - slot else slot));
-    const t = bubbleExpansionEased(model);
-    return collapsed + (expanded - collapsed) * t;
-}
-
-fn bubbleExpandedStackHeight(model: *const Model) f32 {
-    // At least one card: the window exists a frame before the first
-    // bubble lands.
-    const cards: f32 = @floatFromInt(@max(model.bubbles_len, 1));
-    return cards * bubbleCardHeight(model) + bubble_stack_gap * (cards - 1);
-}
-
-/// Height the window needs at a given expansion. Collapsed only has to
-/// cover the front card plus the peek slivers; expanded needs the whole
-/// column. The window is sized to the max of both (see syncBubbleWindow)
-/// so a resize never races the animation.
-fn bubbleStackHeightAt(model: *const Model, expansion: f32) f32 {
-    if (!bubbleStackable(model)) return bubbleCardHeight(model);
-    const behind: f32 = @floatFromInt(model.bubbles_len - 1);
-    const collapsed = bubbleCardHeight(model) + bubble_peek_offset * @min(behind, bubble_peek_max_depth);
-    const expanded = bubbleExpandedStackHeight(model);
-    return collapsed + (expanded - collapsed) * expansion;
-}
-
-/// The window is sized off the worst case, not the text actually in the
-/// cards, so a stack of N reserves N max-height cards and the gaps
-/// between them. At least one: the window exists a frame before the
-/// first bubble lands and must not be born zero-height.
-///
-/// Deliberately the EXPANDED height regardless of the current expansion.
-/// Resizing a window every frame of a 180ms animation is the one thing
-/// most likely to tear or lag behind the content, so the window is sized
-/// once for the tallest state the stack can reach and only the cards
-/// inside it animate. Collapsed simply leaves transparent space above
-/// the front card, which costs nothing: the window is click-through and
-/// fully transparent already.
+/// The window holds the bubbles that keep a place, and the card when one
+/// is open. It changes only when those do, never per frame of motion.
 fn bubbleWindowHeight(model: *const Model) f32 {
-    return bubbleExpandedStackHeight(model) + @as(f32, @floatFromInt(tail_h)) + bubble_head_gap + bubble_canvas_margin * 2;
+    return bubble_sim.contentHeight(model.hook_sim.stayingCount(), model.hook_sim.openIndex() != null, bubbleCardHeight(model));
 }
 
 fn bubbleFontSize(model: *const Model) f32 {
@@ -3652,206 +3448,108 @@ pub const bubble_text_max_px: f32 = 20;
 /// what a fresh install looks like.
 pub const bubble_text_default_px: f32 = 13;
 
-/// Count display characters (UTF-8 sequences, not bytes).
+/// The bubble window exists while any bubble is on screen, popping ones
+/// included.
 fn bubbleActive(model: *const Model) bool {
-    return model.bubbles_enabled and !model.focus_mode and model.bubbles_len > 0;
+    return model.bubbles_enabled and !model.focus_mode and model.hook_sim.anyLive();
 }
 
-/// Hover state for the stack, folded from a cursor sample. The window is
-/// click-through and stays that way, so this reads the same global
-/// cursor the pet's drag detection polls rather than widget events:
-/// expanding is purely visual and must never take input away from
-/// whatever is behind the bubble.
-///
-/// `inside` is tested against the window rect the caller measured, so
-/// this function stays pure and testable.
-fn updateBubbleHover(model: *Model, inside: bool, now_ms: i64) void {
-    if (!bubbleStackable(model)) {
-        model.bubble_hover_since_ms = -1;
-        model.bubble_expansion_target = 0;
-        return;
-    }
-    if (!inside) {
-        // No exit delay on purpose: a stack that lingers open reads as
-        // stuck, while one that closes eagerly just reads as responsive.
-        model.bubble_hover_since_ms = -1;
-        model.bubble_expansion_target = 0;
-        return;
-    }
-    if (model.bubble_hover_since_ms < 0) model.bubble_hover_since_ms = now_ms;
-    if (now_ms - model.bubble_hover_since_ms >= bubble_hover_delay_ms) {
-        model.bubble_expansion_target = 1;
-    }
-}
-
-/// Walk `bubble_expansion` toward its target at the animation rate.
-/// Returns whether anything moved, so the caller can skip a redundant
-/// window sync on the frames where the stack is at rest.
-fn stepBubbleExpansion(model: *Model, now_ms: i64) bool {
-    if (model.bubble_anim_last_ms == 0) model.bubble_anim_last_ms = now_ms;
-    var dt_ms = now_ms - model.bubble_anim_last_ms;
-    model.bubble_anim_last_ms = now_ms;
-    // Same guard the throw physics uses: a stall (or a sleeping machine)
-    // must not teleport the animation.
-    if (dt_ms <= 0) return false;
-    if (dt_ms > 50) dt_ms = 50;
-
-    const target = model.bubble_expansion_target;
-    if (model.bubble_expansion == target) return false;
-    const step = @as(f32, @floatFromInt(dt_ms)) / bubble_anim_ms;
-    if (target > model.bubble_expansion) {
-        model.bubble_expansion = @min(target, model.bubble_expansion + step);
-    } else {
-        model.bubble_expansion = @max(target, model.bubble_expansion - step);
-    }
-    return true;
-}
-
-/// Eased value the view actually draws with. The model stores linear
-/// progress so the interpolation stays reversible mid-flight; the ease
-/// is applied once, here, at read time.
-fn bubbleExpansionEased(model: *const Model) f32 {
-    return easeOutCubic(model.bubble_expansion);
-}
-
-/// Grace band around the visible cards, in points. Hitting a rounded
-/// corner exactly is not a skill anyone should have to demonstrate.
-const bubble_hover_slop: f32 = 4;
-
-/// A rectangle in bubble-window local coordinates.
-const BubbleRect = struct { x: f32, y: f32, w: f32, h: f32 };
-
-/// Top of the stack CONTAINER inside the window, in window-local points.
-///
-/// `bubbleCardOffset` is relative to that container, not to the window,
-/// so anything turning a card offset into window space has to add this
-/// first. The two are not the same number, and the gap between them is
-/// not decoration.
-///
-/// `bubbleWindowHeight` reserves `tail_h + head_gap` beyond the cards,
-/// while the stack container is only `bubbleStackHeightAt(model, 1)`
-/// tall, i.e. cards and nothing else. The root column in `bubbleView`
-/// parks the group against the edge nearest the pet, so that whole
-/// reserve lands on the far side of the cards, and which side that is
-/// follows the flip:
-///
-///   unflipped (`main = .end`, `.{ group, gap }`): cards hug the bottom,
-///   so the entire reserve sits above them;
-///   flipped (`main = .start`, `.{ gap, group }`): the spacer leads and
-///   the tail's share falls off the bottom, so only `head_gap` is above.
-///
-/// Both branches were measured against a live instance with a real
-/// cursor, not derived: reading this as a plain `bubble_canvas_margin`
-/// put the hit region 21pt above the drawing, and the intermediate guess
-/// of `tail_h` alone still left 12pt of the card's bottom dead.
-fn bubbleStackOriginY(model: *const Model) f32 {
-    if (model.bubble_flipped) return bubble_canvas_margin + bubble_head_gap;
-    return bubble_canvas_margin + bubble_head_gap + @as(f32, @floatFromInt(tail_h));
-}
-
-/// The union of the cards as they are ACTUALLY DRAWN, in window-local
-/// coordinates.
-///
-/// Every card spans the fixed card width, and y comes from the same
-/// bubbleCardOffset the renderer transforms each card by, so the hit
-/// region cannot drift from the pixels. It used to be re-derived from the
-/// window edges and the layout constants, which is how it ended up offset
-/// from the cards: the visible-but-dead margins around the card were the
-/// bug Hunter hit, where only the middle of the card (the text) answered.
-fn bubbleCardsRect(model: *const Model) BubbleRect {
-    // The container sits inside the margin, so x only has to clear the
-    // margin; y has a flip-dependent band to clear as well (see
-    // bubbleStackOriginY).
-    const origin_x = bubble_canvas_margin;
-    const origin_y = bubbleStackOriginY(model);
-    const card_h = bubbleCardHeight(model);
-    var min_y = bubbleCardOffset(model, model.bubbles_len - 1);
-    var max_y = min_y + card_h;
-    // The peeks behind the front card stick out; they are visible and so
-    // they are hoverable.
-    if (bubbleStackable(model)) {
-        for (0..model.bubbles_len) |slot| {
-            const y0 = bubbleCardOffset(model, slot);
-            min_y = @min(min_y, y0);
-            max_y = @max(max_y, y0 + card_h);
-        }
-    }
+fn hookLayout(model: *const Model) bubble_sim.Layout {
     return .{
-        .x = origin_x - bubble_hover_slop,
-        .y = origin_y + min_y - bubble_hover_slop,
-        .w = bubble_card_width + bubble_hover_slop * 2,
-        .h = (max_y - min_y) + bubble_hover_slop * 2,
+        .width = bubble_window_width,
+        .height = bubbleWindowHeight(model),
+        .flipped = model.bubble_flipped,
+        .card_w = bubble_card_width,
+        .card_h = bubbleCardHeight(model),
+        .card_radius = bubble_card_radius,
     };
 }
 
-/// Whether a screen-space cursor sample lands on the bubble stack.
-///
-/// Tested against the CARDS, not the whole window: the window is sized
-/// to the expanded height even while collapsed (see bubbleWindowHeight)
-/// and to the widest card the stack could ever show, so its rect is
-/// mostly transparent space that must not answer to the cursor.
-fn bubbleHoverHit(model: *const Model, win_x: f64, win_y: f64, window_h: f64, cursor_x: f64, cursor_y: f64) bool {
-    if (!bubbleActive(model)) return false;
-    _ = window_h;
-    const r = bubbleCardsRect(model);
-    const x0 = win_x + @as(f64, @floatCast(r.x));
-    const y0 = win_y + @as(f64, @floatCast(r.y));
-    return cursor_x >= x0 and cursor_x <= x0 + @as(f64, @floatCast(r.w)) and
-        cursor_y >= y0 and cursor_y <= y0 + @as(f64, @floatCast(r.h));
+/// A conversation's identity in the simulation: its agent and session.
+/// Mailbox slots are re-sorted on every drain, so a slot cannot be one.
+fn hookId(bubble: *const hook_server.Bubble) u64 {
+    var hash = std.hash.Wyhash.init(0);
+    hash.update(bubble.agent[0..bubble.agent_len]);
+    hash.update(&.{0});
+    hash.update(bubble.sessionSlice());
+    return hash.final() | 1;
 }
 
-/// The part of the stack update that needs no cursor: which side of the
-/// pet the stack hangs from, and the walk of the expansion toward its
-/// target. Split out because the throw branch owns its own movement and
-/// returns before the cursor is ever polled, and a pet in flight still
-/// crosses the flip threshold and still has to settle an open fan.
-///
-/// `hover_target` is what the expansion aims at. In flight it is forced
-/// closed: a fan cannot be hovered while the pet is sailing past the
-/// cursor, and leaving it open would fly a stale open stack across the
-/// screen.
-fn updateBubbleStackMotion(model: *Model, hover_target: f32, now_ms: i64) void {
-    // The flip itself is refreshed by syncBubbleWindow, which every path
-    // that moves the pet already calls; keeping it there means no caller
-    // can place the window from a stale side.
-    model.bubble_expansion_target = hover_target;
-    _ = stepBubbleExpansion(model, now_ms);
-}
-
-/// Flip and collapse the stack for a pet in flight. The throw drives its
-/// own moveWindow and returns before the cursor poll, so without this
-/// the flip flag and the expansion both freeze for the whole arc: the
-/// stack hangs off the wrong side of a pet that has long since had room
-/// above it, and syncBubbleWindow keeps placing the window from that
-/// stale flag.
-fn updateBubbleStackInFlight(model: *Model, now_ms: i64) void {
-    if (!bubbleActive(model)) return;
-    model.bubble_hover_since_ms = -1;
-    updateBubbleStackMotion(model, 0, now_ms);
-}
-
-/// Fold one frame of hover + animation into the stack state.
-fn updateBubbleStack(model: *Model, cursor_x: f64, cursor_y: f64, now_ms: i64, fx: *Effects) void {
-    if (!bubbleActive(model)) {
-        model.bubble_hover_since_ms = -1;
-        model.bubble_expansion_target = 0;
-        model.bubble_expansion = 0;
-        return;
+/// The mailbox slot a body's conversation holds, while it still does.
+fn hookSlot(model: *const Model, id: u64) ?usize {
+    for (model.bubbles[0..model.bubbles_len], 0..) |*bubble, i| {
+        if (hookId(bubble) == id) return i;
     }
+    return null;
+}
 
-    var inside = false;
-    if (bubbleStackable(model)) {
-        if (fx.moveWindow("bubble", 0, 0, false)) |bub| {
-            inside = bubbleHoverHit(model, bub.x, bub.y, @floatCast(bubbleWindowHeight(model)), cursor_x, cursor_y);
+/// Hand the simulation the conversations that should be on screen.
+fn syncHookSim(model: *Model) void {
+    var entries: [hook_server.max_bubbles]bubble_sim.Entry = undefined;
+    var n: usize = 0;
+    if (model.bubbles_enabled and !model.focus_mode) {
+        for (model.bubbles[0..model.bubbles_len], 0..) |*bubble, i| {
+            entries[n] = .{
+                .id = hookId(bubble),
+                .status = bubbleState(model, i),
+                .icon = @intCast(agentIconIndex(bubble.agent[0..bubble.agent_len])),
+            };
+            n += 1;
         }
     }
-    updateBubbleHover(model, inside, now_ms);
-    updateBubbleStackMotion(model, model.bubble_expansion_target, now_ms);
+    model.hook_sim.sync(entries[0..n], hookLayout(model));
 }
 
-/// The bubble drawn closest to the pet, i.e. the one the tail points at
-/// and the only one the single avatar slot can serve. Null when the
-/// stack is empty.
+/// Start the simulation's clock when a bubble appears. The pet's own
+/// frames stop while it sits still, so the bubbles keep their own;
+/// tickHookBubbles stops it once the last bubble has popped.
+fn startHookTicks(model: *Model, fx: *Effects) void {
+    if (model.hook_ticking or !model.hook_sim.anyLive()) return;
+    model.hook_ticking = true;
+    model.hook_last_tick_ms = fx.wallMs();
+    fx.startTimer(.{
+        .key = hook_tick_key,
+        .interval_ms = hook_tick_interval_ms,
+        .mode = .repeating,
+        .on_fire = Effects.timerMsg(.bubble_tick),
+    });
+}
+
+fn tickHookBubbles(model: *Model, fx: *Effects) void {
+    const now = fx.wallMs();
+    const dt: f32 = @as(f32, @floatFromInt(@max(0, now - model.hook_last_tick_ms))) / 1000;
+    model.hook_last_tick_ms = now;
+    syncHookSim(model);
+    model.hook_sim.step(dt, hookLayout(model));
+    if (!model.hook_sim.anyLive()) {
+        fx.cancelTimer(hook_tick_key);
+        model.hook_ticking = false;
+        model.hook_hover = false;
+        return;
+    }
+    syncBubbleWindow(model, fx);
+    // The window takes clicks only while a bubble is under the cursor, so
+    // the gaps between bubbles stay the desktop's.
+    model.hook_hover = hookUnderCursor(model, fx) != null;
+}
+
+/// The body under the global cursor, which the bubble window reports
+/// alongside its own origin.
+fn hookUnderCursor(model: *const Model, fx: *Effects) ?usize {
+    if (builtin.target.os.tag == .linux or !model.bubble_placed) return null;
+    const win = fx.moveWindow("bubble", 0, 0, false) orelse return null;
+    return model.hook_sim.hit(hookLayout(model), @floatCast(win.cursor_x - win.x), @floatCast(win.cursor_y - win.y));
+}
+
+/// A press on the bubble window opens the bubble under the cursor as its
+/// card, or closes the card.
+fn pressHookBubble(model: *Model, fx: *Effects) void {
+    const index = hookUnderCursor(model, fx) orelse return;
+    model.hook_sim.toggle(index);
+    syncBubbleWindow(model, fx);
+}
+
+/// The most recently updated bubble, or null when there is none.
 fn newestBubble(model: *const Model) ?*const hook_server.Bubble {
     if (model.bubbles_len == 0) return null;
     return &model.bubbles[newestOf(model.bubbles[0..model.bubbles_len])];
@@ -3862,6 +3560,8 @@ fn clearBubble(model: *Model) void {
     model.bubbles_len = 0;
     model.bubble_expires_at_ms = @splat(-1);
     model.bubble_above_blocked = false;
+    model.hook_sim.clear();
+    model.hook_hover = false;
     hook_server.mailbox.clearBubbles();
 }
 
@@ -3928,9 +3628,7 @@ fn collapseToNewest(drained: []hook_server.Bubble, count: usize) usize {
 ///
 /// Carries the surviving bubble's deadline across with it, so a card
 /// that was two seconds from expiring does not get a fresh lease just
-/// for being the survivor, and resets the hover state: the fan has no
-/// meaning once there is one card, and leaving a half-open expansion
-/// behind would draw the lone bubble mid-animation.
+/// for being the survivor.
 fn collapseModelToNewest(model: *Model) void {
     if (model.bubbles_len <= 1) return;
     const newest = newestOf(model.bubbles[0..model.bubbles_len]);
@@ -3943,9 +3641,6 @@ fn collapseModelToNewest(model: *Model) void {
         model.bubble_expires_at_ms[i] = -1;
     }
     model.bubbles_len = 1;
-    model.bubble_hover_since_ms = -1;
-    model.bubble_expansion = 0;
-    model.bubble_expansion_target = 0;
 }
 
 /// Drop every bubble whose deadline has passed, compacting the stack so
@@ -4074,10 +3769,7 @@ fn settleBubbleWindow(model: *Model, fx: *Effects, bubble_h: f32, want_x: f64) b
     }
     if (!model.bubble_flipped and !settled.hit_y) model.bubble_above_blocked = false;
     if (bubbleClampCorrection(actual.x, actual.y, settled.x, settled.y)) |correction| {
-        const corrected = fx.moveWindow("bubble", correction.dx, correction.dy, false) orelse return false;
-        recordPetCenterLocal(model, corrected.x);
-    } else {
-        recordPetCenterLocal(model, actual.x);
+        _ = fx.moveWindow("bubble", correction.dx, correction.dy, false) orelse return false;
     }
     return true;
 }
@@ -4181,24 +3873,9 @@ fn syncBubbleWindow(model: *Model, fx: *Effects) void {
     model.bubble_placed = true;
 }
 
-/// Project the pet's center into the stack container's coordinates.
-///
-/// `window_x` is where the window ACTUALLY landed, which after an edge
-/// clamp is not where it was asked to go. Deriving the axis from the
-/// real origin is the whole point: it is the difference between the two
-/// that used to leave a narrow card stranded in the middle of a window
-/// that had slid away from the pet.
-fn recordPetCenterLocal(model: *Model, window_x: f64) void {
-    const pet_center = model.pet_x + (frame_w * model.scale) / 2.0;
-    // The container sits inside the canvas margin, so strip it to land
-    // in the same space the card and its tail work in.
-    model.bubble_pet_center_local = @floatCast(pet_center - window_x - bubble_canvas_margin);
-}
-
 /// Where the left of the bubble window wants to sit: centered over the
-/// pet, unless the chat bubble is open beside it. Then the card's edge
-/// on that side stops at the pet's, so the stack never covers the chat;
-/// the tail still finds the pet (recordPetCenterLocal).
+/// pet, unless the chat bubble is open beside it. Then the window's edge
+/// on that side stops at the pet's, so the bubbles never cover the chat.
 fn bubbleWantX(model: *const Model, bubble_w: f32) f64 {
     const pet_w = frame_w * model.scale;
     const centered = model.pet_x + pet_w / 2.0 - bubble_w / 2.0;
@@ -4210,19 +3887,15 @@ fn bubbleWantX(model: *const Model, bubble_w: f32) f64 {
 }
 
 /// Where the top of the bubble window wants to sit for the current flip.
-/// The clearance is applied to the window edge, not the card's internal
-/// margin, so both the speech tail and stacked cards stay outside the pet.
+/// The clearance is applied to the window edge, not the window's internal
+/// margin, so the bubbles stay outside the pet.
 fn bubbleWantY(model: *const Model, bubble_h: f32) f64 {
     if (model.bubble_flipped) return model.pet_y + frame_h * model.scale + bubble_pet_clearance;
     return model.pet_y - bubble_h - bubble_pet_clearance;
 }
 
-/// Decide whether the stack hangs below the pet instead of above it.
-///
-/// The window is always sized to its EXPANDED height, so that is the
-/// space the decision has to clear: flipping only once the collapsed
-/// stack overflows would send the fan off-screen the moment someone
-/// hovers it.
+/// Decide whether the bubbles hang below the pet instead of above it,
+/// from the window's full height (an open card included).
 ///
 /// Hysteresis keeps a pet parked near the threshold from flapping every
 /// frame: it takes the full height plus the clearance to flip down, but
@@ -4359,150 +4032,110 @@ pub fn styleSpeechCard(node: *AppUi.Node, dark: bool) void {
     }
 }
 
-/// One conversation's card: the project, then the agent and what it
-/// needs, one line each at the card's fixed width. `slot` decides whether
-/// this is the newest bubble, the only one the single avatar registry
-/// slot can speak for.
+/// An opened bubble's content: the agent's logo, then the project and
+/// "<Agent> - <Status>", one line each.
 fn bubbleCard(ui: *AppUi, model: *const Model, slot: usize) AppUi.Node {
     const bubble = &model.bubbles[slot];
-    const newest = slot + 1 == model.bubbles_len;
     const title_fg = if (model.dark) canvas.Color.rgb8(237, 237, 238) else canvas.Color.rgb8(17, 17, 17);
     const muted_fg = if (model.dark) canvas.Color.rgb8(156, 158, 168) else canvas.Color.rgb8(88, 92, 106);
     var project = ui.paragraph(.{ .size = .heading, .wrap = false }, &.{.{ .text = bubbleProject(bubble), .weight = .bold }});
     project.widget.style.foreground = title_fg;
     var status = ui.text(.{ .size = .heading }, ui.fmt("{s} - {s}", .{ bubbleAgentName(bubble), bubbleStatus(model, slot) }));
     status.widget.style.foreground = muted_fg;
-
-    // The newest card keeps the dedicated registry slot: it is a
-    // full-resolution decode of the agent's own PNG (fallback art
-    // included), which is strictly better than a strip cell, so the card
-    // Hunter looks at most never degrades. Older cards read their logo
-    // out of the shared strip via image_src, the same addressing
-    // settings_view uses for its rows.
-    const agent_name = bubble.agent[0..bubble.agent_len];
-    const avatar = if (newest) blk: {
-        var img = ui.image(.{
-            .width = bubble_avatar_width,
-            .height = bubble_avatar_width,
-            .image = if (avatar_ready) avatar_image_id else 0,
-            .semantics = .{ .label = i18n.t("Agent avatar", "エージェントのアバター") },
-        });
-        img.widget.image_fit = .contain;
-        break :blk img;
-    } else if (agents_icons_ready) blk: {
-        var img = ui.image(.{
-            .width = bubble_avatar_width,
-            .height = bubble_avatar_width,
-            .image = agent_icon_atlas_id,
-            .semantics = .{ .label = i18n.t("Agent avatar", "エージェントのアバター") },
-        });
-        img.widget.image_src = agentIconRect(agentIconIndex(agent_name));
-        img.widget.image_fit = .contain;
-        break :blk img;
-    } else ui.el(.stack, .{ .width = bubble_avatar_width, .height = bubble_avatar_width }, .{});
-
-    var card = ui.el(.panel, .{
-        .padding = bubble_card_padding,
-        .width = bubble_card_width,
-        .height = bubbleRenderedCardHeight(model),
-    }, .{
-        ui.row(.{ .gap = bubble_content_gap, .cross = .center }, .{
-            avatar,
-            ui.column(.{ .grow = 1, .height = bubbleContentHeight(model, 2), .gap = bubble_line_gap, .main = .start, .cross = .start }, .{ project, status }),
-        }),
+    return ui.row(.{ .gap = bubble_content_gap, .cross = .center }, .{
+        agentLogo(ui, agentIconIndex(bubble.agent[0..bubble.agent_len]), bubble_avatar_width),
+        ui.column(.{ .grow = 1, .height = bubbleContentHeight(model, 2), .gap = bubble_line_gap, .main = .start, .cross = .start }, .{ project, status }),
     });
-    styleSpeechCard(&card, model.dark);
-
-    // Depth: shift up, shrink, and fade with distance from the front.
-    //
-    // Affine.scale is canvas-origin anchored (it is applied raw, see
-    // widget_tree.widgetTransform), so scaling alone would also drag the
-    // card toward the canvas corner. Translating the card's center to
-    // the origin, scaling, and translating back keeps it centered, and
-    // the offset composes on top of that.
-    if (bubbleStackable(model)) {
-        const scale = bubbleCardScale(model, slot);
-        const cx = bubble_card_width / 2;
-        const cy = bubbleCardHeight(model) / 2;
-        card.widget.transform = canvas.Affine.translate(0, bubbleCardOffset(model, slot))
-            .multiply(canvas.Affine.translate(cx, cy))
-            .multiply(canvas.Affine.scale(scale, scale))
-            .multiply(canvas.Affine.translate(-cx, -cy));
-        card.widget.opacity = bubbleCardAlpha(model, slot);
-    }
-    return card;
 }
 
-/// One bubble is a speech bubble: a single card with a tail pointing at
-/// the pet, exactly what shipped before any of this.
-///
-/// Two or more keeps the same tail on the newest/front card. A stack is
-/// still the pet speaking through several conversations, and dropping
-/// the tail there makes the whole tray look detached from the pet.
-///
-/// Stacked, the cards OVERLAY (a `.stack` takes the max of its children
-/// rather than flowing them) and each is placed by the transform
-/// bubbleCard applies: collapsed they sit a few px apart and peek out
-/// behind the front card, expanded they spread into the slice 1 column.
-fn bubbleView(ui: *AppUi, model: *const Model) AppUi.Node {
-    var cards: [1 + hook_server.max_bubbles * 2]AppUi.Node = undefined;
-    var count: usize = 0;
-    if (bubbleStackable(model)) {
-        // Painter's order: the deepest card is built first so the front
-        // one lands on top of it.
-        var overlay: [hook_server.max_bubbles]AppUi.Node = undefined;
-        for (0..model.bubbles_len) |i| overlay[i] = bubbleCard(ui, model, i);
-        cards[count] = ui.el(.stack, .{
-            .width = bubble_card_width,
-            // The container has to reserve the FULL fan, not one card.
-            // Cards are placed by transform, and `.stack` does not clip
-            // (widget_tree.widgetClipsContent covers scroll_view and an
-            // explicit clip_content only), so a one-card box let the
-            // expanded fan spill past its own bounds. Unflipped that
-            // overflow went upward into empty window band and looked
-            // fine; flipped it ran downward off the bottom edge and the
-            // wide card came out cut in half.
-            .height = bubbleStackHeightAt(model, 1),
-        }, @as([]const AppUi.Node, overlay[0..model.bubbles_len]));
-        count += 1;
-    } else {
-        cards[count] = bubbleCard(ui, model, 0);
-        count += 1;
-    }
-
-    var tail = ui.image(.{
-        .width = @floatFromInt(tail_w),
-        .height = @floatFromInt(tail_h),
-        .image = if (tail_ready) tail_image_id else 0,
+/// An agent's logo out of the shared strip, `size` points square.
+fn agentLogo(ui: *AppUi, index: usize, size: f32) AppUi.Node {
+    if (!agents_icons_ready) return ui.el(.stack, .{ .width = size, .height = size }, .{});
+    var img = ui.image(.{
+        .width = size,
+        .height = size,
+        .image = agent_icon_atlas_id,
+        .semantics = .{ .label = i18n.t("Agent avatar", "エージェントのアバター") },
     });
-    tail.widget.image_src = tailSourceRect(model.bubble_flipped);
-    tail.widget.image_fit = .contain;
-    // Pure translation (no rotation, so no canvas-origin surprises).
-    // Horizontally, the tail tracks the pet after an edge clamp;
-    // vertically, its base rides over the front card hairline so card and
-    // arrow read as one shape on either side of the pet.
-    tail.widget.transform = canvas.Affine.translate(bubbleTailDx(model), if (model.bubble_flipped) 1.5 else -1.5);
-    if (model.bubble_flipped) {
-        // The body is one node in both modes: either the card itself or
-        // the stack container. Put the upward tail before it.
-        cards[1] = cards[0];
-        cards[0] = tail;
-    } else {
-        cards[count] = tail;
-    }
-    count += 1;
+    img.widget.image_src = agentIconRect(index);
+    img.widget.image_fit = .contain;
+    return img;
+}
 
-    // The head-gap spacer sits between the pet and the cards, so which
-    // end it goes on follows the flip: above the pet the group hugs the
-    // bottom of the window, below the pet it hugs the top. Keeping the
-    // group pinned to the pet's edge avoids turning unused band height
-    // into a large, theme- or text-dependent distance from the pet.
-    const gap = ui.el(.stack, .{ .width = 1, .height = bubble_head_gap }, .{});
-    const group = ui.column(.{ .cross = .center }, @as([]const AppUi.Node, cards[0..count]));
-    var root = if (model.bubble_flipped)
-        ui.column(.{ .grow = 1, .main = .start, .cross = .center }, .{ gap, group })
-    else
-        ui.column(.{ .grow = 1, .main = .end, .cross = .center }, .{ group, gap });
+/// One conversation, placed where the simulation has it: the agent's logo
+/// in a circle, with a dot when it needs the user, swelling into the card
+/// when opened.
+fn hookBubble(ui: *AppUi, model: *const Model, index: usize, layout: bubble_sim.Layout) AppUi.Node {
+    const body = model.hook_sim.bodies[index];
+    const s = bubble_sim.shape(body, layout);
+    const slot = hookSlot(model, body.id);
+    // Past halfway into the card, the text takes over from the lone logo.
+    const show_card = s.open > 0.5 and slot != null;
+    var panel = if (show_card) blk: {
+        var row = bubbleCard(ui, model, slot.?);
+        row.widget.opacity = (s.open - 0.5) * 2;
+        break :blk ui.el(.panel, .{ .padding = bubble_card_padding, .width = s.w, .height = s.h }, .{row});
+    } else ui.el(.panel, .{ .width = s.w, .height = s.h }, .{
+        ui.column(.{ .grow = 1, .main = .center, .cross = .center }, .{agentLogo(ui, body.icon, hook_bubble_icon)}),
+    });
+    styleSpeechCard(&panel, model.dark);
+    panel.widget.style.radius = s.radius;
+    if (slot) |i| panel.widget.semantics.label = ui.fmt("{s} - {s}", .{ bubbleAgentName(&model.bubbles[i]), bubbleStatus(model, i) });
+
+    var parts: [2]AppUi.Node = .{ panel, undefined };
+    var len: usize = 1;
+    const dot_color: ?canvas.Color = switch (body.status) {
+        .waiting => if (model.dark) canvas.Color.rgb8(255, 159, 10) else canvas.Color.rgb8(255, 149, 0),
+        .failed => if (model.dark) canvas.Color.rgb8(255, 69, 58) else canvas.Color.rgb8(255, 59, 48),
+        .working, .done => null,
+    };
+    if (dot_color) |color| {
+        if (!show_card) {
+            var dot = ui.el(.panel, .{ .width = hook_dot, .height = hook_dot }, .{});
+            dot.widget.style.background = color;
+            dot.widget.style.radius = hook_dot / 2;
+            // A ring of the bubble's own face parts the dot from its edge.
+            dot.widget.style.stroke_width = 1.5;
+            dot.widget.style.border = if (model.dark) canvas.Color.rgb8(25, 25, 28) else canvas.Color.rgb8(255, 255, 255);
+            // On the circle's rim, up and to the right.
+            dot.widget.transform = canvas.Affine.translate(s.w * 0.854 - hook_dot / 2, s.h * 0.146 - hook_dot / 2);
+            parts[1] = dot;
+            len = 2;
+        }
+    }
+    var group = ui.el(.stack, .{ .width = s.w, .height = s.h }, @as([]const AppUi.Node, parts[0..len]));
+    // Scale about the bubble's own center (Affine.scale is canvas-origin
+    // anchored), then move it to where the simulation has it.
+    group.widget.transform = canvas.Affine.translate(s.x - s.w / 2, s.y - s.h / 2)
+        .multiply(canvas.Affine.translate(s.w / 2, s.h / 2))
+        .multiply(canvas.Affine.scale(s.scale, s.scale))
+        .multiply(canvas.Affine.translate(-s.w / 2, -s.h / 2));
+    group.widget.opacity = s.alpha;
+    return group;
+}
+
+/// The hook bubbles, floating where bubble_sim has them, the open card
+/// drawn last so it sits on top. One press handler covers the window:
+/// the press goes to the bubble under the cursor (pressHookBubble), and
+/// the window takes clicks only while there is one.
+fn bubbleView(ui: *AppUi, model: *const Model) AppUi.Node {
+    const layout = hookLayout(model);
+    var nodes: [bubble_sim.capacity]AppUi.Node = undefined;
+    var count: usize = 0;
+    const open = model.hook_sim.openIndex();
+    for (model.hook_sim.bodies, 0..) |body, i| {
+        if (!body.live()) continue;
+        if (open) |o| {
+            if (o == i) continue;
+        }
+        nodes[count] = hookBubble(ui, model, i, layout);
+        count += 1;
+    }
+    if (open) |i| {
+        nodes[count] = hookBubble(ui, model, i, layout);
+        count += 1;
+    }
+    var root = ui.el(.stack, .{ .grow = 1, .on_press = .hook_press }, @as([]const AppUi.Node, nodes[0..count]));
     // A new window opens where the platform puts it (screen center on
     // macOS); stay invisible until syncBubbleWindow has moved it to the
     // pet. Linux's compositor places its popup itself.
@@ -4699,7 +4332,10 @@ fn petdexWindows(model: *const Model, scratch: *PetdexApp.WindowsScratch) []cons
                 .floating = true,
                 .fullscreen_overlay = true,
                 .transparent = true,
-                .click_through = true,
+                // macOS follows the cursor: clicks land only on a bubble
+                // (the gaps stay the desktop's). Windows' color key already
+                // passes the transparent pixels through.
+                .click_through = builtin.target.os.tag == .macos and !model.hook_hover,
             };
         }
         count += 1;
@@ -5150,8 +4786,7 @@ test "flock states use distinct cells in one atlas" {
     try std.testing.expect(flock_atlas_image_id != sheet_image_id);
     try std.testing.expect(flock_atlas_image_id != agent_icon_atlas_id);
     try std.testing.expect(flock_atlas_image_id != thumb_atlas_id);
-    try std.testing.expect(flock_atlas_image_id != avatar_image_id);
-    try std.testing.expect(flock_atlas_image_id != tail_image_id);
+    try std.testing.expect(flock_atlas_image_id != chat_tail_image_id);
 }
 
 test "one image slot covers every agent" {
@@ -5160,14 +4795,21 @@ test "one image slot covers every agent" {
     try std.testing.expectEqual(agent_hooks.agent_count + 2, agent_art.len);
 }
 
-test "DSH bubbles keep the companion window click through" {
+test "the bubble window lets clicks through, except over a bubble on macOS" {
     var model: Model = .{};
-    model.bubbles_len = 1;
+    testPushBubble(&model, "alpha", "reading", true, -1);
     model.bubbles[0].origin_app = .default_browser;
+    syncHookSim(&model);
     var scratch: PetdexApp.WindowsScratch = .{};
-    const windows = petdexWindows(&model, &scratch);
+    var windows = petdexWindows(&model, &scratch);
     try std.testing.expect(windows.len > 0);
-    try std.testing.expect(windows[0].click_through);
+    // Windows' color key passes the transparent pixels through by itself;
+    // GTK's popup and macOS start out click-through.
+    try std.testing.expectEqual(builtin.target.os.tag != .windows, windows[0].click_through);
+    // Over a bubble, only GTK's popup still lets the click through.
+    model.hook_hover = true;
+    windows = petdexWindows(&model, &scratch);
+    try std.testing.expectEqual(builtin.target.os.tag == .linux, windows[0].click_through);
 }
 
 test "Herdr agent aliases resolve to their Petdex artwork" {
@@ -5189,7 +4831,7 @@ test "bubble title and status stay in one compact text block" {
     defer arena.deinit();
     var ui = AppUi.init(arena.allocator());
     const card = bubbleCard(&ui, &model, 0);
-    const text_column = card.nodes[0].nodes[1].widget;
+    const text_column = card.nodes[1].widget;
     try std.testing.expectEqual(bubbleContentHeight(&model, 2), text_column.layout.min_size.height);
     try std.testing.expectEqual(text_column.layout.min_size.height, text_column.layout.max_size.height);
 }
@@ -5472,13 +5114,18 @@ test {
     _ = settings_view;
 }
 
-test "bubble cards keep one size whatever the text, and grow with the text size" {
+test "the bubble window holds a row whatever the text, and grows by the card when one opens" {
     var model: Model = .{};
-    const empty = bubbleWindowHeight(&model);
-    testPushBubble(&model, "alpha", "a much longer line of bubble text than any card could hold on one line", false, -1);
-    try std.testing.expectEqual(empty, bubbleWindowHeight(&model));
+    testPushBubble(&model, "alpha", "a much longer line of bubble text than any card could hold on one line", true, -1);
+    syncHookSim(&model);
+    const closed = bubbleWindowHeight(&model);
+    try std.testing.expectEqual(bubble_sim.contentHeight(1, false, 0), closed);
+    model.hook_sim.toggle(0);
+    const open = bubbleWindowHeight(&model);
+    try std.testing.expect(open > closed);
+    // The card, not the bubbles, grows with the text size.
     model.bubble_text_px = bubble_text_max_px;
-    try std.testing.expect(bubbleWindowHeight(&model) > empty);
+    try std.testing.expect(bubbleWindowHeight(&model) > open);
 }
 
 test "a hook card names the project, the agent and what it needs" {
@@ -5648,19 +5295,11 @@ test "with per-conversation bubbles off, two sessions collapse to the newest one
     // later drain of a bigger set could resurrect.
     try std.testing.expectEqual(@as(usize, 0), drained[1].text_len);
 
-    // One card means the single-bubble path: no stack, so a tail and no
-    // hover fan, which is what "classic" means on screen.
-    var model: Model = .{};
-    model.bubbles_per_conversation = false;
-    testPushBubble(&model, "alpha", "newest", false, -1);
-    try std.testing.expect(!bubbleStackable(&model));
-
-    // And with the setting ON the same two slots survive as a stack.
+    // With the setting ON the same two slots both survive.
     var stacked: Model = .{};
     testPushBubble(&stacked, "alpha", "older", false, -1);
     testPushBubble(&stacked, "beta", "newest", false, -1);
     try std.testing.expectEqual(@as(usize, 2), stacked.bubbles_len);
-    try std.testing.expect(bubbleStackable(&stacked));
     // A single bubble is already collapsed and must pass through
     // unchanged rather than being rewritten.
     var lone: [hook_server.max_bubbles]hook_server.Bubble = undefined;
@@ -5676,10 +5315,6 @@ test "switching per-conversation bubbles off collapses the stack already on scre
     var model: Model = .{};
     testPushBubble(&model, "alpha", "older", false, 5_000);
     testPushBubble(&model, "beta", "newest", false, 9_000);
-    // Pretend the fan was open and mid-hover when the switch was flipped.
-    model.bubble_expansion = 1;
-    model.bubble_expansion_target = 1;
-    model.bubble_hover_since_ms = 1234;
 
     collapseModelToNewest(&model);
 
@@ -5690,155 +5325,12 @@ test "switching per-conversation bubbles off collapses the stack already on scre
     try std.testing.expectEqual(@as(i64, 9_000), model.bubble_expires_at_ms[0]);
     try std.testing.expectEqual(@as(i64, -1), model.bubble_expires_at_ms[1]);
     try std.testing.expectEqual(@as(usize, 0), model.bubbles[1].text_len);
-    // The fan has no meaning with one card, and a half-open expansion
-    // would draw the lone bubble mid-animation.
-    try std.testing.expectEqual(@as(f32, 0), model.bubble_expansion);
-    try std.testing.expectEqual(@as(f32, 0), model.bubble_expansion_target);
-    try std.testing.expectEqual(@as(i64, -1), model.bubble_hover_since_ms);
-    // Which is exactly the single-bubble render path: tail, no stack.
-    try std.testing.expect(!bubbleStackable(&model));
 
     // Idempotent: flipping the switch twice, or collapsing an already
     // single bubble, must not clear the last card off the screen.
     collapseModelToNewest(&model);
     try std.testing.expectEqual(@as(usize, 1), model.bubbles_len);
     try std.testing.expectEqualStrings("newest", model.bubbles[0].text[0..model.bubbles[0].text_len]);
-}
-
-test "one bubble is not a stack: no peek, no hover, no animation" {
-    var model: Model = .{};
-    testPushBubble(&model, "alpha", "solo", true, -1);
-    try std.testing.expect(!bubbleStackable(&model));
-    try std.testing.expectEqual(@as(f32, 1), bubbleCardScale(&model, 0));
-    try std.testing.expectEqual(@as(f32, 1), bubbleCardAlpha(&model, 0));
-    try std.testing.expectEqual(@as(f32, 0), bubbleCardOffset(&model, 0));
-
-    // Hover cannot arm on a single bubble, so it can never expand.
-    updateBubbleHover(&model, true, 10_000);
-    try std.testing.expectEqual(@as(f32, 0), model.bubble_expansion_target);
-    try std.testing.expectEqual(@as(i64, -1), model.bubble_hover_since_ms);
-}
-
-test "collapsed cards recede behind the front one" {
-    var model: Model = .{};
-    testPushBubble(&model, "alpha", "older", false, -1);
-    testPushBubble(&model, "beta", "newer", true, -1);
-    try std.testing.expect(bubbleStackable(&model));
-
-    // Slot 1 is the most recently updated, so it is the front card:
-    // full size, fully opaque, and the one the tail points at.
-    try std.testing.expectEqual(@as(f32, 1), bubbleCardScale(&model, 1));
-    try std.testing.expectEqual(@as(f32, 1), bubbleCardAlpha(&model, 1));
-    // The container reserves the whole fan, and unflipped the front card
-    // sits at its bottom edge, nearest the pet.
-    try std.testing.expectEqual(bubbleStackHeightAt(&model, 1) - bubbleCardHeight(&model), bubbleCardOffset(&model, 1));
-
-    // The one behind is smaller, dimmer and pushed up by the peek offset.
-    try std.testing.expect(bubbleCardScale(&model, 0) < 1);
-    try std.testing.expect(bubbleCardAlpha(&model, 0) < 1);
-    try std.testing.expectEqual(bubble_peek_offset, bubbleCardOffset(&model, 1) - bubbleCardOffset(&model, 0));
-
-    // Collapsed is much shorter than the fan it opens into.
-    const collapsed = bubbleStackHeightAt(&model, 0);
-    const expanded = bubbleStackHeightAt(&model, 1);
-    try std.testing.expect(expanded > collapsed);
-}
-
-test "expanded restores the slice 1 column" {
-    var model: Model = .{};
-    testPushBubble(&model, "alpha", "older", false, -1);
-    testPushBubble(&model, "beta", "newer", true, -1);
-    model.bubble_expansion = 1;
-
-    // Fully expanded every card is full size and solid again, spaced a
-    // whole card plus the stack gap apart: exactly the slice 1 layout.
-    for (0..model.bubbles_len) |i| {
-        try std.testing.expectEqual(@as(f32, 1), bubbleCardScale(&model, i));
-        try std.testing.expectEqual(@as(f32, 1), bubbleCardAlpha(&model, i));
-    }
-    try std.testing.expectEqual(bubbleStackHeightAt(&model, 1) - bubbleCardHeight(&model), bubbleCardOffset(&model, 1));
-    try std.testing.expectEqual(bubbleCardHeight(&model) + bubble_stack_gap, bubbleCardOffset(&model, 1) - bubbleCardOffset(&model, 0));
-}
-
-test "hover waits out the delay, and leaving collapses at once" {
-    var model: Model = .{};
-    testPushBubble(&model, "alpha", "older", false, -1);
-    testPushBubble(&model, "beta", "newer", true, -1);
-
-    // Crossing the stack briefly must not open it.
-    updateBubbleHover(&model, true, 1_000);
-    try std.testing.expectEqual(@as(f32, 0), model.bubble_expansion_target);
-    updateBubbleHover(&model, true, 1_000 + bubble_hover_delay_ms - 1);
-    try std.testing.expectEqual(@as(f32, 0), model.bubble_expansion_target);
-
-    // Staying past the delay arms the expansion.
-    updateBubbleHover(&model, true, 1_000 + bubble_hover_delay_ms);
-    try std.testing.expectEqual(@as(f32, 1), model.bubble_expansion_target);
-
-    // Leaving drops the target immediately, with no exit delay, and
-    // re-entering has to serve the full delay again.
-    updateBubbleHover(&model, false, 2_000);
-    try std.testing.expectEqual(@as(f32, 0), model.bubble_expansion_target);
-    try std.testing.expectEqual(@as(i64, -1), model.bubble_hover_since_ms);
-    updateBubbleHover(&model, true, 2_100);
-    try std.testing.expectEqual(@as(f32, 0), model.bubble_expansion_target);
-}
-
-test "expansion walks to its target and settles" {
-    var model: Model = .{};
-    testPushBubble(&model, "alpha", "older", false, -1);
-    testPushBubble(&model, "beta", "newer", true, -1);
-    model.bubble_expansion_target = 1;
-    model.bubble_anim_last_ms = 1_000;
-
-    // One frame moves partway, never straight to the end.
-    try std.testing.expect(stepBubbleExpansion(&model, 1_016));
-    try std.testing.expect(model.bubble_expansion > 0);
-    try std.testing.expect(model.bubble_expansion < 1);
-
-    // Enough frames and it lands exactly on the target, then reports no
-    // further movement so the caller can stop syncing the window.
-    var t: i64 = 1_016;
-    while (t < 1_016 + @as(i64, @intFromFloat(bubble_anim_ms)) + 100) : (t += 16) {
-        _ = stepBubbleExpansion(&model, t);
-    }
-    try std.testing.expectEqual(@as(f32, 1), model.bubble_expansion);
-    try std.testing.expect(!stepBubbleExpansion(&model, t + 16));
-
-    // A long stall (sleeping machine) is clamped, not teleported.
-    model.bubble_expansion_target = 0;
-    model.bubble_anim_last_ms = t;
-    _ = stepBubbleExpansion(&model, t + 10_000);
-    try std.testing.expect(model.bubble_expansion > 0);
-}
-
-test "hover hit tests the drawn cards, not the tall transparent window" {
-    var model: Model = .{};
-    testPushBubble(&model, "alpha", "older", false, -1);
-    testPushBubble(&model, "beta", "newer", true, -1);
-
-    const win_x: f64 = 100;
-    const win_y: f64 = 200;
-    const win_height: f64 = @floatCast(bubbleWindowHeight(&model));
-    const bottom = win_y + win_height - @as(f64, @floatCast(bubble_canvas_margin + bubble_head_gap + @as(f32, @floatFromInt(tail_h))));
-
-    // Just above the tail, on the front card: a hit.
-    try std.testing.expect(bubbleHoverHit(&model, win_x, win_y, win_height, win_x + 20, bottom - 4));
-    // The window reserves the expanded height even while collapsed, so
-    // the top of the window is empty air. That must NOT count as hover
-    // or the stack would open from far above the visible cards.
-    try std.testing.expect(!bubbleHoverHit(&model, win_x, win_y, win_height, win_x + 20, win_y + 2));
-    // Outside horizontally.
-    try std.testing.expect(!bubbleHoverHit(&model, win_x, win_y, win_height, win_x - 5, bottom - 4));
-    // Below the cards entirely (down by the pet).
-    try std.testing.expect(!bubbleHoverHit(&model, win_x, win_y, win_height, win_x + 20, bottom + 30));
-
-    // Expanded, the live band reaches much higher up the window.
-    model.bubble_expansion = 1;
-    const expanded_rect = bubbleCardsRect(&model);
-    const high_x = win_x + @as(f64, @floatCast(expanded_rect.x + expanded_rect.w / 2));
-    const high_y = win_y + @as(f64, @floatCast(expanded_rect.y + 2));
-    try std.testing.expect(bubbleHoverHit(&model, win_x, win_y, win_height, high_x, high_y));
 }
 
 test "flipping sends the stack below the pet, clear of the sprite" {
@@ -5945,60 +5437,6 @@ test "a blocked above probe stays sticky until position or size changes" {
     try std.testing.expect(bubbleAboveProbeStale(&model, 301));
 }
 
-test "a flipped stack grows downward and is hit tested from the top" {
-    var model: Model = .{};
-    testPushBubble(&model, "alpha", "older", false, -1);
-    testPushBubble(&model, "beta", "newer", true, -1);
-
-    // Unflipped the cards behind sit ABOVE the front one.
-    try std.testing.expect(bubbleCardOffset(&model, 0) < bubbleCardOffset(&model, 1));
-    model.bubble_flipped = true;
-    // Flipped they hang BELOW it, and the front card leads at the top.
-    try std.testing.expect(bubbleCardOffset(&model, 0) > bubbleCardOffset(&model, 1));
-    try std.testing.expectEqual(@as(f32, 0), bubbleCardOffset(&model, 1));
-
-    const win_x: f64 = 100;
-    const win_y: f64 = 200;
-    const win_height: f64 = @floatCast(bubbleWindowHeight(&model));
-    const top = win_y + @as(f64, @floatCast(bubble_canvas_margin + bubble_head_gap));
-
-    // Just below the top edge is on the cards now.
-    try std.testing.expect(bubbleHoverHit(&model, win_x, win_y, win_height, win_x + 20, top + 4));
-    // The empty band is at the BOTTOM of a flipped window, and must not
-    // count as hover.
-    try std.testing.expect(!bubbleHoverHit(&model, win_x, win_y, win_height, win_x + 20, win_y + win_height - 2));
-}
-
-test "a single bubble tail follows the pet after a screen-edge clamp" {
-    var model: Model = .{};
-    testPushBubble(&model, "codex", "running tests", true, -1);
-
-    const card_w = bubble_card_width;
-    const inset = bubble_card_radius + @as(f32, @floatFromInt(tail_w)) / 2;
-
-    model.bubble_pet_center_local = card_w / 2;
-    try std.testing.expectEqual(@as(f32, 0), bubbleTailDx(&model));
-
-    // At either edge the point follows the pet as far as it safely can,
-    // while the tail's full base stays clear of the rounded corner.
-    model.bubble_pet_center_local = 0;
-    try std.testing.expectEqual(inset, bubbleTailCenterX(&model));
-    try std.testing.expect(bubbleTailDx(&model) < 0);
-
-    model.bubble_pet_center_local = card_w;
-    try std.testing.expectEqual(card_w - inset, bubbleTailCenterX(&model));
-    try std.testing.expect(bubbleTailDx(&model) > 0);
-}
-
-test "the tail points toward the pet on both vertical placements" {
-    const down = tailSourceRect(false);
-    const up = tailSourceRect(true);
-    try std.testing.expectEqual(@as(f32, @floatFromInt(tail_h)), down.y);
-    try std.testing.expectEqual(@as(f32, 0), up.y);
-    try std.testing.expectEqual(down.width, up.width);
-    try std.testing.expectEqual(down.height, up.height);
-}
-
 test "bubble movement crosses displays before applying target bounds" {
     // A constrained relative move is bounded by the display that owns the
     // bubble before the move. It cannot cross a monitor boundary from that
@@ -6071,189 +5509,20 @@ test "bubble clamp correction reconciles a reported-only host clamp" {
     try std.testing.expect(bubbleClampCorrection(1680, 96, 1680, 96) == null);
 }
 
-test "the hover rect covers the whole visible card, not just its text" {
-    // Hunter hit this live: the fan only opened over the TEXT. The hit
-    // region was re-derived from the window edges and layout constants
-    // while the cards are placed by bubbleCardOffset,
-    // so the two drifted: a band running up from the window bottom, and
-    // cards sitting on an axis that tracks the pet. The overlap was the
-    // middle of the card, which is where the text is.
-    var model: Model = .{};
-    testPushBubble(&model, "alpha", "older", false, -1);
-    testPushBubble(&model, "beta", "newer", true, -1);
-    testPushBubble(&model, "eve", "ok, shipped", false, -1);
-    model.bubble_expansion = 0;
-    model.bubble_expansion_target = 0;
-    model.bubble_pet_center_local = 120;
-
-    for ([_]bool{ false, true }) |flipped| {
-        model.bubble_flipped = flipped;
-        const r = bubbleCardsRect(&model);
-
-        // Every card that is drawn must sit inside the hit rect: this is
-        // the property that was violated, and it is checked against the
-        // SAME functions the renderer transforms by.
-        for (0..model.bubbles_len) |slot| {
-            const cx = bubble_canvas_margin;
-            const cy = bubbleStackOriginY(&model) + bubbleCardOffset(&model, slot);
-            const cw = bubble_card_width;
-            const chh = bubbleCardHeight(&model);
-            try std.testing.expect(r.x <= cx);
-            try std.testing.expect(r.y <= cy);
-            try std.testing.expect(r.x + r.w >= cx + cw);
-            try std.testing.expect(r.y + r.h >= cy + chh);
-        }
-
-        // And it must not balloon to the whole window: a rect that always
-        // said yes would pass the loop above while making the collapsed
-        // stack expand from anywhere in the transparent canvas. Collapsed,
-        // the widest thing drawn is the front card, so the rect is that
-        // plus slop — NOT the full stack width, which is reserved for the
-        // widest hidden card and is mostly transparent while collapsed.
-        try std.testing.expectApproxEqAbs(
-            bubble_card_width + bubble_hover_slop * 2,
-            r.w,
-            0.01,
-        );
-        try std.testing.expect(r.w < bubble_window_width);
-        try std.testing.expect(r.h < bubbleWindowHeight(&model));
-
-        // The corners of the front card answer, which is the actual
-        // complaint: not just the text in the middle.
-        const fx0 = bubble_canvas_margin;
-        const fy0 = bubbleStackOriginY(&model) + bubbleCardOffset(&model, model.bubbles_len - 1);
-        const fw = bubble_card_width;
-        const fh = bubbleCardHeight(&model);
-        const wh: f64 = @floatCast(bubbleWindowHeight(&model));
-        for ([_][2]f32{
-            .{ fx0 + 1, fy0 + 1 },
-            .{ fx0 + fw - 1, fy0 + 1 },
-            .{ fx0 + 1, fy0 + fh - 1 },
-            .{ fx0 + fw - 1, fy0 + fh - 1 },
-        }) |pt| {
-            try std.testing.expect(bubbleHoverHit(&model, 0, 0, wh, pt[0], pt[1]));
-        }
-
-        // Well outside the cards still says no.
-        try std.testing.expect(!bubbleHoverHit(&model, 0, 0, wh, fx0 - 40, fy0 + fh / 2));
-        try std.testing.expect(!bubbleHoverHit(&model, 0, 0, wh, fx0 + fw + 40, fy0 + fh / 2));
-    }
-}
-
-test "the hover rect starts at the stack container, not at the canvas margin" {
-    // Measured with a real cursor against a live instance, twice.
-    //
-    // Before: the front card was drawn down to screen y 327.5 and the fan
-    // stopped answering at y 317.5, so the bottom of a card everyone
-    // could see was dead while a band of empty air above the stack was
-    // live. After: live through y 352 against a card drawn to y 352.5,
-    // dead by y 354.
-    //
-    // The cause is that `bubbleCardOffset` is relative to the stack
-    // CONTAINER while `bubbleCardsRect` added a bare canvas margin, as
-    // if the container were pinned to the top of the window. It is not.
-    // `bubbleWindowHeight` reserves `tail_h + head_gap` past the cards,
-    // the stack container is only `bubbleStackHeightAt(model, 1)` tall,
-    // and the root column in bubbleView parks the group against the
-    // pet's edge. Unflipped (`main = .end`, `.{ group, gap }`) the whole
-    // reserve therefore sits ABOVE the cards; flipped (`main = .start`,
-    // `.{ gap, group }`) only the head gap leads and the tail's share
-    // falls off the bottom.
-    //
-    // The expected origins are written out from the layout constants
-    // here rather than by calling bubbleStackOriginY, so dropping a term
-    // from that helper cannot keep this test green.
-    var model: Model = .{};
-    testPushBubble(&model, "alpha", "older", false, -1);
-    testPushBubble(&model, "beta", "newer", true, -1);
-    testPushBubble(&model, "eve", "ok, shipped", false, -1);
-    model.bubble_expansion = 0;
-    model.bubble_expansion_target = 0;
-    model.bubble_pet_center_local = 120;
-
-    // The reserve the window carries beyond the cards themselves. This is
-    // the band the old rect ignored, and its magnitude (21) is exactly
-    // the offset measured on screen.
-    const reserve = bubble_head_gap + @as(f32, @floatFromInt(tail_h));
-    const content_h = bubbleWindowHeight(&model) - bubble_canvas_margin * 2;
-    try std.testing.expectApproxEqAbs(
-        bubbleStackHeightAt(&model, 1) + reserve,
-        content_h,
-        0.01,
-    );
-
-    const unflipped_origin = bubble_canvas_margin + reserve;
-    const flipped_origin = bubble_canvas_margin + bubble_head_gap;
-
-    model.bubble_flipped = false;
-    try std.testing.expectApproxEqAbs(unflipped_origin, bubbleStackOriginY(&model), 0.01);
-    model.bubble_flipped = true;
-    try std.testing.expectApproxEqAbs(flipped_origin, bubbleStackOriginY(&model), 0.01);
-
-    // Both branches sit strictly below the bare margin, so a helper that
-    // returned `bubble_canvas_margin` fails both rather than sliding
-    // through one of them.
-    try std.testing.expect(unflipped_origin > bubble_canvas_margin);
-    try std.testing.expect(flipped_origin > bubble_canvas_margin);
-    // And they differ from each other, so a helper that dropped the flip
-    // and returned one constant for both fails too.
-    try std.testing.expect(unflipped_origin != flipped_origin);
-
-    // The consequence Hunter felt: the BOTTOM edge of the front card is
-    // inside the rect on both flips. This is what failed on screen.
-    for ([_]bool{ false, true }) |flipped| {
-        model.bubble_flipped = flipped;
-        const origin_y = if (flipped) flipped_origin else unflipped_origin;
-        const front = model.bubbles_len - 1;
-        const fy0 = origin_y + bubbleCardOffset(&model, front);
-        const fx = bubble_canvas_margin + 4;
-        const bottom = fy0 + bubbleCardHeight(&model);
-        const wh: f64 = @floatCast(bubbleWindowHeight(&model));
-        // One point inside the bottom edge: live.
-        try std.testing.expect(bubbleHoverHit(&model, 0, 0, wh, fx, bottom - 1));
-        // The bottom edge itself, within the grace band: still live.
-        try std.testing.expect(bubbleHoverHit(&model, 0, 0, wh, fx, bottom + bubble_hover_slop - 1));
-        // The live band ends at the LOWEST drawn edge, which is the front
-        // card unflipped and the deepest peek once flipped: the peeks are
-        // drawn, so they are hoverable, and the rect is their union.
-        var drawn_top = origin_y + bubbleCardOffset(&model, 0);
-        var drawn_bottom = drawn_top + bubbleCardHeight(&model);
-        for (0..model.bubbles_len) |slot| {
-            const top = origin_y + bubbleCardOffset(&model, slot);
-            drawn_top = @min(drawn_top, top);
-            drawn_bottom = @max(drawn_bottom, top + bubbleCardHeight(&model));
-        }
-        // Well past the slop below everything drawn: dead, so the fix
-        // widened the rect onto the cards rather than onto the window.
-        try std.testing.expect(!bubbleHoverHit(&model, 0, 0, wh, fx, drawn_bottom + bubble_hover_slop + 8));
-        // Symmetrically, the air above the topmost card stays dead. This
-        // is the half the old rect got wrong in the other direction: it
-        // answered live in a band above the stack.
-        try std.testing.expect(!bubbleHoverHit(&model, 0, 0, wh, fx, drawn_top - bubble_hover_slop - 8));
-    }
-}
-
-test "a thrown pet keeps its flip and collapse current through the flight" {
+test "a thrown pet keeps its flip current through the flight" {
     // The throw branch drives its own moveWindow from the velocity and
-    // returns before the cursor is polled, so it never reaches
-    // updateBubbleStack. Without its own update the flip flag and the
-    // expansion both freeze for the whole arc: the stack hangs off the
-    // wrong side of a pet that already has room above it, and
-    // syncBubbleWindow keeps placing the window from that stale flag.
+    // returns before the cursor is polled. syncBubbleWindow, which owns
+    // the flip, has to run inside it, or the bubbles hang off the side
+    // the pet was on for the whole arc.
     var model: Model = .{};
     testPushBubble(&model, "alpha", "older", false, -1);
     testPushBubble(&model, "beta", "newer", true, -1);
 
-    // Start pinned to the top with the stack flipped below, and a fan
-    // left open by a hover just before the throw.
+    // Start pinned to the top with the bubbles flipped below.
     model.pet_y = 0;
     model.bubble_flipped = true;
-    model.bubble_expansion = 1;
-    model.bubble_expansion_target = 1;
-    model.bubble_anim_last_ms = 0;
 
     const needed: f64 = @floatCast(bubbleWindowHeight(&model));
-    var now: i64 = 0;
     // A real flick: 900 px/s only carries the pet ~115px before friction
     // drops it under physics_min_vel, short of the threshold, so the test
     // would never cross anything. This is a hard throw.
@@ -6264,11 +5533,9 @@ test "a thrown pet keeps its flip and collapse current through the flight" {
     // Physics loop, same shape as the throw branch: 16ms frames, the
     // window integrates velocity, friction decays it.
     while (frames < 60) : (frames += 1) {
-        now += 16;
         model.pet_y += vy * 0.016;
         vy *= physics_friction;
         if (@abs(vy) < physics_min_vel) vy = 0;
-        updateBubbleStackInFlight(&model, now);
         // Stand in for syncBubbleWindow, which owns the flip refresh and
         // is what the throw branch calls every frame. Asserting against
         // bubbleWantY rather than the flag alone ties this to the value
@@ -6293,90 +5560,14 @@ test "a thrown pet keeps its flip and collapse current through the flight" {
     // otherwise the assertion above proves nothing.
     try std.testing.expect(crossed_back);
     try std.testing.expect(model.pet_y > needed);
-    // And an open fan does not fly open: nobody hovers a sailing pet.
-    try std.testing.expectEqual(@as(f32, 0), model.bubble_expansion);
-    try std.testing.expectEqual(@as(i64, -1), model.bubble_hover_since_ms);
 
-    // Guard the wiring, not just the helper: the throw branch has to run
-    // the in-flight update itself, because it returns before the frame
-    // clock's cursor poll. Deleting that call is the regression this
-    // whole test exists for, and a helper tested in isolation cannot see
-    // it, so pin the source instead.
+    // Guard the wiring, not just the helper: the throw branch returns
+    // before the frame clock's own sync, so it must place the window
+    // itself. A helper tested in isolation cannot see that call go.
     const src = @embedFile("main.zig");
     const throw_branch = std.mem.indexOf(u8, src, "if (model.throwing) {").?;
     const branch_end = std.mem.indexOf(u8, src[throw_branch..], "const read = fx.moveWindow").?;
-    const in_flight = std.mem.indexOf(u8, src[throw_branch..][0..branch_end], "updateBubbleStackInFlight(model, now);");
-    try std.testing.expect(in_flight != null);
-    // And it must come BEFORE the sync, or the window is placed from the
-    // side the pet was on a frame ago.
-    const sync = std.mem.indexOf(u8, src[throw_branch..][0..branch_end], "syncBubbleWindow(model, fx);").?;
-    try std.testing.expect(in_flight.? < sync);
-}
-
-test "a stacked card keeps its own height, never the container's" {
-    // The regression this pins, and the one the containment test below
-    // could NOT see: cards are placed by transform inside a container
-    // that reserves the whole expanded fan, and in a `.stack` a child
-    // with height 0 inherits the container's height
-    // (widget_layout.stackChildFrame). Every card stretched to fan
-    // height and drew as one giant rounded rect with its content pinned
-    // to an edge, while every offset assertion stayed green because the
-    // POSITIONS were all still right.
-    var model: Model = .{};
-    testPushBubble(&model, "alpha", "older", false, -1);
-    testPushBubble(&model, "beta", "newer", true, -1);
-
-    const container = bubbleStackHeightAt(&model, 1);
-    try std.testing.expectEqual(bubbleCardHeight(&model), bubbleRenderedCardHeight(&model));
-    try std.testing.expect(bubbleRenderedCardHeight(&model) < container);
-
-    // A single bubble has no container to inherit from, so it keeps
-    // sizing itself to its content: height 0 means intrinsic there.
-    var solo: Model = .{};
-    testPushBubble(&solo, "alpha", "solo", false, -1);
-    try std.testing.expectEqual(@as(f32, 0), bubbleRenderedCardHeight(&solo));
-}
-
-test "a flipped stack stays inside its container at both ends" {
-    // The second screenshot: flipped, mid-hover, the wide card cut off
-    // against the bottom. The container reserves one card height while
-    // the fan needs the full expanded extent, so cards placed by
-    // transform ran past its bounds and the window edge clipped them.
-    var model: Model = .{};
-    testPushBubble(&model, "alpha", "a much longer line of bubble text", false, -1);
-    testPushBubble(&model, "beta", "another wide line of bubble text", false, -1);
-    testPushBubble(&model, "gamma", "eve", true, -1);
-    model.bubble_flipped = true;
-
-    const container = bubbleStackHeightAt(&model, 1);
-
-    // Every card, at every point of the animation, must sit fully
-    // inside the container: top edge at or below 0, bottom edge at or
-    // above the container height.
-    for ([_]f32{ 0, 0.25, 0.5, 0.75, 1 }) |expansion| {
-        model.bubble_expansion = expansion;
-        for (0..model.bubbles_len) |i| {
-            const top = bubbleCardOffset(&model, i);
-            try std.testing.expect(top >= -0.01);
-            try std.testing.expect(top + bubbleCardHeight(&model) <= container + 0.01);
-        }
-        // Flipped, the FRONT card leads at the top, hard against the
-        // head gap, and the rest hang below it.
-        try std.testing.expectEqual(@as(f32, 0), bubbleCardOffset(&model, model.bubbles_len - 1));
-    }
-
-    // Unflipped the same containment holds, with the front card last.
-    model.bubble_flipped = false;
-    for ([_]f32{ 0, 0.5, 1 }) |expansion| {
-        model.bubble_expansion = expansion;
-        for (0..model.bubbles_len) |i| {
-            const top = bubbleCardOffset(&model, i);
-            try std.testing.expect(top >= -0.01);
-            try std.testing.expect(top + bubbleCardHeight(&model) <= container + 0.01);
-        }
-        const front = model.bubbles_len - 1;
-        try std.testing.expectEqual(container - bubbleCardHeight(&model), bubbleCardOffset(&model, front));
-    }
+    try std.testing.expect(std.mem.indexOf(u8, src[throw_branch..][0..branch_end], "syncBubbleWindow(model, fx);") != null);
 }
 
 test "an agent with no dedicated art uses the fallback tile" {
@@ -6410,17 +5601,16 @@ test "closing the pet clears its bubble and closes both windows" {
     try std.testing.expectEqualStrings("main", fx.windowActionState().lastLabel());
 }
 
-test "two conversations stack and grow the window vertically" {
+test "a seventh conversation starts a second row of bubbles" {
     var model: Model = .{};
-    testPushBubble(&model, "alpha", "reading", true, -1);
-    const one_high = bubbleWindowHeight(&model);
-    const one_wide = bubble_window_width;
-    testPushBubble(&model, "beta", "testing", true, -1);
-    try std.testing.expect(bubbleWindowHeight(&model) > one_high);
-    // Only the vertical axis grows: cards keep the configured column
-    // budget, they do not sit side by side.
-    try std.testing.expectEqual(one_wide, bubble_window_width);
-    try std.testing.expectEqualStrings("beta", newestBubble(&model).?.sessionSlice());
+    const sessions = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g" };
+    for (sessions[0..bubble_sim.per_row]) |session| testPushBubble(&model, session, "reading", true, -1);
+    syncHookSim(&model);
+    const one_row = bubbleWindowHeight(&model);
+    testPushBubble(&model, sessions[bubble_sim.per_row], "testing", true, -1);
+    syncHookSim(&model);
+    try std.testing.expect(bubbleWindowHeight(&model) > one_row);
+    try std.testing.expectEqualStrings("g", newestBubble(&model).?.sessionSlice());
 }
 
 test "newest bubble follows its update counter instead of its slot" {
