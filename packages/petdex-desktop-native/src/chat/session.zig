@@ -139,11 +139,26 @@ pub const Session = struct {
     /// The pet speaks first: the shell ends the request's context with
     /// its briefing prompt, and no user turn enters the transcript.
     briefing: bool = false,
+    /// The key of the request still open on the wire, until its terminal
+    /// Msg arrives. A stopped or reset request keeps it: its fetch winds
+    /// down asynchronously, and nothing new goes out before it has, so the
+    /// server never answers two at once.
+    wire: ?u64 = null,
     err_buf: [192]u8 = undefined,
     err_len: usize = 0,
 
     pub fn busy(self: *const Session) bool {
         return self.phase == .streaming or self.phase == .refreshing;
+    }
+
+    /// Nothing streaming, refreshing, or still winding down.
+    fn canSend(self: *const Session) bool {
+        return !self.busy() and self.wire == null;
+    }
+
+    /// The fetch with `key` has ended, a cancelled one included.
+    pub fn settle(self: *Session, key: u64) void {
+        if (self.wire == key) self.wire = null;
     }
 
     /// The effect key of the current stream. Anything tagged with an
@@ -180,12 +195,12 @@ pub const Session = struct {
 
     /// Replace the transcript (history restored, pet switched).
     pub fn load(self: *Session, messages: []const Message) void {
-        self.* = .{ .request_id = self.request_id +% 1 };
+        self.* = .{ .request_id = self.request_id +% 1, .wire = self.wire };
         for (messages) |m| self.transcript.append(m.role, m.text);
     }
 
     pub fn submit(self: *Session, text: []const u8, needs_refresh: bool) Action {
-        if (self.busy()) return .none;
+        if (!self.canSend()) return .none;
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return .none;
         self.transcript.append(.user, trimmed);
@@ -196,7 +211,7 @@ pub const Session = struct {
     /// Re-send after a failure: the user's message is still the newest,
     /// or the failed request was a briefing.
     pub fn retry(self: *Session, needs_refresh: bool) Action {
-        if (self.phase != .failed) return .none;
+        if (self.phase != .failed or !self.canSend()) return .none;
         if (!self.briefing) {
             const m = self.transcript.last() orelse return .none;
             if (m.role != .user) return .none;
@@ -208,7 +223,7 @@ pub const Session = struct {
     /// the shell completes with its briefing prompt. The reply lands like
     /// any other.
     pub fn brief(self: *Session, needs_refresh: bool) Action {
-        if (self.busy()) return .none;
+        if (!self.canSend()) return .none;
         self.briefing = true;
         return self.begin(needs_refresh);
     }
@@ -247,6 +262,7 @@ pub const Session = struct {
     /// The fetch's terminal Msg. `transport_error` is set when no HTTP
     /// status arrived at all (refused, timed out, TLS).
     pub fn onResponse(self: *Session, kind: ProviderKind, key: u64, status: u16, transport_error: ?[]const u8) Action {
+        self.settle(key);
         if (key != self.streamKey() or self.phase != .streaming) return .none;
         if (transport_error) |message| return self.fail(message);
         if (status >= 200 and status < 300 and !self.stream_failed) {
@@ -298,6 +314,7 @@ pub const Session = struct {
         self.request_id +%= 1;
         self.stream_failed = false;
         self.phase = .streaming;
+        self.wire = self.streamKey();
         return .request;
     }
 
@@ -366,6 +383,25 @@ test "a briefing streams a reply without a user turn and can be retried" {
     try t.expectEqualStrings("Claude is waiting.", s.lastReply().?);
     try t.expectEqual(Action.request, s.submit("thanks", false));
     try t.expect(!s.briefing);
+}
+
+test "one request on the wire at a time" {
+    const s = newSession();
+    defer t.allocator.destroy(s);
+
+    try t.expectEqual(Action.request, s.submit("hi", false));
+    const first = s.streamKey();
+    // A double tap while the reply streams.
+    try t.expectEqual(Action.none, s.brief(false));
+    // Stopped, but its fetch has not wound down yet.
+    s.cancel();
+    try t.expectEqual(Action.none, s.submit("again", false));
+    try t.expectEqual(Action.none, s.brief(false));
+    // New Chat and a pet switch reset the transcript, not the wire.
+    s.load(&.{});
+    try t.expectEqual(Action.none, s.submit("again", false));
+    s.settle(first);
+    try t.expectEqual(Action.request, s.submit("again", false));
 }
 
 test "a reply streams into the transcript and completes" {

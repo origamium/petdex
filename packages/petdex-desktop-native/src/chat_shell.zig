@@ -556,7 +556,8 @@ fn onResponse(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) 
     const st = &model.chat;
     const transport: ?[]const u8 = switch (response.outcome) {
         .ok => null,
-        .cancelled => return,
+        // A stopped or superseded stream: only its slot on the wire frees.
+        .cancelled => return st.session.settle(response.key),
         .timed_out => i18n.t("The reply took too long.", "返事に時間がかかりすぎました。"),
         .connect_failed => switch (st.stream_kind) {
             .openai_compat => i18n.t("Could not reach the local server. Is it running?", "ローカルサーバーに接続できません。起動していますか？"),
