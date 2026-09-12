@@ -138,7 +138,7 @@ pub fn run(phase: []const u8, arg_agent: ?[]const u8, origin_app: plat.OriginApp
         }
     }
     if (state) |s| {
-        const duration_ms: u32 = if (isToolFailurePhase(phase)) failed_duration_ms else 0;
+        const duration_ms: u32 = if (isToolFailurePhase(phase) or isStopFailurePhase(phase)) failed_duration_ms else 0;
         const body = stateBody(&body_buf, s, duration_ms, agent);
         if (body) |b| {
             if (startPost("/state", b, token)) |post| {
@@ -215,6 +215,13 @@ fn isSubagentStopPhase(phase: []const u8) bool {
 
 fn isToolFailurePhase(phase: []const u8) bool {
     return std.mem.eql(u8, phase, "tool-failure");
+}
+
+/// A turn that ended on an error (Claude Code's StopFailure: an API error,
+/// a rate limit). Nothing marks the session busy again until its next
+/// event, so its bubble stays failed until then.
+fn isStopFailurePhase(phase: []const u8) bool {
+    return std.mem.eql(u8, phase, "stop-failure");
 }
 
 /// The /bubble request body, extracted and pure for the same reason stateBody
@@ -374,7 +381,7 @@ pub fn stateForEvent(phase: []const u8, tool_name: ?[]const u8) ?[]const u8 {
         return "running";
     }
     if (std.mem.eql(u8, phase, "post")) return "idle";
-    if (isToolFailurePhase(phase)) return "failed";
+    if (isToolFailurePhase(phase) or isStopFailurePhase(phase)) return "failed";
     if (isStopPhase(phase)) return "waving";
     if (isAssistantPhase(phase)) return "waving";
     if (isPromptPhase(phase)) return "jumping";
@@ -398,6 +405,7 @@ pub fn formatBubble(phase: []const u8, payload: []const u8, out: []u8) ?[]const 
     if (std.mem.eql(u8, phase, "approval-response")) return "Approval received";
     if (std.mem.eql(u8, phase, "subagent-start")) return "Subagent working…";
     if (isSubagentStopPhase(phase)) return "Subagent done";
+    if (isStopFailurePhase(phase)) return "Stopped with an error";
     // Tool name only, never the payload's `error` string. jsonString stops at
     // the first `"` or `\` and decodes neither, and error text routinely carries
     // both; tool_name is a controlled identifier from the agent's own registry.
@@ -1147,6 +1155,12 @@ test "the longest bubble body fits one POST" {
     // Past the old 1 KiB cap that dropped such a bubble without a word.
     try t.expect(body.len > 1024);
     try t.expect(body.len <= post_body_cap);
+}
+
+test "a turn that ends on an error fails its bubble" {
+    var out: [256]u8 = undefined;
+    try t.expectEqualStrings("failed", stateForEvent("stop-failure", null).?);
+    try t.expectEqualStrings("Stopped with an error", formatBubble("stop-failure", "{}", &out).?);
 }
 
 test "a bubble without a reported state is byte-identical to before" {
