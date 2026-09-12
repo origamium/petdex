@@ -299,6 +299,14 @@ pub const Sim = struct {
         return contentHeight(closed, cards[0..open]);
     }
 
+    /// The window height with every card shut: what the side of the pet
+    /// is chosen for, so a card opening never moves the stack across.
+    pub fn closedHeight(self: *const Sim) f32 {
+        var count: usize = 0;
+        for (self.bodies) |b| count += @intFromBool(b.staying());
+        return contentHeight(count, &.{});
+    }
+
     /// Something still moves under `layout`: a bubble that sways or waits
     /// (its light breathes), grows in, pops, opens or closes, has not come
     /// to rest, or is away from its place (the window changed height or

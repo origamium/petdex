@@ -13,6 +13,7 @@ PATCHES=(
   "$ROOT/patches/native-sdk-macos-ime-cursor.patch"
   "$ROOT/patches/native-sdk-effects-text-measure.patch"
   "$ROOT/patches/native-sdk-window-click-through.patch"
+  "$ROOT/patches/native-sdk-window-screen.patch"
 )
 SDK="${NATIVE_SDK_PATH:-}"
 

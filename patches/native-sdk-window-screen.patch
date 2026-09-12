@@ -1,0 +1,100 @@
+diff --git a/src/platform/types.zig b/src/platform/types.zig
+--- a/src/platform/types.zig
++++ b/src/platform/types.zig
+@@ -466,6 +466,14 @@
+     /// Global cursor position, top-left convention, same space as x/y.
+     cursor_x: f64 = 0,
+     cursor_y: f64 = 0,
++    /// petdex: the visible frame (menu bar and Dock excluded) of the
++    /// screen the window is on, same space as x/y. Hosts that don't
++    /// report it leave `has_screen` false.
++    has_screen: bool = false,
++    screen_x: f64 = 0,
++    screen_y: f64 = 0,
++    screen_w: f64 = 0,
++    screen_h: f64 = 0,
+ };
+ 
+ /// Which point stays fixed when `resizeWindow` changes a window's size.
+diff --git a/src/platform/macos/root.zig b/src/platform/macos/root.zig
+--- a/src/platform/macos/root.zig
++++ b/src/platform/macos/root.zig
+@@ -150,7 +150,7 @@
+ extern fn native_sdk_appkit_create_window(host: *AppKitHost, window_id: u64, window_title: [*]const u8, window_title_len: usize, window_label: [*]const u8, window_label_len: usize, x: f64, y: f64, width: f64, height: f64, restore_frame: c_int, resizable: c_int, titlebar_style: c_int, window_flags: c_int, show_policy: c_int) c_int;
+ extern fn native_sdk_appkit_set_window_content_min_size(host: *AppKitHost, window_id: u64, min_width: f64, min_height: f64) c_int;
+ extern fn native_sdk_appkit_focus_window(host: *AppKitHost, window_id: u64) c_int;
+-extern fn native_sdk_appkit_move_window(host: *AppKitHost, window_id: u64, dx: f64, dy: f64, clamp: c_int, out_x: *f64, out_y: *f64, out_hit_x: *c_int, out_hit_y: *c_int, out_primary_down: *c_int, out_vx: *f64, out_vy: *f64, out_released: *c_int, out_cursor_x: *f64, out_cursor_y: *f64) c_int;
++extern fn native_sdk_appkit_move_window(host: *AppKitHost, window_id: u64, dx: f64, dy: f64, clamp: c_int, out_x: *f64, out_y: *f64, out_hit_x: *c_int, out_hit_y: *c_int, out_primary_down: *c_int, out_vx: *f64, out_vy: *f64, out_released: *c_int, out_cursor_x: *f64, out_cursor_y: *f64, out_screen: *[4]f64) c_int;
+ extern fn native_sdk_appkit_resize_window(host: *AppKitHost, window_id: u64, width: f64, height: f64, anchor_bottom_center: c_int) c_int;
+ extern fn native_sdk_appkit_close_window(host: *AppKitHost, window_id: u64) c_int;
+ extern fn native_sdk_appkit_minimize_window(host: *AppKitHost, window_id: u64) c_int;
+@@ -1121,8 +1121,9 @@
+     var out_released: c_int = 0;
+     var out_cursor_x: f64 = 0;
+     var out_cursor_y: f64 = 0;
+-    if (native_sdk_appkit_move_window(self.host, window_id, dx, dy, if (clamp) 1 else 0, &out_x, &out_y, &out_hit_x, &out_hit_y, &out_primary, &out_vx, &out_vy, &out_released, &out_cursor_x, &out_cursor_y) == 0) return error.WindowNotFound;
+-    return .{ .x = out_x, .y = out_y, .hit_x = out_hit_x != 0, .hit_y = out_hit_y != 0, .primary_down = out_primary != 0, .vx = out_vx, .vy = out_vy, .released = out_released != 0, .cursor_x = out_cursor_x, .cursor_y = out_cursor_y };
++    var out_screen: [4]f64 = @splat(0);
++    if (native_sdk_appkit_move_window(self.host, window_id, dx, dy, if (clamp) 1 else 0, &out_x, &out_y, &out_hit_x, &out_hit_y, &out_primary, &out_vx, &out_vy, &out_released, &out_cursor_x, &out_cursor_y, &out_screen) == 0) return error.WindowNotFound;
++    return .{ .x = out_x, .y = out_y, .hit_x = out_hit_x != 0, .hit_y = out_hit_y != 0, .primary_down = out_primary != 0, .vx = out_vx, .vy = out_vy, .released = out_released != 0, .cursor_x = out_cursor_x, .cursor_y = out_cursor_y, .has_screen = out_screen[2] > 0, .screen_x = out_screen[0], .screen_y = out_screen[1], .screen_w = out_screen[2], .screen_h = out_screen[3] };
+ }
+ 
+ fn resizeWindow(context: ?*anyopaque, window_id: platform_mod.WindowId, width: f64, height: f64, anchor: platform_mod.WindowResizeAnchor) anyerror!void {
+diff --git a/src/platform/macos/appkit_host.h b/src/platform/macos/appkit_host.h
+--- a/src/platform/macos/appkit_host.h
++++ b/src/platform/macos/appkit_host.h
+@@ -365,7 +365,9 @@
+ // AppKit's default minimum. Returns 0 when the window id is unknown.
+ int native_sdk_appkit_set_window_content_min_size(native_sdk_appkit_host_t *host, uint64_t window_id, double min_width, double min_height);
+ int native_sdk_appkit_focus_window(native_sdk_appkit_host_t *host, uint64_t window_id);
+-int native_sdk_appkit_move_window(native_sdk_appkit_host_t *host, uint64_t window_id, double dx, double dy, int clamp, double *out_x, double *out_y, int *out_hit_x, int *out_hit_y, int *out_primary_down, double *out_vx, double *out_vy, int *out_released, double *out_cursor_x, double *out_cursor_y);
++// petdex: `out_screen` (x, y, width, height, may be NULL) receives the
++// visible frame of the window's screen in the same top-left convention.
++int native_sdk_appkit_move_window(native_sdk_appkit_host_t *host, uint64_t window_id, double dx, double dy, int clamp, double *out_x, double *out_y, int *out_hit_x, int *out_hit_y, int *out_primary_down, double *out_vx, double *out_vy, int *out_released, double *out_cursor_x, double *out_cursor_y, double *out_screen);
+ int native_sdk_appkit_resize_window(native_sdk_appkit_host_t *host, uint64_t window_id, double width, double height, int anchor_bottom_center);
+ int native_sdk_appkit_close_window(native_sdk_appkit_host_t *host, uint64_t window_id);
+ // The real OS minimize verb (NSWindow miniaturize:), for app-drawn
+diff --git a/src/platform/macos/appkit_host.m b/src/platform/macos/appkit_host.m
+--- a/src/platform/macos/appkit_host.m
++++ b/src/platform/macos/appkit_host.m
+@@ -10263,7 +10263,7 @@
+     return 1;
+ }
+ 
+-int native_sdk_appkit_move_window(native_sdk_appkit_host_t *host, uint64_t window_id, double dx, double dy, int clamp, double *out_x, double *out_y, int *out_hit_x, int *out_hit_y, int *out_primary_down, double *out_vx, double *out_vy, int *out_released, double *out_cursor_x, double *out_cursor_y) {
++int native_sdk_appkit_move_window(native_sdk_appkit_host_t *host, uint64_t window_id, double dx, double dy, int clamp, double *out_x, double *out_y, int *out_hit_x, int *out_hit_y, int *out_primary_down, double *out_vx, double *out_vy, int *out_released, double *out_cursor_x, double *out_cursor_y, double *out_screen) {
+     NativeSdkAppKitHost *object = (__bridge NativeSdkAppKitHost *)host;
+     __block int ok = 0;
+     __block double resX = 0, resY = 0;
+@@ -10296,6 +10296,15 @@
+         double screenTop = NSMaxY(NSScreen.screens.firstObject.frame);
+         resX = newX;
+         resY = screenTop - (newY + frame.size.height);
++        if (out_screen) {
++            // The screen the window is on after the move, so a caller
++            // measures room against the display it actually sits on.
++            NSRect visible = (window.screen ?: NSScreen.mainScreen).visibleFrame;
++            out_screen[0] = visible.origin.x;
++            out_screen[1] = screenTop - NSMaxY(visible);
++            out_screen[2] = visible.size.width;
++            out_screen[3] = visible.size.height;
++        }
+         ok = 1;
+     };
+     __block NSPoint velocity = NSZeroPoint;
+diff --git a/src/platform/macos/cef_host.mm b/src/platform/macos/cef_host.mm
+--- a/src/platform/macos/cef_host.mm
++++ b/src/platform/macos/cef_host.mm
+@@ -2108,10 +2108,10 @@
+     [object setShortcutsWithIds:ids idLengths:id_lens keys:keys keyLengths:key_lens modifiers:modifiers count:count];
+ }
+ 
+-int native_sdk_appkit_move_window(native_sdk_appkit_host_t *host, uint64_t window_id, double dx, double dy, int clamp, double *out_x, double *out_y, int *out_hit_x, int *out_hit_y, int *out_primary_down, double *out_vx, double *out_vy, int *out_released, double *out_cursor_x, double *out_cursor_y) {
++int native_sdk_appkit_move_window(native_sdk_appkit_host_t *host, uint64_t window_id, double dx, double dy, int clamp, double *out_x, double *out_y, int *out_hit_x, int *out_hit_y, int *out_primary_down, double *out_vx, double *out_vy, int *out_released, double *out_cursor_x, double *out_cursor_y, double *out_screen) {
+     // The Chromium host does not implement window movement yet; callers
+     // treat 0 as "verb unavailable" (Effects.moveWindow returns null).
+-    (void)host; (void)window_id; (void)dx; (void)dy; (void)clamp;
++    (void)host; (void)window_id; (void)dx; (void)dy; (void)clamp; (void)out_screen;
+     if (out_x) *out_x = 0;
+     if (out_y) *out_y = 0;
+     if (out_hit_x) *out_hit_x = 0;

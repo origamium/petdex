@@ -239,6 +239,10 @@ pub const Model = struct {
     bubble_above_blocked_x: f64 = 0,
     bubble_above_blocked_y: f64 = 0,
     bubble_above_blocked_h: f32 = 0,
+    /// The visible frame of the screen the pet is on, from its last move
+    /// or read. Null where the host doesn't report it (Windows, Linux):
+    /// those keep deciding the side with the probe above.
+    pet_screen: ?Screen = null,
     // Drag + momentum, the old desktop's "Codex parity" physics: the
     // frame clock samples the window origin and the primary button
     // through fx.moveWindow(0,0); a down->up edge computes the release
@@ -3065,8 +3069,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 if (moved) |result| {
                     if (result.hit_x) model.vx = 0;
                     if (result.hit_y) model.vy = 0;
-                    model.pet_x = result.x;
-                    model.pet_y = result.y;
+                    notePet(model, result);
                 }
                 syncBubbleWindow(model, fx);
                 chat_shell.follow(model, fx);
@@ -3090,8 +3093,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 return;
             }
             const read = fx.moveWindow("main", 0, 0, false) orelse return;
-            model.pet_x = read.x;
-            model.pet_y = read.y;
+            notePet(model, read);
             syncBubbleWindow(model, fx);
             chat_shell.follow(model, fx);
             if (model.dragging) {
@@ -3104,8 +3106,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     const dy = (read.cursor_y - model.grab_dy) - read.y;
                     if (dx != 0 or dy != 0) {
                         if (fx.moveWindow("main", dx, dy, false)) |moved| {
-                            model.pet_x = moved.x;
-                            model.pet_y = moved.y;
+                            notePet(model, moved);
                             pushSample(model, moved.x, moved.y, now);
                         }
                     } else {
@@ -3138,8 +3139,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     if (fx.moveWindow("main", release_dx, release_dy, false)) |moved| {
                         release_x = moved.x;
                         release_y = moved.y;
-                        model.pet_x = moved.x;
-                        model.pet_y = moved.y;
+                        notePet(model, moved);
                         pushSample(model, moved.x, moved.y, now);
                         syncBubbleWindow(model, fx);
                         chat_shell.follow(model, fx);
@@ -3623,7 +3623,16 @@ fn hookWantedHeight(model: *const Model) f32 {
 /// height budget, never `keep`, the one just opened. The budget keeps
 /// the stack clear of the pet and on a small screen.
 fn trimHookCards(model: *Model, keep: usize) void {
-    while (hookWantedHeight(model) > bubble_window_max_h and model.hook_sim.closeOldestCard(keep)) {}
+    while (hookWantedHeight(model) > bubbleCardBudget(model) and model.hook_sim.closeOldestCard(keep)) {}
+}
+
+/// How tall the window may grow with cards open: the cap, or less when
+/// the pet's screen has less room on the bubbles' side.
+fn bubbleCardBudget(model: *const Model) f32 {
+    const screen = model.pet_screen orelse return bubble_window_max_h;
+    const room = if (model.bubble_flipped) roomBelow(model, screen) else roomAbove(model, screen);
+    const fit: f32 = @floatCast(room - bubble_pet_clearance);
+    return std.math.clamp(fit, model.hook_sim.closedHeight(), bubble_window_max_h);
 }
 
 fn bubbleFontSize(model: *const Model) f32 {
@@ -4069,6 +4078,7 @@ fn syncBubbleWindow(model: *Model, fx: *Effects) void {
     // before the cursor poll, so it never reached the frame clock's
     // update and flew the whole arc with a stale flag.
     const bubble_w = bubble_window_width;
+    if (model.pet_screen) |screen| return placeOnScreen(model, fx, screen);
     if (bubbleAboveProbeStale(model, bubble_h)) model.bubble_above_blocked = false;
     model.bubble_flipped = if (model.bubble_above_blocked)
         true
@@ -4103,6 +4113,33 @@ fn syncBubbleWindow(model: *Model, fx: *Effects) void {
     model.bubble_placed = true;
 }
 
+/// syncBubbleWindow where the host reports the pet's screen (macOS): the
+/// side and the room come from that screen, and the window is placed
+/// straight inside it. No probe, so no clamp against whichever display
+/// the bubble window happens to overlap most.
+fn placeOnScreen(model: *Model, fx: *Effects, screen: Screen) void {
+    model.bubble_above_blocked = false;
+    model.bubble_flipped = bubbleFlipOnScreen(model, screen);
+    // Dragged toward an edge with cards open: the room shrank.
+    trimHookCards(model, bubble_sim.capacity);
+    const bubble_w = bubble_window_width;
+    const bubble_h = bubbleWindowHeight(model);
+    if (@abs(bubble_w - bubble_window_w) > 0.5 or @abs(bubble_h - bubble_window_h) > 0.5) {
+        _ = fx.resizeWindow("bubble", bubble_w, bubble_h, .top_left);
+        bubble_window_w = bubble_w;
+        bubble_window_h = bubble_h;
+    }
+    const cur = fx.moveWindow("bubble", 0, 0, false) orelse {
+        model.bubble_placed = false;
+        return;
+    };
+    const want_x = std.math.clamp(bubbleWantX(model, bubble_w), screen.x, @max(screen.x, screen.x + screen.w - bubble_w));
+    if (bubbleMovePlan(cur.x, cur.y, want_x, bubbleWantY(model, bubble_h))) |plan| {
+        _ = fx.moveWindow("bubble", plan.dx, plan.dy, false) orelse return;
+    }
+    model.bubble_placed = true;
+}
+
 /// Where the left of the bubble window wants to sit: centered over the
 /// pet, unless the chat bubble is open beside it. Then the window's edge
 /// on that side stops at the pet's, so the bubbles never cover the chat.
@@ -4131,14 +4168,45 @@ fn bubbleWantY(model: *const Model, bubble_h: f32) f64 {
 /// frame: it takes the full height plus the clearance to flip down, but
 /// that threshold plus a margin to come back up.
 fn bubbleShouldFlip(model: *const Model, space_above: f64, needed: f64) bool {
-    const required = needed + bubble_pet_clearance;
     // Screen coordinates are global across the desktop. A monitor above
     // the primary screen legitimately reports negative y, which is not
     // evidence that there is no room above the pet. The destination
     // monitor's constrained move supplies that fact through hit_y.
     if (space_above < 0) return false;
-    if (model.bubble_flipped) return space_above < required + bubble_flip_hysteresis;
-    return space_above < required;
+    return flipForRoom(model.bubble_flipped, space_above, needed);
+}
+
+/// Below the pet once `room` above it can't hold `needed`, and back
+/// above only with the hysteresis to spare.
+fn flipForRoom(flipped: bool, room: f64, needed: f64) bool {
+    const required = needed + bubble_pet_clearance;
+    return room < required + (if (flipped) bubble_flip_hysteresis else 0);
+}
+
+/// A screen's visible frame, in the moveWindow space (top-left, y down).
+pub const Screen = struct { x: f64, y: f64, w: f64, h: f64 };
+
+/// Take the pet's position, and its screen where the host reports one,
+/// from a moveWindow result on the pet's own window.
+fn notePet(model: *Model, at: native_sdk.platform.MoveWindowResult) void {
+    model.pet_x = at.x;
+    model.pet_y = at.y;
+    model.pet_screen = if (at.has_screen) .{ .x = at.screen_x, .y = at.screen_y, .w = at.screen_w, .h = at.screen_h } else null;
+}
+
+/// Room between the pet and its own screen's top and bottom edges.
+fn roomAbove(model: *const Model, screen: Screen) f64 {
+    return model.pet_y - screen.y;
+}
+
+fn roomBelow(model: *const Model, screen: Screen) f64 {
+    return screen.y + screen.h - (model.pet_y + frame_h * model.scale);
+}
+
+/// The side, from the pet's own screen and the closed bubbles alone: a
+/// card opening or a bubble arriving never sends the stack across.
+fn bubbleFlipOnScreen(model: *const Model, screen: Screen) bool {
+    return flipForRoom(model.bubble_flipped, roomAbove(model, screen), model.hook_sim.closedHeight());
 }
 
 /// What the pet window shows before there is a pet to draw.
@@ -5811,6 +5879,62 @@ test "a blocked above probe stays sticky until position or size changes" {
     model.pet_y = -640;
     try std.testing.expect(!bubbleAboveProbeStale(&model, 300));
     try std.testing.expect(bubbleAboveProbeStale(&model, 301));
+}
+
+// A 4K display right of the primary one, bottoms aligned, so its top sits
+// 831 points above the primary screen's: the layout that used to send the
+// bubbles below a pet with plenty of room above it.
+const test_tall_screen: Screen = .{ .x = 2056, .y = -831, .w = 3840, .h = 2160 };
+
+test "the side is measured on the pet's own screen" {
+    var model: Model = .{};
+    testPushBubble(&model, "alpha", "older", false, -1);
+    testPushBubble(&model, "beta", "newer", true, -1);
+    syncHookSim(&model);
+    model.pet_screen = test_tall_screen;
+    // Just under the primary screen's top, 813 points under this one's.
+    model.pet_y = -18;
+    try std.testing.expect(!bubbleFlipOnScreen(&model, test_tall_screen));
+    // Hard against this screen's top, there is no room above.
+    model.pet_y = test_tall_screen.y + 10;
+    try std.testing.expect(bubbleFlipOnScreen(&model, test_tall_screen));
+}
+
+test "opening a card never moves the stack across; it closes when it can't fit" {
+    var model: Model = .{};
+    testPushBubble(&model, "alpha", "older", false, -1);
+    testPushBubble(&model, "beta", "newer", true, -1);
+    syncHookSim(&model);
+    model.pet_screen = test_tall_screen;
+    const closed: f64 = model.hook_sim.closedHeight();
+    // Room for the closed bubbles and 10 points more.
+    model.pet_y = test_tall_screen.y + closed + bubble_pet_clearance + 10;
+    try std.testing.expect(!bubbleFlipOnScreen(&model, test_tall_screen));
+    model.hook_sim.toggle(0);
+    try std.testing.expect(model.hook_sim.isOpen(0));
+    try std.testing.expect(!bubbleFlipOnScreen(&model, test_tall_screen));
+    // The card doesn't fit in the 10 points, so it shuts.
+    try std.testing.expectApproxEqAbs(@as(f32, @floatCast(closed + 10)), bubbleCardBudget(&model), 0.01);
+    trimHookCards(&model, bubble_sim.capacity);
+    try std.testing.expect(!model.hook_sim.isOpen(0));
+    // With the whole screen above it, the budget is the cap.
+    model.pet_y = 1000;
+    try std.testing.expectEqual(bubble_window_max_h, bubbleCardBudget(&model));
+}
+
+test "on its own screen the side keeps its hysteresis" {
+    var model: Model = .{};
+    testPushBubble(&model, "alpha", "older", false, -1);
+    syncHookSim(&model);
+    const needed: f64 = model.hook_sim.closedHeight();
+    const top = test_tall_screen.y;
+    model.pet_y = top + needed + bubble_pet_clearance - 1;
+    try std.testing.expect(bubbleFlipOnScreen(&model, test_tall_screen));
+    model.bubble_flipped = true;
+    model.pet_y = top + needed + bubble_pet_clearance + bubble_flip_hysteresis - 1;
+    try std.testing.expect(bubbleFlipOnScreen(&model, test_tall_screen));
+    model.pet_y = top + needed + bubble_pet_clearance + bubble_flip_hysteresis + 1;
+    try std.testing.expect(!bubbleFlipOnScreen(&model, test_tall_screen));
 }
 
 test "bubble movement crosses displays before applying target bounds" {
