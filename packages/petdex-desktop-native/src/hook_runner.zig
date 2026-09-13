@@ -94,10 +94,14 @@ pub fn run(phase: []const u8, arg_agent: ?[]const u8, origin_app: plat.OriginApp
     // Warp hands each pane a link back to itself. Every event carries it,
     // so the card can bring that pane forward. Codex's terminal UI runs its
     // sessions, hooks included, in a shared background app-server started
-    // outside Warp: there the link is looked up from the terminal UI at a
-    // turn's start and end, and the server keeps it in between.
+    // outside Warp: there the link is looked up from the terminal UI on
+    // every event. A turn's ends alone left a long turn without it (the
+    // link sent at its start was lost with an app restarted mid-turn), and a
+    // permission prompt is exactly when the pane is wanted.
+    // ponytail: a process scan per Codex event, a few ms; cache it per
+    // session if tool calls ever feel it.
     var focus_buf: [64]u8 = undefined;
-    const hosted = std.mem.eql(u8, agent, "codex") and (isPromptPhase(phase) or isStopPhase(phase));
+    const hosted = std.mem.eql(u8, agent, "codex");
     settings.focus_url = plat.safeWarpFocusUrl(warp_focus_raw) orelse
         (if (hosted) plat.warpFocusUrlOf("codex", jsonString(payload, "cwd") orelse "", &focus_buf) else null) orelse "";
 
