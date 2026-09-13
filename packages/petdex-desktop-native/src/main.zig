@@ -3669,10 +3669,22 @@ fn bubbleStatus(model: *const Model, slot: usize) []const u8 {
     };
 }
 
-/// The window holds the bubbles that keep a place, and every open card.
-/// It changes only when those do, never per frame of motion.
-fn bubbleWindowHeight(model: *const Model) f32 {
+/// The bubbles' own extent: those that keep a place, and every open card,
+/// closing ones included.
+fn bubbleStackHeight(model: *const Model) f32 {
     return model.hook_sim.contentHeightFor(hookCardHeights(model), true);
+}
+
+/// The bubble window's height, which off Linux never changes. A resized
+/// window's canvas could fall out of step with it: after a night's sleep a
+/// 56 pt window kept drawing a 190 pt canvas, every bubble drew outside the
+/// window, and none came back. A window that is never resized can't. The
+/// bubbles sit against its edge by the pet, and it takes clicks only over
+/// a bubble, so the empty rest lets them through. Linux's popup is sized to
+/// its content by the compositor.
+fn bubbleWindowHeight(model: *const Model) f32 {
+    if (comptime builtin.target.os.tag == .linux) return bubbleStackHeight(model);
+    return bubble_window_max_h;
 }
 
 /// The height the open cards ask for, not counting cards on their way
@@ -3724,7 +3736,7 @@ fn hookLayout(model: *const Model) bubble_sim.Layout {
     const heights = hookCardHeights(model);
     return .{
         .width = bubble_window_width,
-        .height = model.hook_sim.contentHeightFor(heights, true),
+        .height = if (comptime builtin.target.os.tag == .linux) model.hook_sim.contentHeightFor(heights, true) else bubble_window_max_h,
         .flipped = model.bubble_flipped,
         .still = model.reduce_motion,
         .card_w = bubble_card_width,
@@ -5758,14 +5770,14 @@ test "the bubble window holds a row whatever the text, and grows by the card whe
     var model: Model = .{};
     testPushBubble(&model, "alpha", "a much longer line of bubble text than any card could hold on one line", true, -1);
     syncHookSim(&model);
-    const closed = bubbleWindowHeight(&model);
+    const closed = bubbleStackHeight(&model);
     try std.testing.expectEqual(bubble_sim.contentHeight(1, &.{}), closed);
     model.hook_sim.toggle(0);
-    const open = bubbleWindowHeight(&model);
+    const open = bubbleStackHeight(&model);
     try std.testing.expect(open > closed);
     // The card, not the bubbles, grows with the text size.
     model.bubble_text_px = bubble_text_max_px;
-    try std.testing.expect(bubbleWindowHeight(&model) > open);
+    try std.testing.expect(bubbleStackHeight(&model) > open);
 }
 
 test "a hook card names the project, the agent and what it needs" {
@@ -5999,7 +6011,7 @@ test "flipping sends the stack below the pet, clear of the sprite" {
     var model: Model = .{};
     testPushBubble(&model, "alpha", "older", false, -1);
     testPushBubble(&model, "beta", "newer", true, -1);
-    const bubble_h = bubbleWindowHeight(&model);
+    const bubble_h = bubbleStackHeight(&model);
 
     // Pet pinned to the very top of the screen: there is no room above,
     // so the window must hang below it and never overlap the sprite.
@@ -6071,7 +6083,7 @@ test "a pet above the primary screen keeps the first bubble candidate above" {
     var model: Model = .{};
     model.pet_y = -640;
     model.bubble_flipped = false;
-    const needed: f64 = @floatCast(bubbleWindowHeight(&model));
+    const needed: f64 = @floatCast(bubbleStackHeight(&model));
 
     // The host reports negative top-left y coordinates for monitors above
     // the primary screen. The first candidate must therefore be above; the
@@ -6240,7 +6252,7 @@ test "a thrown pet keeps its flip current through the flight" {
     model.pet_y = 0;
     model.bubble_flipped = true;
 
-    const needed: f64 = @floatCast(bubbleWindowHeight(&model));
+    const needed: f64 = @floatCast(bubbleStackHeight(&model));
     // A real flick: 900 px/s only carries the pet ~115px before friction
     // drops it under physics_min_vel, short of the threshold, so the test
     // would never cross anything. This is a hard throw.
@@ -6406,11 +6418,11 @@ test "several cards can be open at once, and the window holds them all" {
     testPushBubble(&model, "a", "one", true, -1);
     testPushBubble(&model, "b", "two", true, -1);
     syncHookSim(&model);
-    const closed = bubbleWindowHeight(&model);
+    const closed = bubbleStackHeight(&model);
     model.hook_sim.toggle(0);
-    const one = bubbleWindowHeight(&model);
+    const one = bubbleStackHeight(&model);
     model.hook_sim.toggle(1);
-    const two = bubbleWindowHeight(&model);
+    const two = bubbleStackHeight(&model);
     try std.testing.expect(one > closed);
     try std.testing.expect(two > one);
     try std.testing.expect(model.hook_sim.isOpen(0) and model.hook_sim.isOpen(1));
@@ -6442,10 +6454,10 @@ test "a seventh conversation starts a second row of bubbles" {
     const sessions = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g" };
     for (sessions[0..bubble_sim.per_row]) |session| testPushBubble(&model, session, "reading", true, -1);
     syncHookSim(&model);
-    const one_row = bubbleWindowHeight(&model);
+    const one_row = bubbleStackHeight(&model);
     testPushBubble(&model, sessions[bubble_sim.per_row], "testing", true, -1);
     syncHookSim(&model);
-    try std.testing.expect(bubbleWindowHeight(&model) > one_row);
+    try std.testing.expect(bubbleStackHeight(&model) > one_row);
     try std.testing.expectEqualStrings("g", newestBubble(&model).?.sessionSlice());
 }
 
@@ -6472,12 +6484,27 @@ test "newest bubble follows its update counter instead of its slot" {
     try std.testing.expectEqualStrings("codex-session", model.bubbles[1].sessionSlice());
 }
 
+test "off Linux the bubble window keeps one height while bubbles and cards come and go" {
+    if (builtin.target.os.tag == .linux) return error.SkipZigTest;
+    var model: Model = .{};
+    testPushBubble(&model, "a", "one", true, -1);
+    syncHookSim(&model);
+    try std.testing.expectEqual(bubble_window_max_h, bubbleWindowHeight(&model));
+    try std.testing.expectEqual(bubble_window_max_h, hookLayout(&model).height);
+    // A new bubble rises at the window's edge by the pet, not its far one.
+    try std.testing.expect(model.hook_sim.bodies[0].y > bubble_window_max_h / 2);
+    model.hook_sim.toggle(0);
+    testPushBubble(&model, "b", "two", true, -1);
+    syncHookSim(&model);
+    try std.testing.expectEqual(bubble_window_max_h, bubbleWindowHeight(&model));
+}
+
 test "an empty stack still reserves one card of window height" {
     var model: Model = .{};
-    const empty = bubbleWindowHeight(&model);
+    const empty = bubbleStackHeight(&model);
     testPushBubble(&model, "alpha", "reading", true, -1);
     // Every card is the same height, so the reserve is exactly one card.
-    try std.testing.expectEqual(empty, bubbleWindowHeight(&model));
+    try std.testing.expectEqual(empty, bubbleStackHeight(&model));
 }
 
 test "expiry drops only the bubbles past their deadline" {
