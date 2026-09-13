@@ -4997,11 +4997,21 @@ fn petdexWindows(model: *const Model, scratch: *PetdexApp.WindowsScratch) []cons
             .titlebar = if (chat_view.bubble) .chromeless else .hidden_inset,
             .floating = chat_view.bubble,
             .transparent = chat_view.bubble,
+            .quiet_show = model.chat.quiet_open,
             .on_close = .chat_closed,
         };
         count += 1;
     }
     return scratch.windows[0..count];
+}
+
+test "a chat the pet opened itself shows without taking focus" {
+    var model: Model = .{};
+    model.chat.open = true;
+    var scratch: PetdexApp.WindowsScratch = undefined;
+    try std.testing.expect(!petdexWindows(&model, &scratch)[0].quiet_show);
+    model.chat.quiet_open = true;
+    try std.testing.expect(petdexWindows(&model, &scratch)[0].quiet_show);
 }
 
 test "chat opens as a speech bubble beside the pet on macOS" {

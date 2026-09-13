@@ -1,0 +1,151 @@
+diff --git a/src/platform/types.zig b/src/platform/types.zig
+--- a/src/platform/types.zig
++++ b/src/platform/types.zig
+@@ -586,6 +586,10 @@
+     /// The window never receives mouse events: clicks fall through to
+     /// whatever is behind it.
+     click_through: bool = false,
++    /// petdex: show the window without taking focus: ordered front, not
++    /// made key, and the app is not activated (macOS). A click still
++    /// focuses it as usual.
++    quiet_show: bool = false,
+     /// When non-zero, create this window as a compositor-managed popup
+     /// child of the named native window instead of an independent
+     /// toplevel.
+@@ -660,6 +664,8 @@
+     /// The window never receives mouse events: clicks fall through to
+     /// whatever is behind it.
+     click_through: bool = false,
++    /// petdex: see `WindowOptions.quiet_show`.
++    quiet_show: bool = false,
+     popup_parent_id: WindowId = 0,
+     show: WindowShowMode = .immediate,
+     /// Window-enforced content min-size floor (see
+@@ -682,6 +688,7 @@
+             .fullscreen_overlay = self.fullscreen_overlay,
+             .transparent = self.transparent,
+             .click_through = self.click_through,
++            .quiet_show = self.quiet_show,
+             .popup_parent_id = self.popup_parent_id,
+             .show = self.show,
+             .min_width = self.min_width,
+diff --git a/src/primitives/app_manifest/types.zig b/src/primitives/app_manifest/types.zig
+--- a/src/primitives/app_manifest/types.zig
++++ b/src/primitives/app_manifest/types.zig
+@@ -473,6 +473,9 @@
+     transparent: bool = false,
+     /// The window ignores mouse events entirely; clicks fall through.
+     click_through: bool = false,
++    /// petdex: show without taking focus (see the platform
++    /// `WindowOptions.quiet_show`).
++    quiet_show: bool = false,
+     /// Runtime-created popup parent. Zero keeps the ordinary toplevel
+     /// role. Startup manifest windows must remain toplevels.
+     popup_parent_id: u64 = 0,
+diff --git a/src/runtime/ui_app.zig b/src/runtime/ui_app.zig
+--- a/src/runtime/ui_app.zig
++++ b/src/runtime/ui_app.zig
+@@ -292,6 +292,9 @@
+             fullscreen_overlay: bool = false,
+             transparent: bool = false,
+             click_through: bool = false,
++            /// petdex: open without taking focus (see the platform
++            /// `WindowOptions.quiet_show`); fixed at create time.
++            quiet_show: bool = false,
+             /// Label of an already-live parent window. When set, the
+             /// platform creates this descriptor as a compositor-managed
+             /// popup child rather than a second toplevel.
+@@ -1967,6 +1970,7 @@
+                 .fullscreen_overlay = descriptor.fullscreen_overlay,
+                 .transparent = descriptor.transparent,
+                 .click_through = descriptor.click_through,
++                .quiet_show = descriptor.quiet_show,
+                 .popup_parent_id = popup_parent_id,
+                 .titlebar = descriptor.titlebar,
+                 .min_width = descriptor.min_width,
+diff --git a/src/runtime/window_views.zig b/src/runtime/window_views.zig
+--- a/src/runtime/window_views.zig
++++ b/src/runtime/window_views.zig
+@@ -171,6 +171,7 @@
+                 .fullscreen_overlay = shell_window.fullscreen_overlay,
+                 .transparent = shell_window.transparent,
+                 .click_through = shell_window.click_through,
++                .quiet_show = shell_window.quiet_show,
+                 .popup_parent_id = shell_window.popup_parent_id,
+                 .restore_state = shell_window.restore_state,
+                 .restore_policy = shellRestorePolicy(shell_window.restore_policy),
+diff --git a/src/platform/macos/root.zig b/src/platform/macos/root.zig
+--- a/src/platform/macos/root.zig
++++ b/src/platform/macos/root.zig
+@@ -1052,6 +1052,8 @@
+     if (options.transparent) flags |= 2;
+     if (options.click_through) flags |= 4;
+     if (options.fullscreen_overlay) flags |= 8;
++    // petdex: bit 4, show without taking focus.
++    if (@hasField(@TypeOf(options), "quiet_show") and options.quiet_show) flags |= 16;
+     return flags;
+ }
+ 
+diff --git a/src/platform/macos/appkit_host.m b/src/platform/macos/appkit_host.m
+--- a/src/platform/macos/appkit_host.m
++++ b/src/platform/macos/appkit_host.m
+@@ -942,6 +942,16 @@
+ 
+ // Recursively re-emit the gpu-surface resize event for every metal
+ // surface under `view` (the tall-titlebar chrome re-query path).
++// petdex: windows created to show without taking focus (bit 4 of the
++// window flags). They are ordered front like a companion panel: never made
++// key, and the app is not activated, so whatever the user is typing into
++// keeps the keyboard. A click focuses them as usual.
++static NSMutableSet<NSNumber *> *NativeSdkQuietShowWindows(void) {
++    static NSMutableSet<NSNumber *> *set;
++    if (!set) set = [[NSMutableSet alloc] init];
++    return set;
++}
++
+ static void NativeSdkEmitGpuSurfaceResizes(NSView *view) {
+     if ([view isKindOfClass:[NativeSdkMetalSurfaceView class]]) {
+         [(NativeSdkMetalSurfaceView *)view emitResizeEvent];
+@@ -1080,6 +1090,7 @@
+     [self.host.windowClearColors removeObjectForKey:key];
+     [self.host.windowMoveSamples removeObjectForKey:key];
+     [self.host.windowDragActive removeObject:key];
++    [NativeSdkQuietShowWindows() removeObject:key];
+     if (self.host.windows.count == 0) {
+         [self.host emitShutdown];
+         [self.host stop];
+@@ -6573,6 +6584,7 @@
+     }
+     const BOOL floating = (windowFlags & 1) != 0;
+     const BOOL fullscreenOverlay = (windowFlags & 8) != 0;
++    const BOOL quietShow = (windowFlags & 16) != 0;
+     if (fullscreenOverlay) {
+         styleMask |= NSWindowStyleMaskNonactivatingPanel;
+     }
+@@ -6691,6 +6703,8 @@
+     self.windows[key] = window;
+     self.delegates[key] = delegate;
+     self.windowLabels[key] = label.length > 0 ? label : @"main";
++    if (quietShow) [NativeSdkQuietShowWindows() addObject:key];
++    else [NativeSdkQuietShowWindows() removeObject:key];
+     // Present-before-show: a deferred window stays ordered OUT until its
+     // first gpu-surface present lands (`showDeferredWindowIfPending`, at
+     // the bottom of every present path) — the user never sees a blank
+@@ -6710,7 +6724,7 @@
+         self.delegate = delegate;
+         self.windowLabel = label.length > 0 ? label : @"main";
+     } else if (showPolicy != 1) {
+-        if (fullscreenOverlay) {
++        if (fullscreenOverlay || quietShow) {
+             [window orderFrontRegardless];
+         } else {
+             [window makeKeyAndOrderFront:nil];
+@@ -6734,7 +6748,7 @@
+         const double elapsedMs = (double)(NativeSdkTimestampNanoseconds() - createdNs.unsignedLongLongValue) / 1e6;
+         fprintf(stderr, "native-sdk: window %llu shown (%s) %.1f ms after create wall_ns=%llu\n", (unsigned long long)windowId, reason, elapsedMs, (unsigned long long)clock_gettime_nsec_np(CLOCK_REALTIME));
+     }
+-    if ([window isKindOfClass:[NativeSdkCompanionPanel class]]) {
++    if ([window isKindOfClass:[NativeSdkCompanionPanel class]] || [NativeSdkQuietShowWindows() containsObject:key]) {
+         [window orderFrontRegardless];
+     } else {
+         [window makeKeyAndOrderFront:nil];

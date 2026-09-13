@@ -136,6 +136,9 @@ pub const State = struct {
     reopen_at_ms: i64 = 0,
     /// The last placement warning, so a stuck window can't flood the log.
     warned_ms: i64 = 0,
+    /// The pet opened the chat itself, to say something unprompted: its
+    /// window shows without taking focus from whatever the user is in.
+    quiet_open: bool = false,
 
     pub fn petSlug(self: *const State) []const u8 {
         return self.pet[0..self.pet_len];
@@ -296,6 +299,8 @@ fn open(model: *Model, fx: *Effects) void {
     st.scroll = 0;
     st.history = false;
     st.place = .{};
+    // Opened by the user unless speak says otherwise right after.
+    st.quiet_open = false;
     app.registerTail(model.dark, fx);
     st.open = true;
 }
@@ -338,8 +343,11 @@ pub fn speak(model: *Model, prompt: session.Prompt, fx: *Effects) bool {
     const action = st.session.brief(prompt, needsRefresh(st, fx));
     if (action == .none) return false;
     // Said in the chat, which opens beside the pet if it was shut; the
-    // line stays there like any reply.
+    // line stays there like any reply. Opened this way, it takes neither
+    // the keyboard nor the front from the app the user is in.
+    const was_open = st.open;
     show(model, fx);
+    if (!was_open) st.quiet_open = true;
     st.history = false;
     st.scroll = 0;
     pickThinking(st);
