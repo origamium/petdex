@@ -3287,6 +3287,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // `petdex://<slug>` link has work to do.
             drainPendingInstall(model, fx);
             sdk_log.tick(fx.wallMs());
+            // The frame clock is not the only reader of the pet's place: a
+            // pet presenting no frames (occluded, or still on some hosts)
+            // would leave the chat and the bubbles below placed against
+            // wherever it was last seen.
+            if (fx.moveWindow("main", 0, 0, false)) |read| notePet(model, read);
             chat_shell.poll(model, fx);
             if (!model.sheet_loaded) return;
             if (model.settings_open and thumbs_built < catalog_mod.catalog_len) buildNextThumb(fx);

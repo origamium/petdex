@@ -456,15 +456,114 @@ fn tailY(pet_y: f64, pet_h: f64, win_y: f64, card_top: f32, card_h: f32) f32 {
 }
 
 /// Keep the bubble beside the pet: on every frame the pet may move, and
-/// on poll ticks. Moves only when the target changed or the window was
-/// nudged (AppKit settles a new window after its first frame), and
-/// switches sides when the screen clamp stops it short. Descriptor
-/// coordinates are only a creation hint, so this also does the first
-/// placement.
+/// on poll ticks. Descriptor coordinates are only a creation hint, so this
+/// also does the first placement.
 pub fn follow(model: *Model, fx: *Effects) void {
     const st = &model.chat;
     // Linux has no window move or resize.
     if (!st.open or builtin.os.tag == .linux) return;
+    if (chat_view.bubble) {
+        if (model.pet_screen) |screen| return followOnScreen(model, fx, screen);
+    }
+    followProbed(model, fx);
+}
+
+/// The bubble beside the pet on the pet's own screen (macOS reports it).
+/// The spot is computed whole every time and the window goes there
+/// whenever it isn't: nothing remembered can hold it somewhere else, and
+/// no clamp runs against whichever display the bubble overlaps most, which
+/// is how it could be pinned to the edge of another screen.
+fn followOnScreen(model: *Model, fx: *Effects, screen: app.Screen) void {
+    const st = &model.chat;
+    const p = &st.place;
+    var cur = fx.moveWindow(window_label, 0, 0, false) orelse return; // not created yet
+    const h = chat_view.windowHeight(model);
+    if (h != p.h) {
+        // AppKit keeps the bottom edge on resize; the move below puts the
+        // top back beside the pet's head.
+        _ = fx.resizeWindow(window_label, chat_view.window_w, h, .top_left);
+        p.h = h;
+        cur = fx.moveWindow(window_label, 0, 0, false) orelse return;
+    }
+    const pet = petOf(model);
+    p.left = besideLeft(pet, screen, chat_view.window_w, p.left);
+    const speech_top = chat_view.speechTop(model);
+    const at = placeBeside(pet, screen, p.left, speech_top, h);
+    if (app.bubbleMovePlan(cur.x, cur.y, at.x, at.y)) |m| _ = fx.moveWindow(window_label, m.dx, m.dy, false) orelse return;
+    p.want_x = at.x;
+    p.want_y = at.y;
+    p.at_x = at.x;
+    p.at_y = at.y;
+    p.tail_y = tailY(pet.y, pet.h, at.y, speech_top, chat_view.cardHeight(model));
+}
+
+fn petOf(model: *const Model) Pet {
+    return .{
+        .x = model.pet_x,
+        .y = model.pet_y,
+        .w = app.frame_w * model.scale,
+        .h = app.frame_h * model.scale,
+    };
+}
+
+/// The pet's left for the bubble: right while it fits on the pet's screen,
+/// else left when that fits. Once left, right again only with
+/// `side_hysteresis` to spare, so it cannot flap at the edge; with room on
+/// neither side it keeps the side it has.
+fn besideLeft(pet: Pet, screen: app.Screen, win_w: f64, left_now: bool) bool {
+    const spare: f64 = if (left_now) side_hysteresis else 0;
+    if (pet.x + pet.w + pet_gap + win_w + spare <= screen.x + screen.w) return false;
+    if (pet.x - pet_gap - win_w >= screen.x) return true;
+    return left_now;
+}
+
+/// The window origin beside the pet on that side, kept inside the pet's
+/// screen.
+fn placeBeside(pet: Pet, screen: app.Screen, left: bool, speech_top: f32, win_h: f32) Point {
+    const want = originBeside(pet, left, speech_top);
+    const w: f64 = chat_view.window_w;
+    const h: f64 = win_h;
+    return .{
+        .x = std.math.clamp(want.x, screen.x, @max(screen.x, screen.x + screen.w - w)),
+        .y = std.math.clamp(want.y, screen.y, @max(screen.y, screen.y + screen.h - h)),
+    };
+}
+
+// The 4K display beside the primary one on the development Mac: its top
+// sits 831 points above the primary screen's, where no other screen is.
+const test_screen: app.Screen = .{ .x = 2056, .y = -831, .w = 3840, .h = 2160 };
+
+test "the chat takes the pet's right, else its left, on the pet's own screen" {
+    const t = std.testing;
+    const w: f64 = chat_view.window_w;
+    try t.expect(!besideLeft(.{ .x = 4000, .y = -400, .w = 230, .h = 250 }, test_screen, w, false));
+    const right_edge = test_screen.x + test_screen.w;
+    try t.expect(besideLeft(.{ .x = right_edge - 300, .y = -400, .w = 230, .h = 250 }, test_screen, w, false));
+    // Right fits, but not with the hysteresis to spare: a left chat stays.
+    const near: Pet = .{ .x = right_edge - (230 + pet_gap + w) - side_hysteresis / 2, .y = -400, .w = 230, .h = 250 };
+    try t.expect(besideLeft(near, test_screen, w, true));
+    try t.expect(!besideLeft(near, test_screen, w, false));
+}
+
+test "the chat stays inside the pet's screen, off the screens beside it" {
+    const t = std.testing;
+    // At the 4K's left edge, above the primary screen's top: the chat's
+    // left spot is where no screen is, so it stays on the 4K.
+    const pet: Pet = .{ .x = 2060, .y = -600, .w = 230, .h = 250 };
+    const at = placeBeside(pet, test_screen, true, 0, 300);
+    try t.expectEqual(test_screen.x, at.x);
+    try t.expectEqual(@as(f64, -600), at.y);
+    // Too tall for the room below the pet: pushed up, still on the screen.
+    const low: Pet = .{ .x = 4000, .y = test_screen.y + test_screen.h - 100, .w = 230, .h = 250 };
+    try t.expectEqual(test_screen.y + test_screen.h - 300, placeBeside(low, test_screen, false, 0, 300).y);
+}
+
+/// Placement by the display clamp's report, for hosts that don't report
+/// the pet's screen. Moves only when the target changed or the window was
+/// nudged, and switches sides when the clamp stops it short. A titled
+/// window (Windows) is placed once and then belongs to the user.
+fn followProbed(model: *Model, fx: *Effects) void {
+    const st = &model.chat;
     const p = &st.place;
     // A titled window (Windows) is placed once and then belongs to the user.
     if (!chat_view.bubble and p.placed()) return;
