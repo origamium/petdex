@@ -188,24 +188,30 @@ fn textWidth(model: *const Model, text: []const u8) f32 {
     return canvas.measureTextWidthForFont(tokens.text_measure, font, text, tokens.typography.body_size);
 }
 
-const Fit = struct { lines: usize, cut: usize };
+pub const Fit = struct { lines: usize, cut: usize };
 
 /// How `text` wraps at `width` in body text, up to `max` lines: the line
 /// count and the byte where the text must be cut to stay within them.
 /// Uses the SDK's own line breaker with the tokens' measurement, so it
 /// matches the paragraph painted from it.
 fn fit(model: *const Model, text: []const u8, width: f32, comptime max: usize) Fit {
+    return fitSized(model, text, width, app.petdexTokens(model).typography.body_size, lineHeight(model), max);
+}
+
+/// fit at any text size: the hook bubble's card measures its text at the
+/// bubble text size.
+pub fn fitSized(model: *const Model, text: []const u8, width: f32, size: f32, line_height: f32, comptime max: usize) Fit {
     const tokens = app.petdexTokens(model);
     var lines: [max + 1]canvas.TextLine = undefined;
     const count = if (canvas.layoutTextRun(.{
         .font_id = canvas.textSpanFontId(.{ .text = "" }, tokens.typography),
-        .size = tokens.typography.body_size,
+        .size = size,
         .origin = .{ .x = 0, .y = 0 },
         .color = tokens.colors.text,
         .text = text,
     }, .{
         .max_width = width,
-        .line_height = lineHeight(model),
+        .line_height = line_height,
         .measure = tokens.text_measure,
     }, &lines)) |layout| layout.lineCount() else |_| lines.len;
     if (count <= max) return .{ .lines = @max(1, count), .cut = text.len };
@@ -216,7 +222,7 @@ fn fit(model: *const Model, text: []const u8, width: f32, comptime max: usize) F
 }
 
 /// `text` cut to fit, an ellipsis standing in for the rest.
-fn clipped(ui: *AppUi, text: []const u8, f: Fit) []const u8 {
+pub fn clipped(ui: *AppUi, text: []const u8, f: Fit) []const u8 {
     if (f.cut >= text.len) return text;
     // Two characters back, so the ellipsis stays on the last line.
     var cut = f.cut;
@@ -461,7 +467,39 @@ pub fn settingsSection(ui: *AppUi, model: *const Model) AppUi.Node {
             }),
             stackPicker(ui, st),
         })),
+        panel(ui, ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
+            ui.column(.{ .grow = 1 }, .{
+                ui.text(.{}, i18n.t("Small talk", "ひとりごと")),
+                muted(ui, i18n.t("Now and then, your pet says something on its own", "ときどき、ペットが自分から話しかけます")),
+            }),
+            chatterPicker(ui, st),
+        })),
+        panel(ui, ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
+            ui.column(.{ .grow = 1 }, .{
+                ui.text(.{}, i18n.t("Speak up when an agent needs you", "対応が必要なとき声をかける")),
+                muted(ui, i18n.t("Your pet tells you once when a coding agent waits on you", "エージェントが待っているとき、ペットが一度だけ知らせます")),
+            }),
+            ui.el(.switch_control, .{
+                .selected = st.nudge,
+                .on_toggle = .toggle_nudge,
+                .semantics = .{ .label = i18n.t("Speak up when an agent needs you", "対応が必要なとき声をかける") },
+            }, .{}),
+        })),
     });
+}
+
+fn chatterPicker(ui: *AppUi, st: *const State) AppUi.Node {
+    var buttons: [chat_shell.chatter_choices.len]AppUi.Node = undefined;
+    for (&buttons, chat_shell.chatter_choices) |*button, minutes| button.* = ui.button(.{
+        .size = .sm,
+        .variant = if (st.chatter_minutes == minutes) .primary else .secondary,
+        .on_press = Msg{ .set_chatter = minutes },
+    }, switch (minutes) {
+        0 => i18n.t("Off", "オフ"),
+        60 => i18n.t("1 h", "1時間"),
+        else => i18n.fmt(ui, "{d} min", "{d}分", .{minutes}),
+    });
+    return ui.row(.{ .gap = 4 }, @as([]const AppUi.Node, &buttons));
 }
 
 fn stackPicker(ui: *AppUi, st: *const State) AppUi.Node {
@@ -629,7 +667,7 @@ test "the reply card thinks until the first words, a briefing included" {
     try std.testing.expectEqualStrings("hey", speech(st, &buf).text);
     // A briefing adds no user turn: the old reply joins the stack and
     // the card thinks.
-    try std.testing.expectEqual(chat.session.Action.request, s.brief(false));
+    try std.testing.expectEqual(chat.session.Action.request, s.brief(.briefing, false));
     try std.testing.expectEqualStrings(st.thinkingText(), speech(st, &buf).text);
     try std.testing.expectEqual(@as(usize, 2), stacked(&model).to);
     // The first words replace the thinking line; the old reply stays stacked.

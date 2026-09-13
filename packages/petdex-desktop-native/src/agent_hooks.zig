@@ -231,19 +231,23 @@ fn qoderStatus(allocator: std.mem.Allocator, home: []const u8) HookStatus {
     return folded orelse .absent;
 }
 
-/// The five Claude-shaped hook events the bubble pipeline rides.
+/// The Claude-shaped hook events the bubble pipeline rides. The two
+/// failures are what light the `failed` sprite row and the bubble's "!":
+/// a tool that failed (the agent usually carries on), and a turn that
+/// ended on an error, such as an API error or a rate limit.
 const claude_events = [_]HookEvent{
     .{ .event = "UserPromptSubmit", .phase = "user-prompt" },
     .{ .event = "PreToolUse", .phase = "pre" },
     .{ .event = "PostToolUse", .phase = "post" },
+    .{ .event = "PostToolUseFailure", .phase = "tool-failure" },
     .{ .event = "Notification", .phase = "notification" },
     .{ .event = "Stop", .phase = "stop" },
+    .{ .event = "StopFailure", .phase = "stop-failure" },
 };
 
-/// The Claude five plus PostToolUseFailure, the one event no other wired agent
-/// reports — it is what lights the `failed` sprite row. The two Post* events are
-/// mutually exclusive per tool call (coreToolHookTriggers.ts:288 gates
-/// PostToolUse on `!toolResult.error`), so no trailing `idle` stomps it.
+/// The Claude events up to Stop, with PostToolUseFailure. The two Post*
+/// events are mutually exclusive per tool call (coreToolHookTriggers.ts:288
+/// gates PostToolUse on `!toolResult.error`), so no trailing `idle` stomps it.
 const qoder_events = [_]HookEvent{
     .{ .event = "UserPromptSubmit", .phase = "user-prompt" },
     .{ .event = "PreToolUse", .phase = "pre" },
@@ -2212,9 +2216,10 @@ test "installClaude merges into a real fixture home non-destructively" {
     try t.expect(std.mem.indexOf(u8, merged, "\"model\"") != null);
     try t.expect(std.mem.indexOf(u8, merged, "statusLine") != null);
     try t.expect(std.mem.indexOf(u8, merged, "my-own-thing") != null);
-    // The node entry is gone, the canonical one is in, all five events.
+    // The node entry is gone, the canonical one is in, every event.
     try t.expect(std.mem.indexOf(u8, merged, "petdex.js") == null);
     try t.expect(std.mem.indexOf(u8, merged, "petdex-hook") != null);
+    try t.expect(std.mem.indexOf(u8, merged, "StopFailure") != null);
     try t.expect(std.mem.indexOf(u8, merged, "UserPromptSubmit") != null);
     try t.expect(std.mem.indexOf(u8, merged, "Stop") != null);
     // Idempotent: run again, still exactly one petdex entry per event.

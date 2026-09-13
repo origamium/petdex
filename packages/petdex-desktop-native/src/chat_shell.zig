@@ -53,7 +53,8 @@ const stream_timeout_ms: u32 = 5 * 60 * 1000;
 const chatgpt_account = "chatgpt";
 const reply_wave_ms: u32 = 1500;
 const failed_ms: u32 = 2500;
-const excerpt_bytes = 190;
+/// The small-talk intervals Settings offers, in minutes; 0 is off.
+pub const chatter_choices = [_]u16{ 0, 5, 15, 30, 60 };
 
 pub const ChatgptPhase = enum { signed_out, authorizing, exchanging, signed_in, failed };
 const TokenPurpose = enum { none, sign_in, refresh };
@@ -72,6 +73,10 @@ pub const Place = struct {
     /// The height last applied, and the tail's center in the window.
     h: f32 = 0,
     tail_y: f32 = 0,
+    /// Where the pet was at the last placement: a window off its spot
+    /// while the pet stayed put was moved by something else.
+    pet_x: f64 = 0,
+    pet_y: f64 = 0,
 
     pub fn placed(self: Place) bool {
         return !std.math.isNan(self.want_x);
@@ -96,7 +101,6 @@ pub const State = struct {
     local_url: canvas.TextBuffer(256) = .{},
     local_model: canvas.TextBuffer(128) = .{},
     codex_model: canvas.TextBuffer(128) = .{},
-    bubble_excerpt: bool = true,
     /// Recent exchanges stacked above the reply, 1 to max_stack.
     stack: u8 = 3,
     /// The line shown until the reply's first words, picked per request
@@ -119,6 +123,22 @@ pub const State = struct {
     /// Past exchanges instead of the latest reply.
     history: bool = false,
     place: Place = .{},
+    /// Minutes between unprompted small talk; 0 is off (Settings).
+    chatter_minutes: u16 = 0,
+    /// When the next small talk is due; 0 until scheduled.
+    next_chatter_ms: i64 = 0,
+    /// Speak up when a coding agent starts waiting on the user (Settings).
+    nudge: bool = false,
+    /// Since when the open chat's window can't be found; 0 while it can.
+    lost_since_ms: i64 = 0,
+    /// The window went missing and was closed; it opens again at this
+    /// time, once the old window's close has surely come and gone. 0: none.
+    reopen_at_ms: i64 = 0,
+    /// The last placement warning, so a stuck window can't flood the log.
+    warned_ms: i64 = 0,
+    /// The pet opened the chat itself, to say something unprompted: its
+    /// window shows without taking focus from whatever the user is in.
+    quiet_open: bool = false,
 
     pub fn petSlug(self: *const State) []const u8 {
         return self.pet[0..self.pet_len];
@@ -186,8 +206,17 @@ pub fn boot(model: *Model) void {
 /// From poll_tick: follow pet switches while the window is open, and
 /// pick up the ChatGPT sign-in callback.
 pub fn poll(model: *Model, fx: *Effects) void {
+    // The window went missing (followOnScreen) and was closed; it opens
+    // again, as a user closing and reopening the chat would. The wait lets
+    // the old window's close notice (`chat_closed`) land first, so it
+    // can't shut the new one. Opened meanwhile by hand, nothing to do.
+    if (model.chat.reopen_at_ms != 0 and fx.wallMs() >= model.chat.reopen_at_ms) {
+        model.chat.reopen_at_ms = 0;
+        if (!model.chat.open) open(model, fx);
+    }
     if (model.chat.open) syncPet(model, fx);
     follow(model, fx);
+    chatterTick(model, fx);
     const callback = hook_server.chatgpt_mailbox.take() orelse return;
     const st = &model.chat;
     if (st.chatgpt != .authorizing) return;
@@ -221,6 +250,16 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .chat_response => |response| onResponse(model, response, fx),
         .set_chat_stack => |raw| {
             st.stack = @intCast(std.math.clamp(raw, 1, max_stack));
+            saveConfig(st);
+        },
+        .set_chatter => |raw| {
+            st.chatter_minutes = @intCast(@min(raw, chatter_choices[chatter_choices.len - 1]));
+            // The clock restarts from the new interval.
+            st.next_chatter_ms = 0;
+            saveConfig(st);
+        },
+        .toggle_nudge => {
+            st.nudge = !st.nudge;
             saveConfig(st);
         },
         .set_chat_provider => |raw| {
@@ -260,6 +299,8 @@ fn open(model: *Model, fx: *Effects) void {
     st.scroll = 0;
     st.history = false;
     st.place = .{};
+    // Opened by the user unless speak says otherwise right after.
+    st.quiet_open = false;
     app.registerTail(model.dark, fx);
     st.open = true;
 }
@@ -282,11 +323,119 @@ fn brief(model: *Model, fx: *Effects) void {
     const st = &model.chat;
     // Unconfigured, the reply card already points at Settings.
     if (!st.ready() or st.session.busy()) return;
-    const action = st.session.brief(needsRefresh(st, fx));
+    const action = st.session.brief(.briefing, needsRefresh(st, fx));
     if (action == .none) return;
     st.history = false;
     st.scroll = 0;
     begin(model, action, fx);
+}
+
+/// The pet speaks first, unprompted: into its own bubble, never the chat
+/// window, and without touching its pose. False when it can't right now:
+/// unconfigured, the chat is open (the user is already there), bubbles
+/// are off or in Focus, or a request is still on the wire.
+pub fn speak(model: *Model, prompt: session.Prompt, fx: *Effects) bool {
+    if (!canSpeak(model)) return false;
+    const st = &model.chat;
+    // A chat never opened since launch has no pet or persona loaded yet.
+    if (st.pet_len == 0) syncPet(model, fx);
+    if (st.pet_len == 0) return false;
+    const action = st.session.brief(prompt, needsRefresh(st, fx));
+    if (action == .none) return false;
+    // Said in the chat, which opens beside the pet if it was shut; the
+    // line stays there like any reply. Opened this way, it takes neither
+    // the keyboard nor the front from the app the user is in.
+    const was_open = st.open;
+    show(model, fx);
+    if (!was_open) st.quiet_open = true;
+    st.history = false;
+    st.scroll = 0;
+    pickThinking(st);
+    run(model, action, fx);
+    return true;
+}
+
+/// Whether the pet may speak unprompted now: configured, not in Focus, and
+/// not while the user is typing in the chat.
+fn canSpeak(model: *const Model) bool {
+    const st = &model.chat;
+    return st.ready() and !model.focus_mode and !(st.open and st.input.len > 0);
+}
+
+test "the pet speaks unless the user is typing, in Focus, or it's unconfigured" {
+    const t = std.testing;
+    var model: Model = .{};
+    model.chat.kind = .openai_compat;
+    try t.expect(!canSpeak(&model));
+    model.chat.local_url.set("http://localhost:1234/v1");
+    try t.expect(canSpeak(&model));
+    // An open chat is where it speaks, as long as nobody is typing there.
+    model.chat.open = true;
+    try t.expect(canSpeak(&model));
+    model.chat.input.set("hel");
+    try t.expect(!canSpeak(&model));
+    model.chat.input.clear();
+    model.focus_mode = true;
+    try t.expect(!canSpeak(&model));
+}
+
+/// Small talk on its clock, checked on every poll tick: no timer, and a
+/// Mac waking from sleep past the due time just talks once.
+fn chatterTick(model: *Model, fx: *Effects) void {
+    const st = &model.chat;
+    if (st.chatter_minutes == 0) {
+        st.next_chatter_ms = 0;
+        return;
+    }
+    const now = fx.wallMs();
+    if (st.next_chatter_ms != 0 and now < st.next_chatter_ms) return;
+    // Scheduling the first time; talking (or not, when it can't) after.
+    if (st.next_chatter_ms != 0) _ = speak(model, .chatter, fx);
+    st.next_chatter_ms = nextChatterMs(now, st.chatter_minutes, randomU64());
+}
+
+/// The interval give or take a quarter, so the pet never ticks like a
+/// clock.
+pub fn nextChatterMs(now: i64, minutes: u16, rand: u64) i64 {
+    const base: i64 = @as(i64, minutes) * std.time.ms_per_min;
+    const spread: u64 = @intCast(@divTrunc(base, 2));
+    const offset: i64 = if (spread > 0) @intCast(rand % spread) else 0;
+    return now + base - @divTrunc(base, 4) + offset;
+}
+
+test "small talk comes due within a quarter of its interval" {
+    const t = std.testing;
+    const five: i64 = 5 * std.time.ms_per_min;
+    try t.expectEqual(@as(i64, 1000 + five * 3 / 4), nextChatterMs(1000, 5, 0));
+    try t.expect(nextChatterMs(1000, 5, std.math.maxInt(u64)) < 1000 + five * 5 / 4);
+    try t.expect(nextChatterMs(1000, 5, 12345) >= 1000 + five * 3 / 4);
+}
+
+fn randomU64() u64 {
+    var seed: [8]u8 = @splat(0);
+    plat.fillRandom(&seed) catch {};
+    return std.mem.readInt(u64, &seed, .little);
+}
+
+/// Small talk's prompt, the pet's last few lines quoted in it.
+fn chatterPrompt(st: *const State) []const u8 {
+    var lines: [3][]const u8 = undefined;
+    return persona.chatter(&brief_buf, lastLines(st, &lines));
+}
+
+/// The pet's newest replies, newest first, each cut to a quotable length.
+fn lastLines(st: *const State, out: [][]const u8) []const []const u8 {
+    const transcript = &st.session.transcript;
+    var n: usize = 0;
+    var i = transcript.len();
+    while (i > 0 and n < out.len) {
+        i -= 1;
+        const m = transcript.get(i);
+        if (m.role != .assistant) continue;
+        out[n] = domain.utf8Floor(m.text, 200);
+        n += 1;
+    }
+    return out[0..n];
 }
 
 var brief_buf: [4096]u8 = undefined;
@@ -296,19 +445,35 @@ fn briefingPrompt(model: *const Model) []const u8 {
     var notes: [hook_server.max_bubbles]persona.Note = undefined;
     var n: usize = 0;
     for (model.bubbles[0..model.bubbles_len]) |*b| {
-        const agent = b.agent[0..b.agent_len];
-        // The chat's own reply excerpts are not news.
-        if (std.mem.eql(u8, agent, "petdex")) continue;
-        notes[n] = .{
-            .agent = agent,
-            .state = if (b.agent_state_len > 0) b.agentStateSlice() else if (b.busy) "working" else "finished",
-            .title = b.title[0..b.title_len],
-            .text = b.text[0..b.text_len],
-            .project = std.fs.path.basename(b.cwdSlice()),
-        };
+        notes[n] = noteFor(b, if (b.agent_state_len > 0) b.agentStateSlice() else if (b.busy) "working" else "finished");
         n += 1;
     }
     return persona.briefing(&brief_buf, notes[0..n]);
+}
+
+fn noteFor(b: *const hook_server.Bubble, state: []const u8) persona.Note {
+    return .{
+        .agent = b.agent[0..b.agent_len],
+        .state = state,
+        .title = b.title[0..b.title_len],
+        .text = b.text[0..b.text_len],
+        .project = std.fs.path.basename(b.cwdSlice()),
+    };
+}
+
+var nudge_buf: [4096]u8 = undefined;
+var nudge_len: usize = 0;
+
+/// Coding agents started waiting on the user: the pet says so, once, the
+/// way it makes small talk. The prompt is built now, from `waiting`,
+/// because a credential refresh may come before the request.
+pub fn nudge(model: *Model, waiting: []const *const hook_server.Bubble, fx: *Effects) bool {
+    var notes: [hook_server.max_bubbles]persona.Note = undefined;
+    const n = @min(waiting.len, notes.len);
+    for (waiting[0..n], notes[0..n]) |b, *note| note.* = noteFor(b, "waiting");
+    var lines: [3][]const u8 = undefined;
+    nudge_len = persona.nudge(&nudge_buf, notes[0..n], lastLines(&model.chat, &lines)).len;
+    return speak(model, .nudge, fx);
 }
 
 const Pet = struct { x: f64, y: f64, w: f64, h: f64 };
@@ -340,15 +505,165 @@ fn tailY(pet_y: f64, pet_h: f64, win_y: f64, card_top: f32, card_h: f32) f32 {
 }
 
 /// Keep the bubble beside the pet: on every frame the pet may move, and
-/// on poll ticks. Moves only when the target changed or the window was
-/// nudged (AppKit settles a new window after its first frame), and
-/// switches sides when the screen clamp stops it short. Descriptor
-/// coordinates are only a creation hint, so this also does the first
-/// placement.
+/// on poll ticks. Descriptor coordinates are only a creation hint, so this
+/// also does the first placement.
 pub fn follow(model: *Model, fx: *Effects) void {
     const st = &model.chat;
     // Linux has no window move or resize.
     if (!st.open or builtin.os.tag == .linux) return;
+    if (chat_view.bubble) {
+        if (model.pet_screen) |screen| return followOnScreen(model, fx, screen);
+    }
+    followProbed(model, fx);
+}
+
+/// The bubble beside the pet on the pet's own screen (macOS reports it).
+/// The spot is computed whole every time and the window goes there
+/// whenever it isn't: nothing remembered can hold it somewhere else, and
+/// no clamp runs against whichever display the bubble overlaps most, which
+/// is how it could be pinned to the edge of another screen.
+fn followOnScreen(model: *Model, fx: *Effects, screen: app.Screen) void {
+    const st = &model.chat;
+    const p = &st.place;
+    const now = fx.wallMs();
+    var cur = fx.moveWindow(window_label, 0, 0, false) orelse {
+        // Not created yet, or placed once and gone missing: the chat is
+        // open, yet nothing can move it. After a second, reopen it.
+        if (p.placed() and lostLongEnough(&st.lost_since_ms, now)) {
+            std.debug.print("petdex: chat window missing for a second; opening it again\n", .{});
+            st.open = false;
+            st.reopen_at_ms = now + reopen_delay_ms;
+        }
+        return;
+    };
+    st.lost_since_ms = 0;
+    const h = chat_view.windowHeight(model);
+    const resized = h != p.h;
+    const before = cur;
+    if (resized) {
+        // AppKit keeps the bottom edge on resize; the move below puts the
+        // top back beside the pet's head.
+        _ = fx.resizeWindow(window_label, chat_view.window_w, h, .top_left);
+        p.h = h;
+        cur = fx.moveWindow(window_label, 0, 0, false) orelse return;
+    }
+    const pet = petOf(model);
+    p.left = besideLeft(pet, screen, chat_view.window_w, p.left);
+    const speech_top = chat_view.speechTop(model);
+    const at = placeBeside(pet, screen, p.left, speech_top, h);
+    // Placed, the pet where it was, and yet the window is elsewhere:
+    // something moved it, or the last move didn't take. Named in the log,
+    // so the next time it's left behind the cause shows.
+    const drifted = @abs(before.x - p.at_x) > 2 or @abs(before.y - p.at_y) > 2;
+    if (p.placed() and !resized and pet.x == p.pet_x and pet.y == p.pet_y and drifted and (st.warned_ms == 0 or now - st.warned_ms >= warn_every_ms)) {
+        st.warned_ms = now;
+        std.debug.print("petdex: chat moved off its spot: window {d:.0},{d:.0}, spot {d:.0},{d:.0}, pet {d:.0},{d:.0}, screen {d:.0},{d:.0} {d:.0}x{d:.0}\n", .{ before.x, before.y, p.at_x, p.at_y, pet.x, pet.y, screen.x, screen.y, screen.w, screen.h });
+    }
+    if (app.bubbleMovePlan(cur.x, cur.y, at.x, at.y)) |m| _ = fx.moveWindow(window_label, m.dx, m.dy, false) orelse return;
+    p.want_x = at.x;
+    p.want_y = at.y;
+    p.at_x = at.x;
+    p.at_y = at.y;
+    p.pet_x = pet.x;
+    p.pet_y = pet.y;
+    p.tail_y = tailY(pet.y, pet.h, at.y, speech_top, chat_view.cardHeight(model));
+}
+
+/// How long an open chat's window may stay missing before it is reopened,
+/// and how often a placement warning may repeat.
+const lost_grace_ms: i64 = 1000;
+const reopen_delay_ms: i64 = 1000;
+const warn_every_ms: i64 = 10_000;
+
+/// True once the window has been missing for `lost_grace_ms`, counting
+/// from the first miss; the count then starts over.
+fn lostLongEnough(since: *i64, now: i64) bool {
+    if (since.* == 0) {
+        since.* = now;
+        return false;
+    }
+    if (now - since.* < lost_grace_ms) return false;
+    since.* = 0;
+    return true;
+}
+
+test "a missing chat window is reopened only after a second" {
+    const t = std.testing;
+    var since: i64 = 0;
+    try t.expect(!lostLongEnough(&since, 5000));
+    try t.expect(!lostLongEnough(&since, 5999));
+    try t.expect(lostLongEnough(&since, 6000));
+    // Counting starts over after a reopen.
+    try t.expect(!lostLongEnough(&since, 6100));
+}
+
+fn petOf(model: *const Model) Pet {
+    return .{
+        .x = model.pet_x,
+        .y = model.pet_y,
+        .w = app.frame_w * model.scale,
+        .h = app.frame_h * model.scale,
+    };
+}
+
+/// The pet's left for the bubble: right while it fits on the pet's screen,
+/// else left when that fits. Once left, right again only with
+/// `side_hysteresis` to spare, so it cannot flap at the edge; with room on
+/// neither side it keeps the side it has.
+fn besideLeft(pet: Pet, screen: app.Screen, win_w: f64, left_now: bool) bool {
+    const spare: f64 = if (left_now) side_hysteresis else 0;
+    if (pet.x + pet.w + pet_gap + win_w + spare <= screen.x + screen.w) return false;
+    if (pet.x - pet_gap - win_w >= screen.x) return true;
+    return left_now;
+}
+
+/// The window origin beside the pet on that side, kept inside the pet's
+/// screen.
+fn placeBeside(pet: Pet, screen: app.Screen, left: bool, speech_top: f32, win_h: f32) Point {
+    const want = originBeside(pet, left, speech_top);
+    const w: f64 = chat_view.window_w;
+    const h: f64 = win_h;
+    return .{
+        .x = std.math.clamp(want.x, screen.x, @max(screen.x, screen.x + screen.w - w)),
+        .y = std.math.clamp(want.y, screen.y, @max(screen.y, screen.y + screen.h - h)),
+    };
+}
+
+// The 4K display beside the primary one on the development Mac: its top
+// sits 831 points above the primary screen's, where no other screen is.
+const test_screen: app.Screen = .{ .x = 2056, .y = -831, .w = 3840, .h = 2160 };
+
+test "the chat takes the pet's right, else its left, on the pet's own screen" {
+    const t = std.testing;
+    const w: f64 = chat_view.window_w;
+    try t.expect(!besideLeft(.{ .x = 4000, .y = -400, .w = 230, .h = 250 }, test_screen, w, false));
+    const right_edge = test_screen.x + test_screen.w;
+    try t.expect(besideLeft(.{ .x = right_edge - 300, .y = -400, .w = 230, .h = 250 }, test_screen, w, false));
+    // Right fits, but not with the hysteresis to spare: a left chat stays.
+    const near: Pet = .{ .x = right_edge - (230 + pet_gap + w) - side_hysteresis / 2, .y = -400, .w = 230, .h = 250 };
+    try t.expect(besideLeft(near, test_screen, w, true));
+    try t.expect(!besideLeft(near, test_screen, w, false));
+}
+
+test "the chat stays inside the pet's screen, off the screens beside it" {
+    const t = std.testing;
+    // At the 4K's left edge, above the primary screen's top: the chat's
+    // left spot is where no screen is, so it stays on the 4K.
+    const pet: Pet = .{ .x = 2060, .y = -600, .w = 230, .h = 250 };
+    const at = placeBeside(pet, test_screen, true, 0, 300);
+    try t.expectEqual(test_screen.x, at.x);
+    try t.expectEqual(@as(f64, -600), at.y);
+    // Too tall for the room below the pet: pushed up, still on the screen.
+    const low: Pet = .{ .x = 4000, .y = test_screen.y + test_screen.h - 100, .w = 230, .h = 250 };
+    try t.expectEqual(test_screen.y + test_screen.h - 300, placeBeside(low, test_screen, false, 0, 300).y);
+}
+
+/// Placement by the display clamp's report, for hosts that don't report
+/// the pet's screen. Moves only when the target changed or the window was
+/// nudged, and switches sides when the clamp stops it short. A titled
+/// window (Windows) is placed once and then belongs to the user.
+fn followProbed(model: *Model, fx: *Effects) void {
+    const st = &model.chat;
     const p = &st.place;
     // A titled window (Windows) is placed once and then belongs to the user.
     if (!chat_view.bubble and p.placed()) return;
@@ -460,9 +775,7 @@ fn keepThinking(lines: []const []const u8) void {
 fn pickThinking(st: *State) void {
     st.thinking_len = 0;
     if (thinking_count == 0) return;
-    var seed: [8]u8 = @splat(0);
-    plat.fillRandom(&seed) catch {};
-    setField(&st.thinking, &st.thinking_len, thinking_lines[std.mem.readInt(u64, &seed, .little) % thinking_count]);
+    setField(&st.thinking, &st.thinking_len, thinking_lines[randomU64() % thinking_count]);
 }
 
 // ── Conversation ──────────────────────────────────────────────────────
@@ -502,8 +815,18 @@ fn run(model: *Model, action: session.Action, fx: *Effects) void {
         .request => startRequest(model, fx),
         .refresh => startRefresh(model, fx),
         .done => finishReply(model, fx),
-        .failed => app.applyState(model, .failed, failed_ms, fx),
+        // Unprompted, a failure is nobody's business: no pose, no error row.
+        .failed => if (model.chat.session.proactive()) quietFailure(model) else app.applyState(model, .failed, failed_ms, fx),
     }
+}
+
+/// An unprompted line that failed leaves no error row or Retry, but says
+/// why in the log, so small talk that never shows can be told apart from
+/// small talk that never ran.
+fn quietFailure(model: *Model) void {
+    const s = &model.chat.session;
+    std.debug.print("petdex: chat {s} failed: {s}\n", .{ @tagName(s.prompt), s.errorText() });
+    s.quiet();
 }
 
 fn startRequest(model: *Model, fx: *Effects) void {
@@ -511,13 +834,25 @@ fn startRequest(model: *Model, fx: *Effects) void {
     st.stream_kind = st.kind;
     var context: [session.context_messages]domain.Message = undefined;
     const recent = st.session.context(&context);
-    // A briefing ends the context with the app's prompt, never stored.
-    var with_brief: [session.context_messages + 1]domain.Message = undefined;
-    const turns: []const domain.Message = if (st.session.briefing) blk: {
-        @memcpy(with_brief[0..recent.len], recent);
-        with_brief[recent.len] = .{ .role = .user, .text = briefingPrompt(model) };
-        break :blk with_brief[0 .. recent.len + 1];
-    } else recent;
+    // The pet speaking first ends the context with the app's prompt, never
+    // stored. Small talk and nudges are light: that prompt alone, no history.
+    var with_prompt: [session.context_messages + 1]domain.Message = undefined;
+    const turns: []const domain.Message = switch (st.session.prompt) {
+        .none => recent,
+        .briefing => blk: {
+            @memcpy(with_prompt[0..recent.len], recent);
+            with_prompt[recent.len] = .{ .role = .user, .text = briefingPrompt(model) };
+            break :blk with_prompt[0 .. recent.len + 1];
+        },
+        .chatter => blk: {
+            with_prompt[0] = .{ .role = .user, .text = chatterPrompt(st) };
+            break :blk with_prompt[0..1];
+        },
+        .nudge => blk: {
+            with_prompt[0] = .{ .role = .user, .text = nudge_buf[0..nudge_len] };
+            break :blk with_prompt[0..1];
+        },
+    };
     var cache_key: [80]u8 = undefined;
     const target: provider.Target = switch (st.kind) {
         .codex => .{
@@ -556,7 +891,8 @@ fn onResponse(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) 
     const st = &model.chat;
     const transport: ?[]const u8 = switch (response.outcome) {
         .ok => null,
-        .cancelled => return,
+        // A stopped or superseded stream: only its slot on the wire frees.
+        .cancelled => return st.session.settle(response.key),
         .timed_out => i18n.t("The reply took too long.", "返事に時間がかかりすぎました。"),
         .connect_failed => switch (st.stream_kind) {
             .openai_compat => i18n.t("Could not reach the local server. Is it running?", "ローカルサーバーに接続できません。起動していますか？"),
@@ -575,13 +911,13 @@ fn finishReply(model: *Model, fx: *Effects) void {
         _ = h.append(st.petSlug(), .assistant, reply, st.stream_kind, fx.wallMs());
         h.prune(st.petSlug());
     }
-    app.applyState(model, .waving, reply_wave_ms, fx);
-    if (!st.open and st.bubble_excerpt) {
-        var buf: [excerpt_bytes + 3]u8 = undefined;
-        const cut = domain.utf8Floor(reply, excerpt_bytes);
-        const text = if (cut.len < reply.len) std.fmt.bufPrint(&buf, "{s}…", .{cut}) catch cut else cut;
-        _ = hook_server.mailbox.setBubble("petdex-chat", text, "petdex", st.petName(), false);
-    }
+    // ponytail: unprompted lines are saved like any reply above; small talk
+    // every 5 minutes pushes real history past the 400-message cap in about
+    // a day and a half. Skip saving them if that bites.
+    const unprompted = st.session.proactive();
+    // Unprompted, the pet keeps its pose: one waiting on an agent stays
+    // waiting, and its chime escalation with it.
+    if (!unprompted) app.applyState(model, .waving, reply_wave_ms, fx);
 }
 
 fn stop(model: *Model, fx: *Effects) void {
@@ -782,14 +1118,15 @@ fn loadConfig(st: *State) void {
     setText(&st.local_url, cfg.openai_compat.base_url);
     setText(&st.local_model, cfg.openai_compat.model);
     setText(&st.codex_model, cfg.codex.model);
-    st.bubble_excerpt = cfg.bubble_excerpt;
     st.stack = std.math.clamp(cfg.stack, 1, max_stack);
+    st.chatter_minutes = @min(cfg.chatter_minutes, chatter_choices[chatter_choices.len - 1]);
+    st.nudge = cfg.nudge;
 }
 
 fn saveConfig(st: *const State) void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    var cfg: config.Config = .{ .provider = st.kind, .bubble_excerpt = st.bubble_excerpt, .stack = st.stack };
+    var cfg: config.Config = .{ .provider = st.kind, .stack = st.stack, .chatter_minutes = st.chatter_minutes, .nudge = st.nudge };
     cfg.codex.model = st.codexModel();
     cfg.openai_compat.base_url = st.localUrl();
     cfg.openai_compat.model = st.localModel();

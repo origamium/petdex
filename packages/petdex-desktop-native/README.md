@@ -44,6 +44,24 @@ Builds pass `-Dtrace=off`. Without it the SDK appends a trace record per frame
 and timer to `native-sdk.jsonl` in the platform log directory (#714); the app
 deletes that file once it passes 32 MB.
 
+## Bubbles
+
+Each coding-agent conversation floats over the pet as a bubble with the
+agent's logo. A bubble waiting on you glows, with an orange dot; one that hit
+an error wears a red "!". Click a bubble to open it into a card: the project,
+the agent and its status, the model (Claude Code, Codex, OpenCode) and the
+reasoning effort (Claude Code, Codex) when the agent reports them, and the
+first lines of what it is doing or last said. When the agent runs in Warp (2026.05 or later) or in
+Terminal, the card also brings its pane or tab to the front. Click again to
+close it. Any number can be open; the cards stack without overlapping. A finished bubble stays with a green check, its card and terminal
+still a click away, until you clear the bubbles from the pet's menu or the
+tray, or its lifetime in Settings runs out. Up to ten conversations float at
+once; past that, the one idle longest makes way. On Linux the bubbles show
+their state but do not open into cards.
+
+Claude Code reports failed tools and failed turns once its hooks are installed
+again from Settings; an earlier install keeps working without them.
+
 ## Chat
 
 Click the pet to talk to it; double-click it for a catch-up on your coding
@@ -64,6 +82,25 @@ the chat shows one of the pet's `thinking` lines, picked at random, or
 ```
 
 History lives in `~/.petdex/petdex.db`, up to 400 messages per pet.
+
+Two options under Settings → Chat have the pet speak first, both off by
+default:
+- **Small talk** says something unprompted every 5, 15, 30 or 60 minutes,
+  give or take a quarter.
+- **Speak up when an agent needs you** says so once each time a coding agent
+  starts waiting on you.
+
+Either line is said in the chat, which opens beside the pet if it was closed,
+and stays there like any reply; it is saved to history too. The request
+carries the persona and the app's prompt without the conversation, and the pet
+keeps its pose. Nothing is said while you are typing in the chat, in Focus, or
+while another request is on the wire.
+
+## Appearance
+
+Settings → Appearance sets the pet's size, from 0.4 to 2.0 times its frame,
+and the look: Auto follows the system's light or dark appearance, Light and
+Dark keep one. The menus stay the system's.
 
 ## Language
 
