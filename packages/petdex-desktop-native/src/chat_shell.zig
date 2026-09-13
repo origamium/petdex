@@ -74,6 +74,10 @@ pub const Place = struct {
     /// The height last applied, and the tail's center in the window.
     h: f32 = 0,
     tail_y: f32 = 0,
+    /// Where the pet was at the last placement: a window off its spot
+    /// while the pet stayed put was moved by something else.
+    pet_x: f64 = 0,
+    pet_y: f64 = 0,
 
     pub fn placed(self: Place) bool {
         return !std.math.isNan(self.want_x);
@@ -130,6 +134,13 @@ pub const State = struct {
     speak_pending: bool = false,
     /// Speak up when a coding agent starts waiting on the user (Settings).
     nudge: bool = false,
+    /// Since when the open chat's window can't be found; 0 while it can.
+    lost_since_ms: i64 = 0,
+    /// The window went missing and was closed; it opens again at this
+    /// time, once the old window's close has surely come and gone. 0: none.
+    reopen_at_ms: i64 = 0,
+    /// The last placement warning, so a stuck window can't flood the log.
+    warned_ms: i64 = 0,
 
     pub fn petSlug(self: *const State) []const u8 {
         return self.pet[0..self.pet_len];
@@ -197,6 +208,14 @@ pub fn boot(model: *Model) void {
 /// From poll_tick: follow pet switches while the window is open, and
 /// pick up the ChatGPT sign-in callback.
 pub fn poll(model: *Model, fx: *Effects) void {
+    // The window went missing (followOnScreen) and was closed; it opens
+    // again, as a user closing and reopening the chat would. The wait lets
+    // the old window's close notice (`chat_closed`) land first, so it
+    // can't shut the new one. Opened meanwhile by hand, nothing to do.
+    if (model.chat.reopen_at_ms != 0 and fx.wallMs() >= model.chat.reopen_at_ms) {
+        model.chat.reopen_at_ms = 0;
+        if (!model.chat.open) open(model, fx);
+    }
     if (model.chat.open) syncPet(model, fx);
     follow(model, fx);
     chatterTick(model, fx);
@@ -476,9 +495,22 @@ pub fn follow(model: *Model, fx: *Effects) void {
 fn followOnScreen(model: *Model, fx: *Effects, screen: app.Screen) void {
     const st = &model.chat;
     const p = &st.place;
-    var cur = fx.moveWindow(window_label, 0, 0, false) orelse return; // not created yet
+    const now = fx.wallMs();
+    var cur = fx.moveWindow(window_label, 0, 0, false) orelse {
+        // Not created yet, or placed once and gone missing: the chat is
+        // open, yet nothing can move it. After a second, reopen it.
+        if (p.placed() and lostLongEnough(&st.lost_since_ms, now)) {
+            std.debug.print("petdex: chat window missing for a second; opening it again\n", .{});
+            st.open = false;
+            st.reopen_at_ms = now + reopen_delay_ms;
+        }
+        return;
+    };
+    st.lost_since_ms = 0;
     const h = chat_view.windowHeight(model);
-    if (h != p.h) {
+    const resized = h != p.h;
+    const before = cur;
+    if (resized) {
         // AppKit keeps the bottom edge on resize; the move below puts the
         // top back beside the pet's head.
         _ = fx.resizeWindow(window_label, chat_view.window_w, h, .top_left);
@@ -489,12 +521,50 @@ fn followOnScreen(model: *Model, fx: *Effects, screen: app.Screen) void {
     p.left = besideLeft(pet, screen, chat_view.window_w, p.left);
     const speech_top = chat_view.speechTop(model);
     const at = placeBeside(pet, screen, p.left, speech_top, h);
+    // Placed, the pet where it was, and yet the window is elsewhere:
+    // something moved it, or the last move didn't take. Named in the log,
+    // so the next time it's left behind the cause shows.
+    const drifted = @abs(before.x - p.at_x) > 2 or @abs(before.y - p.at_y) > 2;
+    if (p.placed() and !resized and pet.x == p.pet_x and pet.y == p.pet_y and drifted and (st.warned_ms == 0 or now - st.warned_ms >= warn_every_ms)) {
+        st.warned_ms = now;
+        std.debug.print("petdex: chat moved off its spot: window {d:.0},{d:.0}, spot {d:.0},{d:.0}, pet {d:.0},{d:.0}, screen {d:.0},{d:.0} {d:.0}x{d:.0}\n", .{ before.x, before.y, p.at_x, p.at_y, pet.x, pet.y, screen.x, screen.y, screen.w, screen.h });
+    }
     if (app.bubbleMovePlan(cur.x, cur.y, at.x, at.y)) |m| _ = fx.moveWindow(window_label, m.dx, m.dy, false) orelse return;
     p.want_x = at.x;
     p.want_y = at.y;
     p.at_x = at.x;
     p.at_y = at.y;
+    p.pet_x = pet.x;
+    p.pet_y = pet.y;
     p.tail_y = tailY(pet.y, pet.h, at.y, speech_top, chat_view.cardHeight(model));
+}
+
+/// How long an open chat's window may stay missing before it is reopened,
+/// and how often a placement warning may repeat.
+const lost_grace_ms: i64 = 1000;
+const reopen_delay_ms: i64 = 1000;
+const warn_every_ms: i64 = 10_000;
+
+/// True once the window has been missing for `lost_grace_ms`, counting
+/// from the first miss; the count then starts over.
+fn lostLongEnough(since: *i64, now: i64) bool {
+    if (since.* == 0) {
+        since.* = now;
+        return false;
+    }
+    if (now - since.* < lost_grace_ms) return false;
+    since.* = 0;
+    return true;
+}
+
+test "a missing chat window is reopened only after a second" {
+    const t = std.testing;
+    var since: i64 = 0;
+    try t.expect(!lostLongEnough(&since, 5000));
+    try t.expect(!lostLongEnough(&since, 5999));
+    try t.expect(lostLongEnough(&since, 6000));
+    // Counting starts over after a reopen.
+    try t.expect(!lostLongEnough(&since, 6100));
 }
 
 fn petOf(model: *const Model) Pet {
