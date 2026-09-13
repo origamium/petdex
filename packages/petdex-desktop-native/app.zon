@@ -21,6 +21,7 @@
             .items = .{
                 .{ .label = "Settings...", .command = "petdex.settings", .key = ",", .modifiers = .{"primary"} },
                 .{ .label = "Chat...", .command = "petdex.chat", .key = "k", .modifiers = .{"primary"} },
+                .{ .label = "Reset Position", .command = "petdex.reset-position" },
                 .{ .label = "Close Pet", .command = "petdex.close", .key = "w", .modifiers = .{"primary"} },
             },
         },

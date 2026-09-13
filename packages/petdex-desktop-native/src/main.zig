@@ -187,6 +187,7 @@ pub const Msg = union(enum) {
     set_theme: u32,
     set_chatter: u32,
     toggle_nudge,
+    reset_position,
     chat_model_input: canvas.TextInputEvent,
     chat_url_input: canvas.TextInputEvent,
     chat_detect_models,
@@ -2745,6 +2746,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .settings_closed => model.settings_open = false,
         .clear_notifications => clearBubble(model),
+        .reset_position => resetPetPosition(model, fx),
         .set_language => |raw| {
             model.language = std.enums.fromInt(i18n.Pref, raw) orelse return;
             applyLanguage(model.language);
@@ -3421,6 +3423,7 @@ pub fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "petdex.flock")) return .toggle_flock_window;
     if (std.mem.eql(u8, name, "petdex.chat")) return .open_chat;
     if (std.mem.eql(u8, name, "petdex.clear-notifications")) return .clear_notifications;
+    if (std.mem.eql(u8, name, "petdex.reset-position")) return .reset_position;
     return null;
 }
 
@@ -3428,12 +3431,13 @@ pub fn onCommand(name: []const u8) ?Msg {
 
 pub const AppUi = canvas.Ui(Msg);
 
-fn petMenu(comptime lang: i18n.Lang) [6]AppUi.ContextMenuItem {
+fn petMenu(comptime lang: i18n.Lang) [7]AppUi.ContextMenuItem {
     return .{
         .{ .label = i18n.pick(lang, "Open Settings", "設定…"), .msg = .open_settings },
         .{ .label = i18n.pick(lang, "Open Flock", "フロックを開く"), .msg = .toggle_flock_window },
         .{ .label = i18n.pick(lang, "View Pet on Petdex", "Petdexでペットを見る"), .msg = .open_active_pet_page },
         .{ .label = i18n.pick(lang, "Chat", "チャット"), .msg = .open_chat },
+        .{ .label = i18n.pick(lang, "Reset Position", "位置のリセット"), .msg = .reset_position },
         .{ .label = i18n.pick(lang, "Clear Notifications", "通知を消去"), .msg = .clear_notifications },
         .{ .label = i18n.pick(lang, "Close Pet", "ペットを閉じる"), .msg = .close_pet },
     };
@@ -3441,7 +3445,7 @@ fn petMenu(comptime lang: i18n.Lang) [6]AppUi.ContextMenuItem {
 const pet_menu_en = petMenu(.en);
 const pet_menu_ja = petMenu(.ja);
 
-fn petMenuFor() *const [6]AppUi.ContextMenuItem {
+fn petMenuFor() *const [7]AppUi.ContextMenuItem {
     return if (i18n.current == .ja) &pet_menu_ja else &pet_menu_en;
 }
 
@@ -4399,6 +4403,38 @@ fn notePet(model: *Model, at: native_sdk.platform.MoveWindowResult) void {
     model.pet_screen = if (at.has_screen) .{ .x = at.screen_x, .y = at.screen_y, .w = at.screen_w, .h = at.screen_h } else null;
 }
 
+/// Where Reset Position first puts the pet: near the main display's
+/// top-left corner, which is the origin of the move space, so the pet lands
+/// on that display wherever it was lost (a display unplugged under it).
+const reset_hop: f64 = 100;
+
+/// Reset Position: the pet goes back to the middle of the main display.
+/// The hop onto that display reports its visible frame, and the pet is
+/// centered in it. A host that doesn't report screens leaves the pet at
+/// the hop, which is on the main display too.
+fn resetPetPosition(model: *Model, fx: *Effects) void {
+    model.dragging = false;
+    model.throwing = false;
+    const cur = fx.moveWindow("main", 0, 0, false) orelse return;
+    const hop = fx.moveWindow("main", reset_hop - cur.x, reset_hop - cur.y, false) orelse return;
+    notePet(model, hop);
+    if (model.pet_screen) |screen| {
+        const size = petWindowSize(model);
+        const x = screen.x + (screen.w - size[0]) / 2;
+        const y = screen.y + (screen.h - size[1]) / 2;
+        if (fx.moveWindow("main", x - hop.x, y - hop.y, false)) |centered| notePet(model, centered);
+    }
+    syncBubbleWindow(model, fx);
+    chat_shell.follow(model, fx);
+    saveSettings(model);
+}
+
+/// The pet window's size: the sprite, or Linux's fixed canvas.
+fn petWindowSize(model: *const Model) [2]f64 {
+    if (comptime builtin.target.os.tag == .linux) return .{ win_w, win_h };
+    return .{ frame_w * model.scale, frame_h * model.scale };
+}
+
 /// Room between the pet and its own screen's top and bottom edges.
 fn roomAbove(model: *const Model, screen: Screen) f64 {
     return model.pet_y - screen.y;
@@ -5136,26 +5172,27 @@ fn petdexStatusItem(model: *const Model, scratch: *PetdexApp.StatusItemScratch) 
     };
     scratch.items[0] = .{ .id = 1, .label = i18n.t("Open Settings", "設定…"), .command = "petdex.settings" };
     scratch.items[1] = .{ .id = 12, .label = i18n.t("Chat…", "チャット…"), .command = "petdex.chat" };
-    scratch.items[2] = .{ .id = 2, .label = i18n.t("Open petdex.dev", "petdex.devを開く"), .command = "petdex.website" };
-    scratch.items[3] = .{ .id = 3, .separator = true };
-    scratch.items[4] = .{
+    scratch.items[2] = .{ .id = 14, .label = i18n.t("Reset Position", "位置のリセット"), .command = "petdex.reset-position" };
+    scratch.items[3] = .{ .id = 2, .label = i18n.t("Open petdex.dev", "petdex.devを開く"), .command = "petdex.website" };
+    scratch.items[4] = .{ .id = 3, .separator = true };
+    scratch.items[5] = .{
         .id = 4,
         .label = if (model.focus_mode) i18n.t("Focus Mode: On", "集中モード：オン") else i18n.t("Focus Mode: Off", "集中モード：オフ"),
         .command = "petdex.focus",
     };
-    scratch.items[5] = .{ .id = 13, .label = i18n.t("Clear Notifications", "通知を消去"), .command = "petdex.clear-notifications", .enabled = model.bubbles_len > 0 };
-    scratch.items[6] = .{ .id = 5, .label = i18n.t("Shuffle Pet", "ペットをシャッフル"), .command = "petdex.shuffle" };
-    scratch.items[7] = .{
+    scratch.items[6] = .{ .id = 13, .label = i18n.t("Clear Notifications", "通知を消去"), .command = "petdex.clear-notifications", .enabled = model.bubbles_len > 0 };
+    scratch.items[7] = .{ .id = 5, .label = i18n.t("Shuffle Pet", "ペットをシャッフル"), .command = "petdex.shuffle" };
+    scratch.items[8] = .{
         .id = 6,
         .label = if (model.flock.open) i18n.t("Hide Flock", "フロックを隠す") else i18n.t("Show Flock", "フロックを表示"),
         .command = "petdex.flock",
     };
-    scratch.items[8] = .{ .id = 7, .label = i18n.t("View Pet on Petdex", "Petdexでペットを見る"), .command = "petdex.pet-page" };
-    scratch.items[9] = .{ .id = 8, .separator = true };
-    scratch.items[10] = .{ .id = 9, .label = update_label, .command = "petdex.updates", .enabled = model.update_phase != .checking };
-    scratch.items[11] = .{ .id = 10, .separator = true };
-    scratch.items[12] = .{ .id = 11, .label = i18n.t("Quit Petdex", "Petdexを終了"), .command = "petdex.quit" };
-    return .{ .items = scratch.items[0..13] };
+    scratch.items[9] = .{ .id = 7, .label = i18n.t("View Pet on Petdex", "Petdexでペットを見る"), .command = "petdex.pet-page" };
+    scratch.items[10] = .{ .id = 8, .separator = true };
+    scratch.items[11] = .{ .id = 9, .label = update_label, .command = "petdex.updates", .enabled = model.update_phase != .checking };
+    scratch.items[12] = .{ .id = 10, .separator = true };
+    scratch.items[13] = .{ .id = 11, .label = i18n.t("Quit Petdex", "Petdexを終了"), .command = "petdex.quit" };
+    return .{ .items = scratch.items[0..14] };
 }
 
 /// The menu-bar button icon: the brand mark's silhouette with the face
@@ -5188,6 +5225,7 @@ fn appMenus(comptime lang: i18n.Lang) [1]native_sdk.platform.Menu {
         .items = &.{
             .{ .label = i18n.pick(lang, "Settings...", "設定…"), .command = "petdex.settings", .key = ",", .modifiers = .{ .primary = true } },
             .{ .label = i18n.pick(lang, "Chat...", "チャット…"), .command = "petdex.chat", .key = "k", .modifiers = .{ .primary = true } },
+            .{ .label = i18n.pick(lang, "Reset Position", "位置のリセット"), .command = "petdex.reset-position" },
             .{ .separator = true },
             .{ .label = i18n.pick(lang, "Close Pet", "ペットを閉じる"), .command = "petdex.close", .key = "w", .modifiers = .{ .primary = true } },
         },
@@ -5622,7 +5660,7 @@ test "empty-state copy fits the pet window" {
 }
 
 test "menus fit the SDK's label limits in both languages" {
-    for ([_][6]AppUi.ContextMenuItem{ pet_menu_en, pet_menu_ja }) |menu| {
+    for ([_][7]AppUi.ContextMenuItem{ pet_menu_en, pet_menu_ja }) |menu| {
         for (menu) |item| try std.testing.expect(item.label.len <= 128);
     }
     for ([_][1]native_sdk.platform.Menu{ app_menus_en, app_menus_ja }) |menus| {
@@ -5638,8 +5676,9 @@ test "the tray speaks Japanese and keeps the version in its update label" {
     var scratch: PetdexApp.StatusItemScratch = undefined;
     const tray = petdexStatusItem(&model, &scratch);
     try std.testing.expectEqualStrings("設定…", tray.items[0].label);
+    try std.testing.expectEqualStrings("位置のリセット", tray.items[2].label);
     var buf: [96]u8 = undefined;
-    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "アップデートを確認… · {s}", .{updates.current_version}), tray.items[10].label);
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "アップデートを確認… · {s}", .{updates.current_version}), tray.items[11].label);
     for (tray.items) |item| try std.testing.expect(item.label.len <= 128);
 }
 
@@ -5683,25 +5722,28 @@ test "tray exposes website active pet and updater commands" {
     var model: Model = .{};
     var scratch: PetdexApp.StatusItemScratch = .{};
     var state = petdexStatusItem(&model, &scratch);
-    try std.testing.expectEqual(@as(usize, 13), state.items.len);
+    try std.testing.expectEqual(@as(usize, 14), state.items.len);
     try std.testing.expectEqualStrings("petdex.chat", state.items[1].command);
-    try std.testing.expectEqualStrings("Open petdex.dev", state.items[2].label);
-    try std.testing.expectEqualStrings("petdex.clear-notifications", state.items[5].command);
+    // Right under Chat, where a pet lost off a missing display is looked for.
+    try std.testing.expectEqualStrings("petdex.reset-position", state.items[2].command);
+    try std.testing.expectEqualStrings("Open petdex.dev", state.items[3].label);
+    try std.testing.expectEqualStrings("petdex.clear-notifications", state.items[6].command);
     // Nothing to clear, nothing to press.
-    try std.testing.expect(!state.items[5].enabled);
-    try std.testing.expectEqualStrings("Show Flock", state.items[7].label);
-    try std.testing.expectEqualStrings("View Pet on Petdex", state.items[8].label);
-    try std.testing.expect(std.mem.startsWith(u8, state.items[10].label, "Check for Updates"));
+    try std.testing.expect(!state.items[6].enabled);
+    try std.testing.expectEqualStrings("Show Flock", state.items[8].label);
+    try std.testing.expectEqualStrings("View Pet on Petdex", state.items[9].label);
+    try std.testing.expect(std.mem.startsWith(u8, state.items[11].label, "Check for Updates"));
     try std.testing.expectEqual(std.meta.Tag(Msg).open_chat, std.meta.activeTag(onCommand("petdex.chat").?));
     try std.testing.expectEqual(std.meta.Tag(Msg).clear_notifications, std.meta.activeTag(onCommand("petdex.clear-notifications").?));
+    try std.testing.expectEqual(std.meta.Tag(Msg).reset_position, std.meta.activeTag(onCommand("petdex.reset-position").?));
 
     testPushBubble(&model, "alpha", "waiting", false, -1);
     model.update_phase = .available;
     @memcpy(model.latest_version[0.."0.10.0".len], "0.10.0");
     model.latest_version_len = "0.10.0".len;
     state = petdexStatusItem(&model, &scratch);
-    try std.testing.expect(state.items[5].enabled);
-    try std.testing.expectEqualStrings("Update to Petdex 0.10.0…", state.items[10].label);
+    try std.testing.expect(state.items[6].enabled);
+    try std.testing.expectEqualStrings("Update to Petdex 0.10.0…", state.items[11].label);
 }
 
 test "bubble text default is its own value, not the range floor" {
