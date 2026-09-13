@@ -17,8 +17,6 @@ pub const Config = struct {
         base_url: []const u8 = openai_compat.default_base_url,
         model: []const u8 = "",
     } = .{},
-    /// Show the end of a reply in a bubble when the chat window is closed.
-    bubble_excerpt: bool = true,
     /// How many recent exchanges the chat bubble keeps on screen.
     stack: u8 = 3,
     /// Minutes between the pet's unprompted small talk; 0 is off.
@@ -50,7 +48,6 @@ test "missing, partial and broken files fall back to defaults" {
     try t.expectEqual(domain.ProviderKind.openai_compat, empty.provider);
     try t.expectEqualStrings(openai_compat.default_base_url, empty.openai_compat.base_url);
     try t.expectEqualStrings(codex.default_model, empty.codex.model);
-    try t.expect(empty.bubble_excerpt);
     try t.expectEqual(@as(u8, 3), empty.stack);
     try t.expectEqual(@as(u16, 0), empty.chatter_minutes);
     try t.expect(!empty.nudge);
@@ -70,13 +67,12 @@ test "config round-trips" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var config: Config = .{ .provider = .codex, .bubble_excerpt = false, .stack = 6, .chatter_minutes = 15, .nudge = true };
+    var config: Config = .{ .provider = .codex, .stack = 6, .chatter_minutes = 15, .nudge = true };
     config.openai_compat.base_url = "http://localhost:11434/v1";
     const bytes = stringify(a, config).?;
     const back = parse(a, bytes);
     try t.expectEqual(domain.ProviderKind.codex, back.provider);
     try t.expectEqualStrings("http://localhost:11434/v1", back.openai_compat.base_url);
-    try t.expect(!back.bubble_excerpt);
     try t.expectEqual(@as(u8, 6), back.stack);
     try t.expectEqual(@as(u16, 15), back.chatter_minutes);
     try t.expect(back.nudge);

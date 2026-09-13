@@ -53,7 +53,6 @@ const stream_timeout_ms: u32 = 5 * 60 * 1000;
 const chatgpt_account = "chatgpt";
 const reply_wave_ms: u32 = 1500;
 const failed_ms: u32 = 2500;
-const excerpt_bytes = 190;
 /// The small-talk intervals Settings offers, in minutes; 0 is off.
 pub const chatter_choices = [_]u16{ 0, 5, 15, 30, 60 };
 
@@ -102,7 +101,6 @@ pub const State = struct {
     local_url: canvas.TextBuffer(256) = .{},
     local_model: canvas.TextBuffer(128) = .{},
     codex_model: canvas.TextBuffer(128) = .{},
-    bubble_excerpt: bool = true,
     /// Recent exchanges stacked above the reply, 1 to max_stack.
     stack: u8 = 3,
     /// The line shown until the reply's first words, picked per request
@@ -129,9 +127,6 @@ pub const State = struct {
     chatter_minutes: u16 = 0,
     /// When the next small talk is due; 0 until scheduled.
     next_chatter_ms: i64 = 0,
-    /// Something the pet said unprompted just went to its bubble; main
-    /// opens that bubble as a card on its next drain.
-    speak_pending: bool = false,
     /// Speak up when a coding agent starts waiting on the user (Settings).
     nudge: bool = false,
     /// Since when the open chat's window can't be found; 0 while it can.
@@ -335,15 +330,45 @@ fn brief(model: *Model, fx: *Effects) void {
 /// unconfigured, the chat is open (the user is already there), bubbles
 /// are off or in Focus, or a request is still on the wire.
 pub fn speak(model: *Model, prompt: session.Prompt, fx: *Effects) bool {
+    if (!canSpeak(model)) return false;
     const st = &model.chat;
-    if (st.open or !model.bubbles_enabled or model.focus_mode or !st.ready()) return false;
     // A chat never opened since launch has no pet or persona loaded yet.
     if (st.pet_len == 0) syncPet(model, fx);
     if (st.pet_len == 0) return false;
     const action = st.session.brief(prompt, needsRefresh(st, fx));
     if (action == .none) return false;
+    // Said in the chat, which opens beside the pet if it was shut; the
+    // line stays there like any reply.
+    show(model, fx);
+    st.history = false;
+    st.scroll = 0;
+    pickThinking(st);
     run(model, action, fx);
     return true;
+}
+
+/// Whether the pet may speak unprompted now: configured, not in Focus, and
+/// not while the user is typing in the chat.
+fn canSpeak(model: *const Model) bool {
+    const st = &model.chat;
+    return st.ready() and !model.focus_mode and !(st.open and st.input.len > 0);
+}
+
+test "the pet speaks unless the user is typing, in Focus, or it's unconfigured" {
+    const t = std.testing;
+    var model: Model = .{};
+    model.chat.kind = .openai_compat;
+    try t.expect(!canSpeak(&model));
+    model.chat.local_url.set("http://localhost:1234/v1");
+    try t.expect(canSpeak(&model));
+    // An open chat is where it speaks, as long as nobody is typing there.
+    model.chat.open = true;
+    try t.expect(canSpeak(&model));
+    model.chat.input.set("hel");
+    try t.expect(!canSpeak(&model));
+    model.chat.input.clear();
+    model.focus_mode = true;
+    try t.expect(!canSpeak(&model));
 }
 
 /// Small talk on its clock, checked on every poll tick: no timer, and a
@@ -412,9 +437,6 @@ fn briefingPrompt(model: *const Model) []const u8 {
     var notes: [hook_server.max_bubbles]persona.Note = undefined;
     var n: usize = 0;
     for (model.bubbles[0..model.bubbles_len]) |*b| {
-        const agent = b.agent[0..b.agent_len];
-        // The chat's own reply excerpts are not news.
-        if (std.mem.eql(u8, agent, "petdex")) continue;
         notes[n] = noteFor(b, if (b.agent_state_len > 0) b.agentStateSlice() else if (b.busy) "working" else "finished");
         n += 1;
     }
@@ -786,8 +808,17 @@ fn run(model: *Model, action: session.Action, fx: *Effects) void {
         .refresh => startRefresh(model, fx),
         .done => finishReply(model, fx),
         // Unprompted, a failure is nobody's business: no pose, no error row.
-        .failed => if (model.chat.session.proactive()) model.chat.session.quiet() else app.applyState(model, .failed, failed_ms, fx),
+        .failed => if (model.chat.session.proactive()) quietFailure(model) else app.applyState(model, .failed, failed_ms, fx),
     }
+}
+
+/// An unprompted line that failed leaves no error row or Retry, but says
+/// why in the log, so small talk that never shows can be told apart from
+/// small talk that never ran.
+fn quietFailure(model: *Model) void {
+    const s = &model.chat.session;
+    std.debug.print("petdex: chat {s} failed: {s}\n", .{ @tagName(s.prompt), s.errorText() });
+    s.quiet();
 }
 
 fn startRequest(model: *Model, fx: *Effects) void {
@@ -879,14 +910,6 @@ fn finishReply(model: *Model, fx: *Effects) void {
     // Unprompted, the pet keeps its pose: one waiting on an agent stays
     // waiting, and its chime escalation with it.
     if (!unprompted) app.applyState(model, .waving, reply_wave_ms, fx);
-    if (unprompted or (!st.open and st.bubble_excerpt)) {
-        var buf: [excerpt_bytes + 3]u8 = undefined;
-        const cut = domain.utf8Floor(reply, excerpt_bytes);
-        const text = if (cut.len < reply.len) std.fmt.bufPrint(&buf, "{s}…", .{cut}) catch cut else cut;
-        _ = hook_server.mailbox.setBubble("petdex-chat", text, "petdex", st.petName(), false);
-        // Said unprompted, it opens as a card, read without a click.
-        st.speak_pending = unprompted;
-    }
 }
 
 fn stop(model: *Model, fx: *Effects) void {
@@ -1087,7 +1110,6 @@ fn loadConfig(st: *State) void {
     setText(&st.local_url, cfg.openai_compat.base_url);
     setText(&st.local_model, cfg.openai_compat.model);
     setText(&st.codex_model, cfg.codex.model);
-    st.bubble_excerpt = cfg.bubble_excerpt;
     st.stack = std.math.clamp(cfg.stack, 1, max_stack);
     st.chatter_minutes = @min(cfg.chatter_minutes, chatter_choices[chatter_choices.len - 1]);
     st.nudge = cfg.nudge;
@@ -1096,7 +1118,7 @@ fn loadConfig(st: *State) void {
 fn saveConfig(st: *const State) void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    var cfg: config.Config = .{ .provider = st.kind, .bubble_excerpt = st.bubble_excerpt, .stack = st.stack, .chatter_minutes = st.chatter_minutes, .nudge = st.nudge };
+    var cfg: config.Config = .{ .provider = st.kind, .stack = st.stack, .chatter_minutes = st.chatter_minutes, .nudge = st.nudge };
     cfg.codex.model = st.codexModel();
     cfg.openai_compat.base_url = st.localUrl();
     cfg.openai_compat.model = st.localModel();

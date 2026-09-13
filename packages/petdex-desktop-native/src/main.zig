@@ -251,9 +251,6 @@ pub const Model = struct {
     /// or read. Null where the host doesn't report it (Windows, Linux):
     /// those keep deciding the side with the probe above.
     pet_screen: ?Screen = null,
-    /// When the card of something the pet said unprompted shuts itself;
-    /// 0 when none is on its timer.
-    speak_close_at_ms: i64 = 0,
     /// Conversations the pet already spoke up about in their current
     /// waiting spell, oldest first.
     nudged: [hook_server.max_bubbles]u64 = @splat(0),
@@ -3343,7 +3340,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
             _ = expireBubbles(model, now);
             syncHookSim(model);
-            showSpokenCard(model, now);
             nudgeWaiting(model, fx);
             startHookTicks(model, fx);
             // Place the bubble on the poll clock too, not only on presented
@@ -3608,8 +3604,7 @@ fn cardButtonHit(model: *const Model, x: f32, y: f32) ?usize {
 /// the model line when known, and the text's first lines, three at most.
 fn bubbleCardLines(model: *const Model, slot: usize) usize {
     const bubble = &model.bubbles[slot];
-    // The pet's own card has no status line.
-    var lines: usize = if (isPetBubble(bubble)) 1 else 2;
+    var lines: usize = 2;
     if (bubble.model_len > 0 or bubble.effort_len > 0) lines += 1;
     var buf: [256]u8 = undefined;
     const text = bubbleCardText(bubble, &buf);
@@ -3857,10 +3852,6 @@ fn pressHookBubble(model: *Model, fx: *Effects) void {
     const at = hookCursor(model, fx) orelse return;
     if (cardButtonHit(model, at[0], at[1])) |slot| return openDestination(&model.bubbles[slot]);
     const index = model.hook_sim.hit(hookLayout(model), at[0], at[1]) orelse return;
-    // A press takes over from the timer that shuts the pet's own card.
-    model.speak_close_at_ms = 0;
-    // The pet's own card answers with the chat, where a reply goes.
-    const to_chat = model.hook_sim.isOpen(index) and isPetBody(model, index);
     model.hook_sim.toggle(index);
     if (model.hook_sim.isOpen(index)) trimHookCards(model, index);
     // The window resizes now, so the bubbles move with it now too.
@@ -3868,28 +3859,6 @@ fn pressHookBubble(model: *Model, fx: *Effects) void {
     syncBubbleWindow(model, fx);
     // The card swells open or shut on the clock.
     startHookTicks(model, fx);
-    if (to_chat) chat_shell.update(model, .show_chat, fx);
-}
-
-/// How long the card of something the pet said unprompted stays open.
-const speak_card_ms: i64 = 12_000;
-
-/// The pet just said something unprompted into its own bubble: open that
-/// bubble as a card for a while, so the line reads without a click. Waits
-/// for the drain that brings the bubble in.
-fn showSpokenCard(model: *Model, now: i64) void {
-    if (model.chat.speak_pending) {
-        const index = petBubbleIndex(model) orelse return;
-        model.chat.speak_pending = false;
-        if (!model.hook_sim.isOpen(index)) model.hook_sim.toggle(index);
-        trimHookCards(model, index);
-        model.hook_sim.step(0, hookLayout(model));
-        model.speak_close_at_ms = now + speak_card_ms;
-    } else if (model.speak_close_at_ms != 0 and now >= model.speak_close_at_ms) {
-        model.speak_close_at_ms = 0;
-        const index = petBubbleIndex(model) orelse return;
-        if (model.hook_sim.isOpen(index)) model.hook_sim.toggle(index);
-    }
 }
 
 /// Speak up once per waiting spell (Settings → Chat): when a conversation
@@ -3907,7 +3876,6 @@ fn nudgeWaiting(model: *Model, fx: *Effects) void {
     var n: usize = 0;
     var calm: usize = 0;
     for (model.bubbles[0..model.bubbles_len], 0..) |*bubble, i| {
-        if (isPetBubble(bubble)) continue;
         if (bubbleState(model, i) == .waiting) {
             waiting_ids[n] = hookId(bubble);
             waiting[n] = bubble;
@@ -3919,16 +3887,15 @@ fn nudgeWaiting(model: *Model, fx: *Effects) void {
     }
     model.nudged_len = forgetNudged(model.nudged[0..model.nudged_len], calm_ids[0..calm]);
     if (!nudgeNews(model.nudged[0..model.nudged_len], waiting_ids[0..n])) return;
-    // With the chat open the user is already there, so it counts as said.
-    // Otherwise a request still on the wire leaves it for a later tick.
-    if (!model.chat.open and !chat_shell.nudge(model, waiting[0..n], fx)) return;
+    // Said in the chat. The user typing there, or a request still on the
+    // wire, leaves it for a later tick.
+    if (!chat_shell.nudge(model, waiting[0..n], fx)) return;
     rememberNudged(&model.nudged, &model.nudged_len, waiting_ids[0..n]);
 }
 
 /// Forget, in place, the conversations seen not waiting: their next prompt
-/// is news again. One missing from the list stays remembered: with one
-/// bubble at a time, the pet's own reply takes its place, and forgetting
-/// it there would have the pet speak up again at every re-post.
+/// is news again. One missing from the list (evicted, or folded away with
+/// one bubble at a time) stays remembered, so its re-post isn't news.
 fn forgetNudged(nudged: []u64, calm: []const u64) usize {
     var kept: usize = 0;
     for (nudged) |id| {
@@ -3978,23 +3945,6 @@ test "the pet speaks up once per waiting spell" {
     try std.testing.expectEqual(nudged.len, len);
     try std.testing.expectEqual(@as(u64, 2), nudged[0]);
     try std.testing.expectEqual(@as(u64, 11), nudged[len - 1]);
-}
-
-/// The chat's own bubble: what the pet said while the chat was shut.
-fn isPetBubble(bubble: *const hook_server.Bubble) bool {
-    return std.mem.eql(u8, bubble.agent[0..bubble.agent_len], "petdex");
-}
-
-fn isPetBody(model: *const Model, index: usize) bool {
-    const slot = hookSlot(model, model.hook_sim.bodies[index].id) orelse return false;
-    return isPetBubble(&model.bubbles[slot]);
-}
-
-fn petBubbleIndex(model: *const Model) ?usize {
-    for (model.hook_sim.bodies, 0..) |body, i| {
-        if (body.live() and !body.leaving and isPetBody(model, i)) return i;
-    }
-    return null;
 }
 
 /// The most recently updated bubble, or null when there is none.
@@ -4581,14 +4531,10 @@ fn bubbleCard(ui: *AppUi, model: *const Model, slot: usize) AppUi.Node {
     var project = ui.paragraph(.{ .size = .heading, .wrap = false }, &.{.{ .text = bubbleProject(bubble), .weight = .bold }});
     project.widget.style.foreground = title_fg;
     rows[0] = project;
-    var count: usize = 1;
-    // The pet's own card is its name and what it said.
-    if (!isPetBubble(bubble)) {
-        var status = ui.text(.{ .size = .heading }, ui.fmt("{s} - {s}", .{ bubbleAgentName(bubble), bubbleStatus(model, slot) }));
-        status.widget.style.foreground = muted_fg;
-        rows[1] = status;
-        count = 2;
-    }
+    var status = ui.text(.{ .size = .heading }, ui.fmt("{s} - {s}", .{ bubbleAgentName(bubble), bubbleStatus(model, slot) }));
+    status.widget.style.foreground = muted_fg;
+    rows[1] = status;
+    var count: usize = 2;
     if (bubbleSettingsLine(ui, bubble)) |line| {
         var settings = ui.text(.{ .size = .heading }, line);
         settings.widget.style.foreground = muted_fg;
@@ -5930,25 +5876,6 @@ fn testPushBubble(model: *Model, session: []const u8, text: []const u8, busy: bo
     model.bubbles[i] = b;
     model.bubble_expires_at_ms[i] = deadline;
     model.bubbles_len = i + 1;
-}
-
-test "what the pet says unprompted opens its bubble as a card, then shuts it" {
-    var model: Model = .{};
-    testPushBubble(&model, "petdex-chat", "眠いなあ…", false, -1);
-    @memcpy(model.bubbles[0].agent[0.."petdex".len], "petdex");
-    model.bubbles[0].agent_len = "petdex".len;
-    syncHookSim(&model);
-    // The pet's name and what it said: no "agent - status" line.
-    try std.testing.expectEqual(@as(usize, 2), bubbleCardLines(&model, 0));
-    model.chat.speak_pending = true;
-    showSpokenCard(&model, 1000);
-    const index = petBubbleIndex(&model).?;
-    try std.testing.expect(model.hook_sim.isOpen(index));
-    try std.testing.expect(!model.chat.speak_pending);
-    showSpokenCard(&model, 1000 + speak_card_ms - 1);
-    try std.testing.expect(model.hook_sim.isOpen(index));
-    showSpokenCard(&model, 1000 + speak_card_ms);
-    try std.testing.expect(!model.hook_sim.isOpen(index));
 }
 
 test "bubbles per conversation defaults on, and only an explicit false opts out" {

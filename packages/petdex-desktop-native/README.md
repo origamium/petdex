@@ -90,11 +90,11 @@ default:
 - **Speak up when an agent needs you** says so once each time a coding agent
   starts waiting on you.
 
-Either line goes to the pet's own bubble, which opens as a card for 12
-seconds; press it to open the chat. The request carries the persona and the
-app's prompt without the conversation, and the pet keeps its pose. Nothing is
-said while the chat is open, while bubbles are off or in Focus, or while
-another request is on the wire. The lines are saved to history like any reply.
+Either line is said in the chat, which opens beside the pet if it was closed,
+and stays there like any reply; it is saved to history too. The request
+carries the persona and the app's prompt without the conversation, and the pet
+keeps its pose. Nothing is said while you are typing in the chat, in Focus, or
+while another request is on the wire.
 
 ## Appearance
 
