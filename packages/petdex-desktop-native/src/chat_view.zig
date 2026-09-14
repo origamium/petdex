@@ -1,4 +1,4 @@
-//! The chat window and the Chat section of Settings. Pure views over
+//! The chat window and its dedicated options screen. Pure views over
 //! `Model.chat`; every interaction is a Msg that chat_shell handles.
 
 const std = @import("std");
@@ -255,11 +255,11 @@ fn speech(st: *const State, buf: []u8) Speech {
     if (s.busy() and reply.len == 0) return .{ .text = st.thinkingText() };
     if (!st.ready()) return .{
         .text = if (st.kind == .codex)
-            i18n.bufPrint(buf, "Sign in to ChatGPT in Settings to talk to {s}.", "{s}と話すには、設定でChatGPTにサインインしてください。", .{st.petName()}) catch i18n.t("Sign in to ChatGPT in Settings.", "設定でChatGPTにサインインしてください。")
+            i18n.bufPrint(buf, "Connect ChatGPT to talk to {s}.", "ChatGPTを接続して、{s}と話しましょう。", .{st.petName()}) catch i18n.t("Connect ChatGPT to start chatting.", "ChatGPTを接続して会話を始めましょう。")
         else
-            i18n.t("Set the local server URL in Settings.", "設定でローカルサーバーのURLを指定してください。"),
-        .action = .open_settings,
-        .action_label = i18n.t("Open Settings", "設定を開く"),
+            i18n.t("Connect a local server to start chatting.", "ローカルサーバーを接続して会話を始めましょう。"),
+        .action = .open_chat_options,
+        .action_label = i18n.t("Set up chat", "チャットを接続"),
     };
     if (reply.len > 0) return .{ .text = reply, .tone = .speech };
     if (s.lost_text) return .{ .text = i18n.t("Part of this reply was lost.", "返事の一部が失われました。") };
@@ -408,11 +408,15 @@ fn composer(ui: *AppUi, model: *const Model, st: *const State) AppUi.Node {
 /// Small round buttons under the composer. Each wears the bubble surface
 /// so it stays legible over any desktop.
 fn controls(ui: *AppUi, model: *const Model, st: *const State) AppUi.Node {
+    var options = ui.button(.{ .size = .sm, .height = control_h, .on_press = .open_chat_options, .semantics = .{ .label = i18n.t("Chat options", "チャットの設定") } }, i18n.t("Options", "会話の設定"));
+    app.styleSpeechCard(&options, model.dark);
+    options.widget.style.radius = control_h / 2;
     return ui.row(.{ .gap = 6, .width = card_w }, .{
+        options,
         ui.el(.stack, .{ .grow = 1 }, .{}),
         // Starts over: the conversation and its saved history go.
-        roundButton(ui, model, "edit", i18n.t("New Chat", "新しいチャット"), .chat_clear, st.session.transcript.len() == 0 and !st.session.busy()),
-        roundButton(ui, model, "clock", if (st.history) i18n.t("Latest Reply", "最新の返事") else i18n.t("Earlier Messages", "以前のメッセージ"), .chat_toggle_history, false),
+        roundButton(ui, model, "refresh-cw", i18n.t("Reset conversation", "会話をリセット"), .chat_clear, st.session.transcript.len() == 0 and !st.session.busy()),
+        roundButton(ui, model, if (st.history) "arrow-down" else "clock", if (st.history) i18n.t("Latest Reply", "最新の返事") else i18n.t("Earlier Messages", "以前のメッセージ"), .chat_toggle_history, false),
         roundButton(ui, model, "x", i18n.t("Close Chat", "チャットを閉じる"), .chat_closed, false),
     });
 }
@@ -432,16 +436,39 @@ fn roundButton(ui: *AppUi, model: *const Model, icon: []const u8, label: []const
     return button;
 }
 
-// ── Settings ──────────────────────────────────────────────────────────
+// The options use the preferences window's slot so opening them never
+// evicts a companion window. They have their own title and return action.
+pub fn optionsView(ui: *AppUi, model: *const Model) AppUi.Node {
+    var root = ui.el(.panel, .{ .grow = 1 }, .{ui.column(.{ .grow = 1 }, .{
+        ui.el(.stack, .{ .height = app.companion_header_h, .window_drag = true }, .{}),
+        ui.row(.{ .padding = 20, .gap = 12, .cross = .center }, .{
+            ui.column(.{ .grow = 1, .gap = 6 }, .{
+                ui.text(.{ .size = .lg }, i18n.t("Chat options", "チャットの設定")),
+                muted(ui, i18n.t("Connection and conversation, in one place.", "接続先と会話のふるまいを、ここで。")),
+            }),
+            ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .close_chat_options }, i18n.t("Back to chat", "チャットに戻る")),
+        }),
+        ui.scroll(.{ .grow = 1, .value = model.settings_scroll, .on_scroll = AppUi.scrollMsg(.settings_scrolled) }, .{
+            ui.column(.{ .padding = 20, .gap = 12 }, .{
+                optionsSection(ui, model),
+                ui.el(.stack, .{ .height = 12 }, .{}),
+            }),
+        }),
+    })});
+    root.widget.style.radius = 0;
+    root.widget.style.stroke_width = 0;
+    root.widget.style.background = app.settingsBackground(model);
+    return root;
+}
 
-pub fn settingsSection(ui: *AppUi, model: *const Model) AppUi.Node {
+fn optionsSection(ui: *AppUi, model: *const Model) AppUi.Node {
     const st = &model.chat;
     return ui.column(.{ .gap = 10 }, .{
-        ui.text(.{ .size = .lg }, i18n.t("Chat", "チャット")),
+        ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, i18n.t("CONNECTION", "接続")),
         panel(ui, ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
             ui.column(.{ .grow = 1 }, .{
-                ui.text(.{}, i18n.t("Talk to your pet", "ペットと話す")),
-                muted(ui, i18n.t("Click the pet to chat; double-click for a catch-up on your agents", "クリックでチャット、ダブルクリックでエージェントの様子を聞けます")),
+                ui.text(.{}, i18n.t("Reply with", "返事に使うサービス")),
+                muted(ui, i18n.t("Choose the service for this conversation", "会話に使うサービスを選びます")),
             }),
             ui.row(.{ .gap = 6 }, .{
                 ui.button(.{
@@ -460,6 +487,8 @@ pub fn settingsSection(ui: *AppUi, model: *const Model) AppUi.Node {
             .codex => chatgptPanel(ui, st),
             .openai_compat => localPanel(ui, st),
         },
+        ui.el(.stack, .{ .height = 8 }, .{}),
+        ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, i18n.t("CONVERSATION", "会話")),
         panel(ui, ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
             ui.column(.{ .grow = 1 }, .{
                 ui.text(.{}, i18n.t("Messages on screen", "画面に残すメッセージ")),
@@ -681,12 +710,12 @@ test "the reply card thinks until the first words, a briefing included" {
     try std.testing.expectEqualStrings(st.thinkingText(), speech(st, &buf).text);
 }
 
-test "an unconfigured chat bubble points at Settings" {
+test "an unconfigured chat bubble opens its connection options" {
     var model: Model = .{};
     var buf: [speech_buf_len]u8 = undefined;
     const sp = speech(&model.chat, &buf);
-    try std.testing.expect(sp.action.? == .open_settings);
-    // The Open Settings button adds to the card.
+    try std.testing.expect(sp.action.? == .open_chat_options);
+    // The connection button adds to the card.
     const unconfigured = cardHeight(&model);
     model.chat.local_url.set("http://localhost:1234/v1");
     try std.testing.expect(cardHeight(&model) < unconfigured);

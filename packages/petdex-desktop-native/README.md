@@ -44,6 +44,26 @@ Builds pass `-Dtrace=off`. Without it the SDK appends a trace record per frame
 and timer to `native-sdk.jsonl` in the platform log directory (#714); the app
 deletes that file once it passes 32 MB.
 
+## Navigation
+
+The pet’s right-click menu and the menu-bar extra share live Show/Hide
+controls for chat, agent bubbles, Flock and usage limits. Focus Mode,
+waiting sound and clearing notifications live there too. Hiding agent bubbles
+keeps the existing behavior: current notifications are cleared. Focus Mode
+also pauses spontaneous chat; it ends when the app restarts.
+
+Settings uses a sidebar: Pets, Connections, Notifications, Appearance and
+General. Daily visibility controls are in the menus; notification lifetime,
+text size and per-conversation layout stay under Notifications. General holds
+launch at login, Dock presence and updates.
+
+Chat options has a dedicated screen, reached from the chat’s Options button
+or either menu: connection, model, messages kept on screen, small talk and
+agent nudges. Back to chat keeps the draft and history. It reuses the settings
+window slot, so opening it does not consume another companion window. New
+installs open Connections; pet download links open the Pets page and its
+existing progress banner.
+
 ## Bubbles
 
 Each coding-agent conversation floats over the pet as a bubble with the
@@ -55,19 +75,19 @@ first lines of what it is doing or last said. When the agent runs in Warp (2026.
 Terminal, the card also brings its pane or tab to the front. Click again to
 close it. Any number can be open; the cards stack without overlapping. A finished bubble stays with a green check, its card and terminal
 still a click away, until you clear the bubbles from the pet's menu or the
-tray, or its lifetime in Settings runs out. Up to ten conversations float at
+tray, or its lifetime in Settings → Notifications runs out. Up to ten conversations float at
 once; past that, the one idle longest makes way. On Linux the bubbles show
 their state but do not open into cards.
 
 Claude Code reports failed tools and failed turns once its hooks are installed
-again from Settings; an earlier install keeps working without them.
+again from Settings → Connections; an earlier install keeps working without them.
 
 ## Chat
 
 Click the pet to talk to it; double-click it for a catch-up on your coding
 agents and your last conversation, in its own voice. Cmd+K, the tray and the
 pet's menu toggle the chat. Choose ChatGPT or a local OpenAI-compatible server
-(LM Studio, Ollama) under Settings → Chat.
+(LM Studio, Ollama) from Chat options, opened beside the chat composer or from either menu.
 
 The persona comes from the pet's `pet.json` (`displayName`, `description`). A
 `persona.md` next to `pet.json` describes the character in more depth, and
@@ -83,7 +103,7 @@ the chat shows one of the pet's `thinking` lines, picked at random, or
 
 History lives in `~/.petdex/petdex.db`, up to 400 messages per pet.
 
-Two options under Settings → Chat have the pet speak first, both off by
+Two options under Chat options have the pet speak first, both off by
 default:
 - **Small talk** says something unprompted every 5, 15, 30 or 60 minutes,
   give or take a quarter.
@@ -96,11 +116,37 @@ carries the persona and the app's prompt without the conversation, and the pet
 keeps its pose. Nothing is said while you are typing in the chat, in Focus, or
 while another request is on the wire.
 
+## Usage limits
+
+Show Usage Limits in the pet’s right-click menu or the menu-bar extra (macOS, off by default) puts a column beside the pet:
+each coding agent's logo and how much of its tightest limit is used, the
+five-hour or the weekly one, whichever is fuller. It sits left of the pet and
+moves right when the chat or the screen's edge takes the left. Click a row to
+open its windows beside the column, each with its bar and how long until it
+resets; click it again to close them.
+
+- **Claude Code** hands its limits to its statusline. Turning the column on
+  wraps the `statusLine` command in `~/.claude/settings.json`; the wrapper
+  keeps the numbers and runs your command as before. Turning the column off,
+  or removing Petdex's Claude Code hooks, puts yours back. The row needs those
+  hooks.
+- **Codex** writes them into its session log, read by the Stop hook at the end
+  of each turn.
+- **Junie** spends JetBrains AI credits, read from the quota file the JetBrains
+  IDEs keep, as of an IDE's last check.
+- **Copilot** and **Cursor** are asked every five minutes, with the sign-ins
+  their own apps keep (`~/.config/github-copilot/apps.json`, Cursor's settings
+  database).
+
+An agent with nothing to report has no row. Petdex never refreshes an agent's
+sign-in.
+
 ## Appearance
 
-Settings → Appearance sets the pet's size, from 0.4 to 2.0 times its frame,
-and the look: Auto follows the system's light or dark appearance, Light and
-Dark keep one. The menus stay the system's.
+Settings → Pets keeps the existing library, size control (0.4 to 2.0 times
+the frame), daily rotation and custom-pets folder. Settings → Appearance
+sets the look: Auto follows the system’s light or dark appearance; Light and
+Dark keep one. The menus stay the system’s.
 
 ## Language
 
@@ -122,7 +168,7 @@ Petdex hooks remain preferred for supported agents. See
 ## DeepSeek Harness (macOS)
 
 The bundled DeepSeek Harness plugin mirrors official DSH Web session events
-into Petdex. Install it from Settings, restart DSH Web, then start or continue
+into Petdex. Install it from Settings → Connections, restart DSH Web, then start or continue
 a task; Petdex reports the integration as connected only after receiving a real
 event. One top-level DSH session becomes one task card, while subagents,
 workflows, goals, and compaction update their parent card.
@@ -182,7 +228,7 @@ Notes:
   when that installation does not use `~/.hermes`; it must be absolute or
   begin with `~/`.
 - Sync runs after every tunnel establishment, before that tunnel's feed token
-  becomes available; the Settings "Remote Agents" section reports live status
+  becomes available; Settings → Connections → Remote Agents reports live status
   and stays read-only.
 - If a remote account also runs a petdex desktop, do not point a remote at it:
   the writeback replaces that account's `~/.petdex/bin/petdex-hook` with the
