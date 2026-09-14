@@ -7,6 +7,7 @@
 const std = @import("std");
 const domain = @import("domain.zig");
 const provider = @import("provider.zig");
+const persona = @import("persona.zig");
 const i18n = @import("../i18n.zig");
 
 const Role = domain.Role;
@@ -19,6 +20,8 @@ pub const max_message_bytes = 16 * 1024;
 /// One request carries the newest turns that fit both budgets.
 pub const context_messages = 20;
 pub const context_bytes = 24 * 1024;
+pub const chatter_context_messages = 6;
+pub const chatter_context_bytes = 4 * 1024;
 /// Far above main.zig's hand-numbered keys and remote_runtime's 1<<40 band.
 pub const stream_key_base: u64 = @as(u64, 1) << 41;
 
@@ -151,6 +154,10 @@ pub const Session = struct {
     /// The pet speaks first: the shell ends the request with the app's
     /// prompt of this kind, and no user turn enters the transcript.
     prompt: Prompt = .none,
+    /// Chosen once per new small-talk turn, also remembering the last
+    /// angle between turns. Retries keep it; load resets it with the pet.
+    chatter_angle: ?persona.ChatterAngle = null,
+    chatter_topic: persona.ChatterTopic = .contextual,
     /// The key of the request still open on the wire, until its terminal
     /// Msg arrives. A stopped or reset request keeps it: its fetch winds
     /// down asynchronously, and nothing new goes out before it has, so the
@@ -205,6 +212,14 @@ pub const Session = struct {
         return self.transcript.window(out, context_messages, context_bytes);
     }
 
+    pub fn chatterContext(self: *const Session, out: *[chatter_context_messages]Message) []const Message {
+        return self.transcript.window(out, chatter_context_messages, chatter_context_bytes);
+    }
+
+    pub fn casualChatter(self: *const Session) bool {
+        return self.prompt == .chatter and self.chatter_topic == .casual;
+    }
+
     pub fn lastReply(self: *const Session) ?[]const u8 {
         const m = self.transcript.last() orelse return null;
         return if (m.role == .assistant) m.text else null;
@@ -247,9 +262,15 @@ pub const Session = struct {
     /// Let the pet speak first: a request with no new user turn, which
     /// the shell completes with the app's `prompt`. The reply lands like
     /// any other.
-    pub fn brief(self: *Session, prompt: Prompt, needs_refresh: bool) Action {
+    pub fn brief(self: *Session, prompt: Prompt, needs_refresh: bool, entropy: u64) Action {
         if (!self.canSend()) return .none;
         self.prompt = prompt;
+        if (prompt == .chatter) {
+            self.chatter_topic = persona.chatterTopic(entropy);
+            // Use the quotient for the angle so either topic can get
+            // every angle, even when excluding the previous one.
+            self.chatter_angle = persona.nextChatterAngle(self.chatter_angle, entropy / 3);
+        }
         return self.begin(needs_refresh);
     }
 
@@ -382,7 +403,7 @@ test "the current reply is the one being said, none while thinking or failed" {
     s.transcript.append(.user, "hi");
     s.transcript.append(.assistant, "hey");
     try t.expectEqualStrings("hey", s.currentReply().?);
-    _ = s.brief(.briefing, false);
+    _ = s.brief(.briefing, false, 0);
     try t.expect(s.currentReply() == null);
     _ = s.onResponse(.openai_compat, s.streamKey(), 0, "down");
     try t.expect(s.currentReply() == null);
@@ -397,7 +418,7 @@ test "a briefing streams a reply without a user turn and can be retried" {
 
     s.transcript.append(.user, "hi");
     s.transcript.append(.assistant, "hey");
-    try t.expectEqual(Action.request, s.brief(.briefing, false));
+    try t.expectEqual(Action.request, s.brief(.briefing, false, 0));
     try t.expectEqual(Prompt.briefing, s.prompt);
     try t.expectEqual(@as(usize, 2), s.transcript.len());
     try t.expectEqual(Action.failed, s.onResponse(.openai_compat, s.streamKey(), 0, "down"));
@@ -415,7 +436,7 @@ test "unprompted small talk that fails passes quietly" {
     defer t.allocator.destroy(s);
     s.transcript.append(.user, "hi");
     s.transcript.append(.assistant, "hey");
-    try t.expectEqual(Action.request, s.brief(.chatter, false));
+    try t.expectEqual(Action.request, s.brief(.chatter, false, 0));
     try t.expect(s.proactive());
     try t.expectEqual(Action.failed, s.onResponse(.openai_compat, s.streamKey(), 0, "down"));
     s.quiet();
@@ -425,6 +446,101 @@ test "unprompted small talk that fails passes quietly" {
     try t.expectEqualStrings("hey", s.currentReply().?);
 }
 
+test "small-talk angles survive refreshes and retries and reset with the conversation" {
+    const s = newSession();
+    defer t.allocator.destroy(s);
+    try t.expectEqual(Action.refresh, s.brief(.chatter, true, 6));
+    const angle = s.chatter_angle.?;
+    try t.expect(s.casualChatter());
+    try t.expectEqual(Action.none, s.brief(.chatter, false, 0));
+    try t.expectEqual(angle, s.chatter_angle.?);
+    try t.expect(s.casualChatter());
+    try t.expectEqual(Action.request, s.onRefreshed(true, ""));
+    try t.expectEqual(Action.refresh, s.onResponse(.codex, s.streamKey(), 401, null));
+    try t.expectEqual(Action.request, s.onRefreshed(true, ""));
+    try t.expectEqual(angle, s.chatter_angle.?);
+    try t.expect(s.casualChatter());
+    try t.expectEqual(Action.failed, s.onResponse(.codex, s.streamKey(), 503, null));
+    try t.expectEqual(Action.request, s.retry(false));
+    try t.expectEqual(angle, s.chatter_angle.?);
+    try t.expect(s.casualChatter());
+    _ = s.onResponse(.codex, s.streamKey(), 503, null);
+    s.quiet();
+
+    // Other kinds of turns don't consume an angle.
+    _ = s.brief(.nudge, false, 1);
+    try t.expectEqual(angle, s.chatter_angle.?);
+    try t.expect(!s.casualChatter());
+    _ = s.onResponse(.openai_compat, s.streamKey(), 503, null);
+    s.quiet();
+    _ = s.brief(.chatter, false, 2);
+    try t.expect(s.chatter_angle.? != angle);
+    try t.expect(!s.casualChatter());
+    _ = s.onResponse(.openai_compat, s.streamKey(), 503, null);
+
+    // Both switching pets (load history) and New Chat use load.
+    s.load(&.{.{ .role = .user, .text = "another pet's history" }});
+    try t.expect(s.chatter_angle == null);
+    try t.expectEqual(persona.ChatterTopic.contextual, s.chatter_topic);
+    _ = s.brief(.chatter, false, 6);
+    try t.expectEqual(angle, s.chatter_angle.?);
+    s.load(&.{});
+    try t.expect(s.chatter_angle == null);
+    try t.expect(!s.casualChatter());
+}
+
+test "a third of small-talk slots are casual and each topic can use every angle" {
+    const s = newSession();
+    defer t.allocator.destroy(s);
+    var casual: usize = 0;
+    var seen = [_][4]bool{[_]bool{false} ** 4} ** 2;
+    for (0..120) |entropy| {
+        s.load(&.{});
+        _ = s.brief(.chatter, true, entropy);
+        if (s.casualChatter()) casual += 1;
+        seen[@intFromEnum(s.chatter_topic)][@intFromEnum(s.chatter_angle.?)] = true;
+    }
+    try t.expectEqual(@as(usize, 40), casual);
+    for (seen) |angles| for (angles) |reached| {
+        try t.expect(reached);
+    };
+}
+
+test "small-talk context uses six recent messages within four KiB" {
+    const s = newSession();
+    defer t.allocator.destroy(s);
+    var out: [chatter_context_messages]Message = undefined;
+    try t.expectEqual(@as(usize, 0), s.chatterContext(&out).len);
+    s.transcript.append(.assistant, "a line before anyone spoke");
+    try t.expectEqual(@as(usize, 0), s.chatterContext(&out).len);
+    for (0..4) |_| {
+        s.transcript.append(.user, "好きな本は？");
+        s.transcript.append(.assistant, "冒険のお話かな。");
+    }
+    const six = s.chatterContext(&out);
+    try t.expectEqual(@as(usize, 6), six.len);
+    try t.expectEqual(Role.user, six[0].role);
+    try t.expectEqualStrings(s.transcript.get(3).text, six[0].text);
+    try t.expectEqualStrings(s.transcript.last().?.text, six[5].text);
+
+    s.load(&.{});
+    for (0..3) |_| {
+        s.transcript.append(.user, "あ" ** 300);
+        s.transcript.append(.assistant, "い" ** 300);
+    }
+    const bounded = s.chatterContext(&out);
+    try t.expectEqual(@as(usize, 4), bounded.len);
+    var bytes: usize = 0;
+    for (bounded) |m| {
+        bytes += m.text.len;
+        try t.expect(std.unicode.utf8ValidateSlice(m.text));
+    }
+    try t.expect(bytes <= chatter_context_bytes);
+    // An oversized newest message leaves no partial exchange to misread.
+    s.transcript.append(.user, "あ" ** 1400);
+    try t.expectEqual(@as(usize, 0), s.chatterContext(&out).len);
+}
+
 test "one request on the wire at a time" {
     const s = newSession();
     defer t.allocator.destroy(s);
@@ -432,11 +548,11 @@ test "one request on the wire at a time" {
     try t.expectEqual(Action.request, s.submit("hi", false));
     const first = s.streamKey();
     // A double tap while the reply streams.
-    try t.expectEqual(Action.none, s.brief(.briefing, false));
+    try t.expectEqual(Action.none, s.brief(.briefing, false, 0));
     // Stopped, but its fetch has not wound down yet.
     s.cancel();
     try t.expectEqual(Action.none, s.submit("again", false));
-    try t.expectEqual(Action.none, s.brief(.briefing, false));
+    try t.expectEqual(Action.none, s.brief(.briefing, false, 0));
     // New Chat and a pet switch reset the transcript, not the wire.
     s.load(&.{});
     try t.expectEqual(Action.none, s.submit("again", false));

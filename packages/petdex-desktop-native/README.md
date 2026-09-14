@@ -92,8 +92,14 @@ pet's menu toggle the chat. Choose ChatGPT or a local OpenAI-compatible server
 The persona comes from the pet's `pet.json` (`displayName`, `description`). A
 `persona.md` next to `pet.json` describes the character in more depth, and
 `~/.petdex/personas/<slug>.md` overrides it for your own copy; either stands in
-for the description. The app keeps the framing: a desktop pet that answers in
-one to three short sentences of plain text. Until a reply's first words arrive,
+for the description. A blank override falls back to the pet's own sheet.
+Sheets are re-read before each request, so edits apply to the next utterance.
+The sheet's pronouns, name for the user, register and emotional tone take
+priority over variety; recurring interests can return with fresh details.
+The app keeps the framing: a desktop pet that answers in
+one to three short sentences of plain text, with varied reactions and phrasing
+while preserving the character's identity and established facts. Catchphrases,
+advice and follow-up questions are optional. Until a reply's first words arrive,
 the chat shows one of the pet's `thinking` lines, picked at random, or
 "Thinking…" when it has none:
 
@@ -101,7 +107,12 @@ the chat shows one of the pet's `thinking` lines, picked at random, or
 { "displayName": "古関ウイ", "thinking": ["眠いなあ…", "先生、何考えてるんだろう…"] }
 ```
 
-History lives in `~/.petdex/petdex.db`, up to 400 messages per pet.
+History lives in `~/.petdex/petdex.db`: user messages and completed replies,
+including unprompted lines, survive app restarts. Every save removes the oldest
+rows over 400 messages per pet or 10,000 in total. Failed replies do not postpone
+cleanup. The app restores the newest 64 messages into its bounded memory;
+only a smaller recent window goes to the model. Reset conversation clears that pet's
+saved conversation.
 
 Two options under Chat options have the pet speak first, both off by
 default:
@@ -112,9 +123,20 @@ default:
 
 Either line is said in the chat, which opens beside the pet if it was closed,
 and stays there like any reply; it is saved to history too. The request
-carries the persona and the app's prompt without the conversation, and the pet
-keeps its pose. Nothing is said while you are typing in the chat, in Focus, or
-while another request is on the wire.
+carries the persona and the app's prompt, and the pet keeps its pose. Each
+scheduled small-talk turn has a one-in-three chance of being simple everyday
+chat based on the character sheet (or the pet description when no sheet exists).
+Those turns omit conversation context, recent-reply quotes and live usage limits, and explicitly
+avoid work and coding-agent topics. The other two thirds can use up to six
+recent conversation messages within 4 KiB and the available usage context,
+plus the last three replies for language and repetition avoidance. A randomly selected angle (a
+feeling, a small imagined what-if, an established preference, or gentle humor)
+suggests a direction only when it fits the character and conversation. The
+angle differs from the previous one. Both the topic choice and the angle stay
+fixed through retries and reset when switching pets or clearing history.
+Agent nudges are separate from this ratio and use the app's prompt and
+recent replies without the conversation. Nothing is said while you are typing
+in the chat, in Focus, or while another request is on the wire.
 
 ## Usage limits
 
@@ -140,6 +162,11 @@ resets; click it again to close them.
 
 An agent with nothing to report has no row. Petdex never refreshes an agent's
 sign-in.
+
+The pet knows the numbers too: while the column is on, chat requests other
+than casual small talk carry each agent's windows and how long until they reset, so a reply, the
+double-click catch-up or small talk can say that a limit with room left resets
+soon and now is the time to use it.
 
 ## Appearance
 

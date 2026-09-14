@@ -696,7 +696,7 @@ test "the reply card thinks until the first words, a briefing included" {
     try std.testing.expectEqualStrings("hey", speech(st, &buf).text);
     // A briefing adds no user turn: the old reply joins the stack and
     // the card thinks.
-    try std.testing.expectEqual(chat.session.Action.request, s.brief(.briefing, false));
+    try std.testing.expectEqual(chat.session.Action.request, s.brief(.briefing, false, 0));
     try std.testing.expectEqualStrings(st.thinkingText(), speech(st, &buf).text);
     try std.testing.expectEqual(@as(usize, 2), stacked(&model).to);
     // The first words replace the thinking line; the old reply stays stacked.

@@ -18,6 +18,7 @@ const secret_store = @import("secret_store.zig");
 const chat_history = @import("chat_history.zig");
 const chat = @import("chat/chat.zig");
 const i18n = @import("i18n.zig");
+const usage_mod = @import("usage.zig");
 
 const domain = chat.domain;
 const provider = chat.provider;
@@ -323,7 +324,7 @@ fn brief(model: *Model, fx: *Effects) void {
     const st = &model.chat;
     // Unconfigured, the reply card already points at Settings.
     if (!st.ready() or st.session.busy()) return;
-    const action = st.session.brief(.briefing, needsRefresh(st, fx));
+    const action = st.session.brief(.briefing, needsRefresh(st, fx), 0);
     if (action == .none) return;
     st.history = false;
     st.scroll = 0;
@@ -337,10 +338,11 @@ fn brief(model: *Model, fx: *Effects) void {
 pub fn speak(model: *Model, prompt: session.Prompt, fx: *Effects) bool {
     if (!canSpeak(model)) return false;
     const st = &model.chat;
-    // A chat never opened since launch has no pet or persona loaded yet.
-    if (st.pet_len == 0) syncPet(model, fx);
+    // Sync before choosing the angle, including a pet switched while
+    // the chat was closed. Opening the window must not reset this turn.
+    syncPet(model, fx);
     if (st.pet_len == 0) return false;
-    const action = st.session.brief(prompt, needsRefresh(st, fx));
+    const action = st.session.brief(prompt, needsRefresh(st, fx), if (prompt == .chatter) randomU64() else 0);
     if (action == .none) return false;
     // Said in the chat, which opens beside the pet if it was shut; the
     // line stays there like any reply. Opened this way, it takes neither
@@ -420,7 +422,7 @@ fn randomU64() u64 {
 /// Small talk's prompt, the pet's last few lines quoted in it.
 fn chatterPrompt(st: *const State) []const u8 {
     var lines: [3][]const u8 = undefined;
-    return persona.chatter(&brief_buf, lastLines(st, &lines));
+    return persona.chatter(&brief_buf, lastLines(st, &lines), st.session.chatter_angle orelse .feeling, st.session.chatter_topic);
 }
 
 /// The pet's newest replies, newest first, each cut to a quotable length.
@@ -725,6 +727,13 @@ fn syncPet(model: *Model, fx: *Effects) void {
     buildPersona(st, entry.rootSlice());
 }
 
+/// Re-read the active sheet at request time so edits apply to the next
+/// utterance without clearing the conversation or switching pets.
+fn refreshPersona(st: *State) void {
+    const index = catalog_mod.catalogIndexOf(st.petSlug()) orelse return;
+    buildPersona(st, catalog_mod.catalog[index].rootSlice());
+}
+
 fn buildPersona(st: *State, root: []const u8) void {
     var info: persona.PetInfo = .{};
     var character: ?[]const u8 = null;
@@ -743,6 +752,9 @@ fn buildPersona(st: *State, root: []const u8) void {
         if (std.fmt.bufPrint(&path_buf, "{s}/.petdex/personas/{s}.md", .{ home, st.petSlug() })) |path| {
             character = plat.readFile(path, &character_buf);
         } else |_| {}
+        if (character) |sheet| {
+            if (std.mem.trim(u8, sheet, " \t\r\n").len == 0) character = null;
+        }
         if (character == null) {
             if (std.fmt.bufPrint(&path_buf, "{s}/{s}/{s}/persona.md", .{ home, root, st.petSlug() })) |path| {
                 character = plat.readFile(path, &character_buf);
@@ -751,6 +763,53 @@ fn buildPersona(st: *State, root: []const u8) void {
     }
     persona_len = persona.build(&persona_buf, st.petSlug(), info, character).len;
     setField(&st.pet_name, &st.pet_name_len, info.name orelse st.petSlug());
+}
+
+test "persona edits reload without resetting the conversation and blank overrides fall back" {
+    const t = std.testing;
+    var dir = t.tmpDir(.{});
+    defer dir.cleanup();
+    var home_buf: [256]u8 = undefined;
+    const home = try std.fmt.bufPrint(&home_buf, ".zig-cache/tmp/{s}", .{dir.sub_path});
+    const previous_home = app.env_home;
+    const previous_entry = catalog_mod.catalog[0];
+    const previous_count = catalog_mod.catalog_len;
+    defer {
+        app.env_home = previous_home;
+        catalog_mod.catalog[0] = previous_entry;
+        catalog_mod.catalog_len = previous_count;
+    }
+    app.env_home = home;
+    catalog_mod.catalog_len = 1;
+    catalog_mod.catalog[0] = .{};
+    setField(&catalog_mod.catalog[0].name, &catalog_mod.catalog[0].len, "boba");
+    setField(&catalog_mod.catalog[0].root, &catalog_mod.catalog[0].root_len, "pets");
+    var st: State = .{};
+    setField(&st.pet, &st.pet_len, "boba");
+    st.session.transcript.append(.user, "hello");
+    _ = st.session.brief(.chatter, true, 0);
+
+    var path_buf: [512]u8 = undefined;
+    plat.makeDir(try std.fmt.bufPrint(&path_buf, "{s}/pets/boba", .{home}));
+    const sheet_path = try std.fmt.bufPrint(&path_buf, "{s}/pets/boba/persona.md", .{home});
+    try t.expect(plat.writeFile(sheet_path, "一人称は私。ユーザーは先生。"));
+    refreshPersona(&st);
+    try t.expect(std.mem.endsWith(u8, persona_buf[0..persona_len], "一人称は私。ユーザーは先生。"));
+    try t.expect(plat.writeFile(sheet_path, "一人称は拙者。ユーザーは殿。"));
+    refreshPersona(&st);
+    try t.expect(std.mem.endsWith(u8, persona_buf[0..persona_len], "一人称は拙者。ユーザーは殿。"));
+    try t.expectEqual(@as(usize, 1), st.session.transcript.len());
+    try t.expect(st.session.casualChatter());
+    try t.expectEqual(persona.ChatterAngle.feeling, st.session.chatter_angle.?);
+
+    plat.makeDir(try std.fmt.bufPrint(&path_buf, "{s}/.petdex/personas", .{home}));
+    const override_path = try std.fmt.bufPrint(&path_buf, "{s}/.petdex/personas/boba.md", .{home});
+    try t.expect(plat.writeFile(override_path, "A personal character override."));
+    refreshPersona(&st);
+    try t.expect(std.mem.endsWith(u8, persona_buf[0..persona_len], "A personal character override."));
+    try t.expect(plat.writeFile(override_path, " \n\t"));
+    refreshPersona(&st);
+    try t.expect(std.mem.endsWith(u8, persona_buf[0..persona_len], "一人称は拙者。ユーザーは殿。"));
 }
 
 /// Copy the pet's thinking lines out of the parse scratch, which the
@@ -829,30 +888,170 @@ fn quietFailure(model: *Model) void {
     s.quiet();
 }
 
+var instructions_buf: [persona.max_bytes + usage_context_bytes]u8 = undefined;
+const usage_context_bytes = 2048;
+
+/// The persona, then the user's coding agents' usage limits as the app
+/// knows them. Casual small talk gets only the character; other turns
+/// can use the limits, rebuilt per request, since the
+/// resets count down. Last, so the persona's cached prefix holds.
+fn instructions(model: *const Model, now_s: i64) []const u8 {
+    const base = persona_buf[0..persona_len];
+    if (model.chat.session.casualChatter()) return base;
+    var limits_buf: [usage_context_bytes - 2]u8 = undefined;
+    const limits = usage_mod.context(&model.usage, now_s, &limits_buf);
+    if (limits.len == 0) return base;
+    return std.fmt.bufPrint(&instructions_buf, "{s}\n\n{s}", .{ base, domain.utf8Floor(limits, limits_buf.len) }) catch base;
+}
+
+test "the instructions carry the usage limits after the persona" {
+    const t = std.testing;
+    var model: Model = .{};
+    persona_len = persona.build(&persona_buf, "boba", .{ .name = "Boba" }, null).len;
+    try t.expectEqualStrings(persona_buf[0..persona_len], instructions(&model, 1000));
+    model.usage.set(.codex, usage_mod.Windows.one(15, 1000 + 3600, usage_mod.week_minutes));
+    const with = instructions(&model, 1000);
+    try t.expect(std.mem.startsWith(u8, with, "You are Boba,"));
+    try t.expect(std.mem.indexOf(u8, with, "\n\nTheir coding agents' plan usage right now") != null);
+    try t.expect(std.mem.indexOf(u8, with, "- Codex: weekly limit 15% used, resets in 1h 0m") != null);
+}
+
+/// Only conversation turns are stored; each app request is appended to
+/// the bounded context here, after any background conversation.
+fn requestMessages(model: *const Model, out: *[session.context_messages + 1]domain.Message) []const domain.Message {
+    const st = &model.chat;
+    const count = switch (st.session.prompt) {
+        .none => return st.session.context(out[0..session.context_messages]),
+        .briefing => st.session.context(out[0..session.context_messages]).len,
+        .chatter => if (st.session.casualChatter()) 0 else st.session.chatterContext(out[0..session.chatter_context_messages]).len,
+        .nudge => 0,
+    };
+    const prompt = switch (st.session.prompt) {
+        .none => unreachable,
+        .briefing => briefingPrompt(model),
+        .chatter => chatterPrompt(st),
+        .nudge => nudge_buf[0..nudge_len],
+    };
+    out[count] = .{ .role = .user, .text = prompt };
+    return out[0 .. count + 1];
+}
+
+test "small talk sends bounded background and its chosen angle through both providers" {
+    const t = std.testing;
+    var model: Model = .{};
+    const s = &model.chat.session;
+    for (0..4) |_| {
+        s.transcript.append(.user, "好きな本は？");
+        s.transcript.append(.assistant, "冒険のお話かな。");
+    }
+    _ = s.brief(.chatter, false, 11);
+    var out: [session.context_messages + 1]domain.Message = undefined;
+    const messages = requestMessages(&model, &out);
+    try t.expectEqual(@as(usize, 7), messages.len);
+    try t.expectEqualStrings("好きな本は？", messages[0].text);
+    const prompt = messages[6];
+    try t.expectEqual(domain.Role.user, prompt.role);
+    try t.expect(std.mem.indexOf(u8, prompt.text, persona.ChatterAngle.humor.hint()) != null);
+    try t.expect(std.mem.indexOf(u8, prompt.text, "Your last lines, not to repeat:") != null);
+    try t.expectEqual(@as(usize, 8), s.transcript.len());
+
+    var base_buf: [persona.max_bytes]u8 = undefined;
+    const base = persona.build(&base_buf, "boba", .{ .description = "本好きな猫。" }, null);
+    var request_bufs: provider.Bufs = .{};
+    for ([_]domain.ProviderKind{ .codex, .openai_compat }) |kind| {
+        const req = provider.buildRequest(kind, .{ .base_url = "http://localhost:1234/v1", .model = "test" }, .{ .bearer = "test-token", .account_id = "test-account" }, base, messages, &request_bufs) orelse return error.RequestBuildFailed;
+        const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, req.body, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        try t.expect(obj.get("temperature") == null);
+        try t.expect(obj.get("top_p") == null);
+        if (kind == .codex) {
+            try t.expectEqualStrings(base, obj.get("instructions").?.string);
+            const turns = obj.get("input").?.array.items;
+            try t.expectEqual(@as(usize, 7), turns.len);
+            try t.expectEqualStrings(prompt.text, turns[6].object.get("content").?.array.items[0].object.get("text").?.string);
+        } else {
+            const turns = obj.get("messages").?.array.items;
+            try t.expectEqual(@as(usize, 8), turns.len);
+            try t.expectEqualStrings("system", turns[0].object.get("role").?.string);
+            try t.expectEqualStrings(base, turns[0].object.get("content").?.string);
+            try t.expectEqualStrings(prompt.text, turns[7].object.get("content").?.string);
+        }
+    }
+
+    // Ordinary replies and catch-ups keep their wider history window.
+    s.prompt = .none;
+    try t.expectEqual(@as(usize, 8), requestMessages(&model, &out).len);
+    s.prompt = .briefing;
+    const briefing = requestMessages(&model, &out);
+    try t.expectEqual(@as(usize, 9), briefing.len);
+    try t.expect(std.mem.indexOf(u8, briefing[8].text, "double-clicked you to catch up") != null);
+    s.prompt = .nudge;
+    const nudging = requestMessages(&model, &out);
+    try t.expectEqual(@as(usize, 1), nudging.len);
+    try t.expectEqualStrings(nudge_buf[0..nudge_len], nudging[0].text);
+}
+
+test "small talk without a user turn still has its recent lines and angle" {
+    const t = std.testing;
+    var model: Model = .{};
+    const s = &model.chat.session;
+    var out: [session.context_messages + 1]domain.Message = undefined;
+    _ = s.brief(.chatter, false, 4);
+    try t.expectEqual(@as(usize, 1), requestMessages(&model, &out).len);
+    for ([_][]const u8{ "oldest", "first", "second", "最新のひとこと。" }) |line| s.transcript.append(.assistant, line);
+    const messages = requestMessages(&model, &out);
+    try t.expectEqual(@as(usize, 1), messages.len);
+    try t.expect(std.mem.indexOf(u8, messages[0].text, "oldest") == null);
+    try t.expect(std.mem.endsWith(u8, messages[0].text, "\n- 最新のひとこと。\n- second\n- first"));
+    try t.expect(std.mem.indexOf(u8, messages[0].text, persona.ChatterAngle.imagination.hint()) != null);
+}
+
+test "casual small talk omits work context while replies and notifications keep it" {
+    const t = std.testing;
+    var model: Model = .{};
+    const s = &model.chat.session;
+    persona_len = persona.build(&persona_buf, "boba", .{}, "A quiet cat who likes books and warm milk.").len;
+    s.transcript.append(.user, "Please check project-secret-build.");
+    s.transcript.append(.assistant, "Codex is still working.");
+    model.usage.set(.codex, usage_mod.Windows.one(15, 4600, usage_mod.week_minutes));
+    _ = s.brief(.chatter, false, 0);
+    var out: [session.context_messages + 1]domain.Message = undefined;
+    const messages = requestMessages(&model, &out);
+    const base = instructions(&model, 1000);
+    try t.expectEqualStrings(persona_buf[0..persona_len], base);
+    try t.expect(std.mem.indexOf(u8, base, "warm milk") != null);
+    try t.expectEqual(@as(usize, 1), messages.len);
+    try t.expect(std.mem.indexOf(u8, messages[0].text, "project-secret-build") == null);
+    try t.expect(std.mem.indexOf(u8, messages[0].text, "Keep this line away from coding agents") != null);
+    try t.expect(std.mem.indexOf(u8, messages[0].text, "Codex is still working.") == null);
+    try t.expect(std.mem.indexOf(u8, messages[0].text, "Your last lines") == null);
+    try t.expectEqual(@as(usize, 2), s.transcript.len());
+
+    // The routing applies to both backends, including their system text.
+    var request_bufs: provider.Bufs = .{};
+    for ([_]domain.ProviderKind{ .codex, .openai_compat }) |kind| {
+        const req = provider.buildRequest(kind, .{ .base_url = "http://localhost:1234/v1", .model = "test" }, .{ .bearer = "test-token", .account_id = "test-account" }, base, messages, &request_bufs) orelse return error.RequestBuildFailed;
+        try t.expect(std.mem.indexOf(u8, req.body, "project-secret-build") == null);
+        try t.expect(std.mem.indexOf(u8, req.body, "weekly limit 15%") == null);
+        try t.expect(std.mem.indexOf(u8, req.body, "Codex is still working.") == null);
+    }
+    for ([_]session.Prompt{ .none, .briefing, .nudge }) |prompt| {
+        s.prompt = prompt;
+        try t.expect(std.mem.indexOf(u8, instructions(&model, 1000), "weekly limit 15%") != null);
+    }
+    s.prompt = .chatter;
+    s.chatter_topic = .contextual;
+    try t.expectEqual(@as(usize, 3), requestMessages(&model, &out).len);
+    try t.expect(std.mem.indexOf(u8, instructions(&model, 1000), "weekly limit 15%") != null);
+}
+
 fn startRequest(model: *Model, fx: *Effects) void {
     const st = &model.chat;
+    refreshPersona(st);
     st.stream_kind = st.kind;
-    var context: [session.context_messages]domain.Message = undefined;
-    const recent = st.session.context(&context);
-    // The pet speaking first ends the context with the app's prompt, never
-    // stored. Small talk and nudges are light: that prompt alone, no history.
     var with_prompt: [session.context_messages + 1]domain.Message = undefined;
-    const turns: []const domain.Message = switch (st.session.prompt) {
-        .none => recent,
-        .briefing => blk: {
-            @memcpy(with_prompt[0..recent.len], recent);
-            with_prompt[recent.len] = .{ .role = .user, .text = briefingPrompt(model) };
-            break :blk with_prompt[0 .. recent.len + 1];
-        },
-        .chatter => blk: {
-            with_prompt[0] = .{ .role = .user, .text = chatterPrompt(st) };
-            break :blk with_prompt[0..1];
-        },
-        .nudge => blk: {
-            with_prompt[0] = .{ .role = .user, .text = nudge_buf[0..nudge_len] };
-            break :blk with_prompt[0..1];
-        },
-    };
+    const turns = requestMessages(model, &with_prompt);
     var cache_key: [80]u8 = undefined;
     const target: provider.Target = switch (st.kind) {
         .codex => .{
@@ -863,10 +1062,10 @@ fn startRequest(model: *Model, fx: *Effects) void {
         .openai_compat => .{ .base_url = st.localUrl(), .model = st.localModel() },
     };
     const auth: provider.Auth = if (st.kind == .codex) st.creds.auth() else .{};
-    const request = provider.buildRequest(st.kind, target, auth, persona_buf[0..persona_len], turns, &bufs) orelse {
+    const request = provider.buildRequest(st.kind, target, auth, instructions(model, @divFloor(fx.wallMs(), 1000)), turns, &bufs) orelse {
         const why: []const u8 = switch (st.kind) {
-            .codex => if (st.creds.signedIn()) i18n.t("The conversation is too long to send.", "会話が長すぎて送信できません。") else i18n.t("Sign in to ChatGPT in Settings first.", "先に設定でChatGPTにサインインしてください。"),
-            .openai_compat => if (st.local_url.len == 0) i18n.t("Set the server URL in Settings first.", "先に設定でサーバーのURLを指定してください。") else i18n.t("The conversation is too long to send.", "会話が長すぎて送信できません。"),
+            .codex => if (st.creds.signedIn()) i18n.t("The conversation is too long to send.", "会話が長すぎて送信できません。") else i18n.t("Sign in to ChatGPT in Chat options first.", "チャットの設定でChatGPTにサインインしてください。"),
+            .openai_compat => if (st.local_url.len == 0) i18n.t("Set the server URL in Chat options first.", "チャットの設定でサーバーのURLを指定してください。") else i18n.t("The conversation is too long to send.", "会話が長すぎて送信できません。"),
         };
         run(model, st.session.onResponse(st.kind, st.session.streamKey(), 0, why), fx);
         return;
@@ -909,11 +1108,7 @@ fn finishReply(model: *Model, fx: *Effects) void {
     const reply = st.session.lastReply() orelse return;
     if (ensureHistory()) |h| {
         _ = h.append(st.petSlug(), .assistant, reply, st.stream_kind, fx.wallMs());
-        h.prune(st.petSlug());
     }
-    // ponytail: unprompted lines are saved like any reply above; small talk
-    // every 5 minutes pushes real history past the 400-message cap in about
-    // a day and a half. Skip saving them if that bites.
     const unprompted = st.session.proactive();
     // Unprompted, the pet keeps its pose: one waiting on an agent stays
     // waiting, and its chime escalation with it.
@@ -983,14 +1178,14 @@ fn startRefresh(model: *Model, fx: *Effects) void {
     const st = &model.chat;
     st.stream_kind = st.kind;
     if (st.creds.refresh_len == 0) {
-        run(model, st.session.onRefreshed(false, i18n.t("Sign in to ChatGPT in Settings.", "設定でChatGPTにサインインしてください。")), fx);
+        run(model, st.session.onRefreshed(false, i18n.t("Sign in to ChatGPT in Chat options.", "チャットの設定でChatGPTにサインインしてください。")), fx);
         return;
     }
     // A token request already in flight resolves the session when it lands.
     if (st.token_purpose != .none) return;
     var body_buf: [8192]u8 = undefined;
     const body = codex.refreshBody(&body_buf, st.creds.refreshToken()) orelse {
-        run(model, st.session.onRefreshed(false, i18n.t("Sign in to ChatGPT in Settings.", "設定でChatGPTにサインインしてください。")), fx);
+        run(model, st.session.onRefreshed(false, i18n.t("Sign in to ChatGPT in Chat options.", "チャットの設定でChatGPTにサインインしてください。")), fx);
         return;
     };
     st.token_purpose = .refresh;
@@ -1026,7 +1221,7 @@ fn onToken(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) voi
         signOut(st);
     }
     if (st.session.phase == .refreshing) {
-        run(model, st.session.onRefreshed(ok, i18n.t("Sign in to ChatGPT again in Settings.", "設定でChatGPTにもう一度サインインしてください。")), fx);
+        run(model, st.session.onRefreshed(ok, i18n.t("Sign in to ChatGPT again in Chat options.", "チャットの設定でChatGPTにもう一度サインインしてください。")), fx);
     }
 }
 
