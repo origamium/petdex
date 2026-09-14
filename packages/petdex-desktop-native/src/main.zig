@@ -5244,6 +5244,12 @@ pub fn main(init: std.process.Init) !void {
             hook_runner.run(phase, agent, origin_app, init.environ_map.get("PWD"), init.environ_map.get("HERDR_PANE_ID"), if (in_warp) init.environ_map.get("WARP_FOCUS_URL") else null, env_home orelse return);
             return;
         }
+        // Claude Code's statusline, wrapped for the usage column: runs as
+        // often as a hook, so it leaves before the UI too.
+        if (std.mem.eql(u8, cmd, "statusline")) {
+            hook_runner.statusline(env_home orelse return, init.environ_map);
+            return;
+        }
     }
     // After the hook hot path: hooks run per tool call and must not stat
     // log files. The same HOME/XDG/LOCALAPPDATA lookups the SDK makes.

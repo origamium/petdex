@@ -14,6 +14,7 @@ pub const Error = error{Sqlite};
 const sqlite_ok = 0;
 const sqlite_row = 100;
 const sqlite_done = 101;
+const open_readonly = 0x1;
 const open_readwrite = 0x2;
 const open_create = 0x4;
 /// SQLITE_TRANSIENT: SQLite copies bound text before the call returns.
@@ -109,9 +110,19 @@ pub const Db = struct {
 
     /// `load()` must have returned true.
     pub fn open(path: [:0]const u8) Error!Db {
+        return openFlags(path, open_readwrite | open_create);
+    }
+
+    /// Another app's database, read where it is: nothing is created or
+    /// written. `load()` must have returned true.
+    pub fn openReadOnly(path: [:0]const u8) Error!Db {
+        return openFlags(path, open_readonly);
+    }
+
+    fn openFlags(path: [:0]const u8, flags: c_int) Error!Db {
         std.debug.assert(load_state == .loaded);
         var handle: ?*RawDb = null;
-        if (api.open_v2(path.ptr, &handle, open_readwrite | open_create, null) != sqlite_ok) {
+        if (api.open_v2(path.ptr, &handle, flags, null) != sqlite_ok) {
             _ = api.close_v2(handle);
             return error.Sqlite;
         }

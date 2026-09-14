@@ -635,6 +635,100 @@ pub fn installClaude(allocator: std.mem.Allocator, home: []const u8) bool {
     return installJsonHooks(allocator, path, &claude_events, "claude-code", 2, false);
 }
 
+/// Claude Code's statusline, wrapped for the usage column: the relay
+/// (hook_runner.statusline) keeps the limits Claude Code hands it, then runs
+/// the command it replaced, kept at savedStatuslinePath so uninstall can put
+/// it back.
+pub const statusline_relay_command = "if [ -x \"$HOME/.petdex/bin/petdex-hook\" ]; then exec \"$HOME/.petdex/bin/petdex-hook\" statusline; fi; [ -t 0 ] || cat >/dev/null";
+
+pub fn savedStatuslinePath(buf: []u8, home: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/.petdex/claude-statusline.json", .{home}) catch null;
+}
+
+fn isStatuslineRelay(value: std.json.Value) bool {
+    if (value != .object) return false;
+    const command = value.object.get("command") orelse return false;
+    return command == .string and std.mem.indexOf(u8, command.string, "petdex-hook\" statusline") != null;
+}
+
+/// Wrap Claude Code's statusline in the relay, keeping its other fields
+/// (padding). Already wrapped is left alone: saving again would replace the
+/// kept command with the relay itself.
+pub fn installClaudeStatusline(allocator: std.mem.Allocator, home: []const u8) bool {
+    var dir_buf: [512]u8 = undefined;
+    var path_buf: [512]u8 = undefined;
+    const path = claudeSettingsPath(&path_buf, home) orelse return false;
+    const existing = readFileAlloc(allocator, path, 1024 * 1024);
+    defer if (existing) |e| allocator.free(e);
+    if (existing == null) {
+        // Unreadable is not a starting point, and no Claude Code, no file.
+        if (fileExists(path) or !dirExists(claudeConfigDir(&dir_buf, home) orelse return false)) return false;
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var root: std.json.Value = if (existing) |bytes|
+        std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return false
+    else
+        emptyObject(a);
+    if (root != .object) return false;
+
+    const current = root.object.get("statusLine");
+    if (current) |line| {
+        if (isStatuslineRelay(line)) return true;
+    }
+    var saved_buf: [512]u8 = undefined;
+    const saved_path = savedStatuslinePath(&saved_buf, home) orelse return false;
+    const original = if (current) |line| std.json.Stringify.valueAlloc(a, line, .{}) catch return false else "null";
+    if (!writeFile(saved_path, original)) return false;
+    if (existing != null and !backupOnce(allocator, path)) return false;
+
+    var line = if (current != null and current.? == .object) current.?.object else std.json.ObjectMap.init(a, &.{}, &.{}) catch return false;
+    line.put(a, "type", .{ .string = "command" }) catch return false;
+    line.put(a, "command", .{ .string = statusline_relay_command }) catch return false;
+    root.object.put(a, "statusLine", .{ .object = line }) catch return false;
+    const serialized = std.json.Stringify.valueAlloc(a, root, .{ .whitespace = .indent_2 }) catch return false;
+    return writeFile(path, serialized);
+}
+
+/// Put back the statusline the relay replaced, or none when there was
+/// none. One the user set since is theirs and stays.
+pub fn uninstallClaudeStatusline(allocator: std.mem.Allocator, home: []const u8) bool {
+    var saved_buf: [512]u8 = undefined;
+    const saved_path = savedStatuslinePath(&saved_buf, home) orelse return false;
+    var path_buf: [512]u8 = undefined;
+    const path = claudeSettingsPath(&path_buf, home) orelse return false;
+    const existing = readFileAlloc(allocator, path, 1024 * 1024) orelse {
+        plat.deleteFile(saved_path);
+        return true;
+    };
+    defer allocator.free(existing);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var root = std.json.parseFromSliceLeaky(std.json.Value, a, existing, .{}) catch return false;
+    if (root != .object) return false;
+    const current = root.object.get("statusLine") orelse .null;
+    if (!isStatuslineRelay(current)) {
+        plat.deleteFile(saved_path);
+        return true;
+    }
+    const saved = readFileAlloc(allocator, saved_path, 64 * 1024);
+    defer if (saved) |s| allocator.free(s);
+    const original: std.json.Value = if (saved) |s| std.json.parseFromSliceLeaky(std.json.Value, a, s, .{}) catch .null else .null;
+    if (original == .object) {
+        root.object.put(a, "statusLine", original) catch return false;
+    } else {
+        _ = root.object.orderedRemove("statusLine");
+    }
+    const serialized = std.json.Stringify.valueAlloc(a, root, .{ .whitespace = .indent_2 }) catch return false;
+    if (!writeFile(path, serialized)) return false;
+    plat.deleteFile(saved_path);
+    return true;
+}
+
 /// Pure settings.json: no feature flag like Codex, and no hooksConfig write
 /// like Gemini — `hooksConfig.enabled` already defaults to true upstream, so
 /// writing it could only clobber a deliberate opt-out. Timeout is in seconds.
@@ -2108,7 +2202,8 @@ pub fn uninstall(allocator: std.mem.Allocator, home: []const u8, kind: AgentKind
     switch (kind) {
         .claude_code => {
             const path = claudeSettingsPath(&path_buf, home) orelse return false;
-            return uninstallJsonHooks(allocator, path);
+            // Leaving Claude Code takes the usage relay along.
+            return uninstallClaudeStatusline(allocator, home) and uninstallJsonHooks(allocator, path);
         },
         .gemini => {
             const path = std.fmt.bufPrint(&path_buf, "{s}/.gemini/settings.json", .{home}) catch return false;
@@ -2230,6 +2325,52 @@ test "installClaude merges into a real fixture home non-destructively" {
     // Backup exists.
     const bak = std.fmt.bufPrint(&pb, "{s}/.claude/settings.json.pre-petdex-backup", .{home}) catch unreachable;
     try t.expect(fileExists(bak));
+}
+
+test "the statusline relay wraps Claude Code's own and gives it back" {
+    const home = ".zig-cache/petdex-agenthooks-statusline-fixture";
+    plat.makeDir(home ++ "/.claude");
+    plat.makeDir(home ++ "/.petdex");
+    var pb: [512]u8 = undefined;
+    const cfg = std.fmt.bufPrint(&pb, "{s}/.claude/settings.json", .{home}) catch unreachable;
+    try t.expect(writeFile(cfg, "{\"model\":\"opus\",\"statusLine\":{\"type\":\"command\",\"command\":\"bash ~/line.sh\",\"padding\":1}}"));
+
+    try t.expect(installClaudeStatusline(t.allocator, home));
+    // Twice: the kept command must stay the user's, not become the relay.
+    try t.expect(installClaudeStatusline(t.allocator, home));
+    const wrapped = readFileAlloc(t.allocator, cfg, 1024 * 1024).?;
+    defer t.allocator.free(wrapped);
+    try t.expect(std.mem.indexOf(u8, wrapped, "petdex-hook\\\" statusline") != null);
+    try t.expect(std.mem.indexOf(u8, wrapped, "\"padding\": 1") != null);
+    try t.expect(std.mem.indexOf(u8, wrapped, "line.sh") == null);
+    var sb: [512]u8 = undefined;
+    const kept = readFileAlloc(t.allocator, savedStatuslinePath(&sb, home).?, 1024).?;
+    defer t.allocator.free(kept);
+    try t.expect(std.mem.indexOf(u8, kept, "bash ~/line.sh") != null);
+
+    try t.expect(uninstallClaudeStatusline(t.allocator, home));
+    const restored = readFileAlloc(t.allocator, cfg, 1024 * 1024).?;
+    defer t.allocator.free(restored);
+    try t.expect(std.mem.indexOf(u8, restored, "bash ~/line.sh") != null);
+    try t.expect(std.mem.indexOf(u8, restored, "petdex-hook") == null);
+    try t.expect(std.mem.indexOf(u8, restored, "\"model\"") != null);
+    try t.expect(!fileExists(savedStatuslinePath(&sb, home).?));
+
+    // No statusline before: none after.
+    try t.expect(writeFile(cfg, "{\"model\":\"opus\"}"));
+    try t.expect(installClaudeStatusline(t.allocator, home));
+    try t.expect(uninstallClaudeStatusline(t.allocator, home));
+    const bare = readFileAlloc(t.allocator, cfg, 1024 * 1024).?;
+    defer t.allocator.free(bare);
+    try t.expect(std.mem.indexOf(u8, bare, "statusLine") == null);
+}
+
+test "no Claude Code, no statusline relay" {
+    const home = ".zig-cache/petdex-agenthooks-no-claude";
+    plat.makeDir(home);
+    try t.expect(!installClaudeStatusline(t.allocator, home));
+    var pb: [512]u8 = undefined;
+    try t.expect(!fileExists(std.fmt.bufPrint(&pb, "{s}/.claude/settings.json", .{home}) catch unreachable));
 }
 
 test "installCodex migrates legacy hooks without dropping a foreign hook" {
