@@ -115,19 +115,26 @@ const Stack = struct { from: usize, to: usize, top: f32 };
 
 /// The transcript range stacked above the reply card and the height it
 /// takes: the last `st.stack` exchanges, minus the reply the card itself
-/// shows, dropping the oldest messages past max_stack_h.
+/// shows, dropping the oldest messages past the available screen height.
 fn stacked(model: *const Model) Stack {
     const st = &model.chat;
     if (st.history) return .{ .from = 0, .to = 0, .top = 0 };
     const tr = &st.session.transcript;
     var to = tr.len();
     if (st.session.currentReply() != null) to -= 1;
-    // Each exchange opens on a user turn.
-    var from = to;
+    // Count the current reply too. A user message and the reply directly
+    // after it form one exchange; each unprompted pet message is its own.
+    var from = tr.len();
     var left: usize = st.stack;
+    // A visible proactive request has no transcript entry until its first
+    // delta, but its thinking/error card already occupies an exchange.
+    // Timer drafts stay hidden and keep showing the previous reply.
+    if (st.session.prompt != .none and st.session.prompt != .timer_done and
+        (st.session.thinking() or st.session.phase == .failed)) left -|= 1;
     while (from > 0 and left > 0) {
         from -= 1;
-        if (tr.get(from).role == .user) left -= 1;
+        if (tr.get(from).role == .assistant and from > 0 and tr.get(from - 1).role == .user) from -= 1;
+        left -= 1;
     }
     var top: f32 = 0;
     for (from..to) |i| top += stackedHeight(model, tr.get(i)) + row_gap;
@@ -669,6 +676,63 @@ test "the chat bubble stacks as many exchanges as the setting allows" {
     // The full history replaces the stack.
     model.chat.history = true;
     try std.testing.expectEqual(@as(f32, 0), speechTop(&model));
+}
+
+test "standalone pet messages respect every display limit immediately" {
+    var model: Model = .{};
+    // Keep screen fitting from concealing a broken exchange count.
+    model.pet_screen = .{ .x = 0, .y = 0, .w = 1920, .h = 4000 };
+    const tr = &model.chat.session.transcript;
+    tr.append(.user, "hello");
+    tr.append(.assistant, "hello back");
+    // Small talk, nudges and timer notices have no preceding user turn.
+    for (0..8) |_| tr.append(.assistant, "a pet announcement");
+    var limit: usize = chat_shell.max_stack;
+    while (limit > 0) : (limit -= 1) {
+        model.chat.stack = @intCast(limit);
+        const range = stacked(&model);
+        try std.testing.expectEqual(tr.len() - limit, range.from);
+        try std.testing.expectEqual(tr.len() - 1, range.to);
+    }
+    // The setting changes only what is visible, not the saved conversation.
+    try std.testing.expectEqual(@as(usize, 10), tr.len());
+}
+
+test "display limits count pairs and standalone turns as separate exchanges" {
+    var model: Model = .{};
+    model.pet_screen = .{ .x = 0, .y = 0, .w = 1920, .h = 4000 };
+    const tr = &model.chat.session.transcript;
+    tr.append(.assistant, "welcome");
+    tr.append(.user, "question");
+    tr.append(.assistant, "answer");
+    tr.append(.assistant, "small talk");
+    tr.append(.user, "unanswered question");
+    tr.append(.user, "another question");
+    tr.append(.assistant, "another answer");
+    tr.append(.assistant, "timer finished");
+    for ([_]usize{ 7, 5, 4, 3, 1, 0 }, 1..) |first, limit| {
+        model.chat.stack = @intCast(limit);
+        const range = stacked(&model);
+        try std.testing.expectEqual(first, range.from);
+        try std.testing.expectEqual(@as(usize, 7), range.to);
+    }
+}
+
+test "a new pet turn keeps the display limit while thinking and streaming" {
+    var model: Model = .{};
+    model.chat.stack = 1;
+    const s = &model.chat.session;
+    s.transcript.append(.user, "hello");
+    s.transcript.append(.assistant, "hello back");
+    s.transcript.append(.assistant, "an earlier announcement");
+    try std.testing.expectEqual(chat.session.Action.request, s.brief(.briefing, false, 0));
+    try std.testing.expectEqual(stacked(&model).to, stacked(&model).from);
+    var scratch: [4096]u8 = undefined;
+    s.onLine(.openai_compat, s.streamKey(), "data: {\"choices\":[{\"delta\":{\"content\":\"a new briefing\"}}]}", false, false, &scratch);
+    try std.testing.expectEqual(stacked(&model).to, stacked(&model).from);
+    try std.testing.expectEqual(chat.session.Action.done, s.onResponse(.openai_compat, s.streamKey(), 200, null));
+    try std.testing.expectEqual(stacked(&model).to, stacked(&model).from);
+    try std.testing.expectEqualStrings("a new briefing", s.currentReply().?);
 }
 
 test "a stack of long messages drops its oldest to stay on screen" {
