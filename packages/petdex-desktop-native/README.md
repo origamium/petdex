@@ -188,6 +188,10 @@ resets; click it again to close them.
 An agent with nothing to report has no row. Petdex never refreshes an agent's
 sign-in.
 
+The [usage acquisition audit](../../docs/agent-usage-research.md) records
+additional Grok, Gemini, Kimi and Qoder integration paths, live verification
+results, and the difference between missing support and unavailable credentials.
+
 The pet knows the numbers too: while the column is on, chat requests other
 than casual small talk carry each agent's windows and how long until they reset, so a reply, the
 double-click catch-up or small talk can say that a limit with room left resets
