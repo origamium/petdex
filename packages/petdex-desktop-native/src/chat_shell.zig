@@ -19,6 +19,8 @@ const chat_history = @import("chat_history.zig");
 const chat = @import("chat/chat.zig");
 const i18n = @import("i18n.zig");
 const usage_mod = @import("usage.zig");
+const timer = @import("timer.zig");
+const timer_shell = @import("timer_shell.zig");
 
 const domain = chat.domain;
 const provider = chat.provider;
@@ -140,6 +142,7 @@ pub const State = struct {
     /// The pet opened the chat itself, to say something unprompted: its
     /// window shows without taking focus from whatever the user is in.
     quiet_open: bool = false,
+    timer_completion: ?timer.Completion = null,
 
     pub fn petSlug(self: *const State) []const u8 {
         return self.pet[0..self.pet_len];
@@ -194,6 +197,7 @@ var thinking_lines: [16][]const u8 = undefined;
 var thinking_count: usize = 0;
 var history: ?chat_history.History = null;
 var history_tried = false;
+var timer_prompt_buf: [1024]u8 = undefined;
 /// CODEX_HOME, read in main(): where Codex CLI keeps auth.json.
 pub var env_codex_home: ?[]const u8 = null;
 
@@ -202,6 +206,94 @@ pub var env_codex_home: ?[]const u8 = null;
 pub fn boot(model: *Model) void {
     loadConfig(&model.chat);
     loadCredentials(&model.chat);
+}
+
+/// Only the timer's request is cancelled; reset/focus never stop a
+/// conversation initiated by the user. Its stale callbacks are ignored.
+pub fn cancelTimerSpeech(model: *Model, fx: *Effects) void {
+    const st = &model.chat;
+    if (st.timer_completion == null) return;
+    st.timer_completion = null;
+    const key = st.session.streamKey();
+    st.session.cancel();
+    st.session.quiet();
+    fx.cancel(key);
+}
+
+fn timerReplyFinished(model: *Model, success: bool) void {
+    const st = &model.chat;
+    const completion = st.timer_completion orelse return;
+    st.timer_completion = null;
+    st.session.quiet();
+    if (model.focus_mode or !model.timer.clock.config.speak) return;
+    const clock = &model.timer.clock;
+    if (clock.serial != completion.id or clock.pending != null) return;
+    // Persist fallback-only while a completed generation waits for a
+    // draft. A restart can deliver the fixed line without another fetch.
+    clock.failed(completion);
+    if (success) {
+        const text = std.mem.trim(u8, st.session.notice[0..st.session.notice_len], " \r\n\t");
+        @memcpy(model.timer.generated[0..text.len], text);
+        model.timer.generated_len = text.len;
+        model.timer.generated_id = completion.id;
+    }
+    timer_shell.save(&model.timer);
+}
+
+fn timerSpeech(model: *Model, fx: *Effects) void {
+    const st = &model.chat;
+    const ts = &model.timer;
+    if (model.focus_mode or !ts.clock.config.speak or st.pet_len == 0) return;
+    const p = ts.clock.claim(st.session.phase != .idle or st.session.wire != null, st.input.len > 0) orelse return;
+    timer_shell.save(ts); // Acknowledge before opening a window or fetching.
+    const generated = ts.generated_len > 0 and ts.generated_id == p.id;
+    if (generated or p.fallback_only or !st.ready() or needsRefresh(st, fx)) {
+        const line = if (generated) ts.generated[0..ts.generated_len] else p.fallback();
+        st.session.transcript.append(.assistant, line);
+        st.session.prompt = .timer_done;
+        st.session.lost_text = false;
+        if (ensureHistory()) |h| _ = h.append(st.petSlug(), .assistant, line, st.kind, fx.wallMs());
+        ts.generated_len = 0;
+        const was_open = st.open;
+        show(model, fx);
+        if (!was_open) st.quiet_open = true;
+        st.history = false;
+        st.scroll = 0;
+        return;
+    }
+    st.timer_completion = p;
+    // No automatic retry/credential refresh for an unsolicited notice.
+    run(model, st.session.brief(.timer_done, false, 0), fx);
+}
+
+test "completed timer generation waits behind a new draft and failures become fallback-only" {
+    const t = std.testing;
+    const saved_home = app.env_home;
+    app.env_home = null;
+    defer app.env_home = saved_home;
+    var model: Model = .{};
+    model.timer.clock.start(1000);
+    _ = model.timer.clock.tick(model.timer.clock.deadline_ms, false);
+    const p = model.timer.clock.claim(false, false).?;
+    model.chat.timer_completion = p;
+    const reply = "Your focus time is over.";
+    @memcpy(model.chat.session.notice[0..reply.len], reply);
+    model.chat.session.notice_len = reply.len;
+    model.chat.input.set("A draft that must survive");
+    timerReplyFinished(&model, true);
+    try t.expect(model.timer.clock.claim(false, model.chat.input.len > 0) == null);
+    try t.expectEqualStrings(reply, model.timer.generated[0..model.timer.generated_len]);
+    try t.expectEqual(@as(usize, 0), model.chat.session.transcript.len());
+    try t.expectEqualStrings("A draft that must survive", model.chat.input.text());
+    try t.expect(model.timer.clock.pending.?.fallback_only);
+    model.timer.generated_len = 0;
+    model.chat.timer_completion = model.timer.clock.claim(false, false);
+    timerReplyFinished(&model, false);
+    try t.expect(model.timer.clock.pending.?.fallback_only);
+    model.chat.timer_completion = model.timer.clock.claim(false, false);
+    model.focus_mode = true;
+    timerReplyFinished(&model, false);
+    try t.expect(model.timer.clock.pending == null);
 }
 
 /// From poll_tick: follow pet switches while the window is open, and
@@ -215,9 +307,11 @@ pub fn poll(model: *Model, fx: *Effects) void {
         model.chat.reopen_at_ms = 0;
         if (!model.chat.open) open(model, fx);
     }
-    if (model.chat.open) syncPet(model, fx);
+    timer_shell.tick(model, fx);
+    if (model.chat.open or model.chat.timer_completion != null or model.timer.clock.pending != null) syncPet(model, fx);
+    timerSpeech(model, fx);
     follow(model, fx);
-    chatterTick(model, fx);
+    if (model.timer.clock.pending == null) chatterTick(model, fx);
     const callback = hook_server.chatgpt_mailbox.take() orelse return;
     const st = &model.chat;
     if (st.chatgpt != .authorizing) return;
@@ -720,6 +814,15 @@ fn syncPet(model: *Model, fx: *Effects) void {
     const entry = &catalog_mod.catalog[model.active_pet];
     const st = &model.chat;
     if (std.mem.eql(u8, entry.slice(), st.petSlug())) return;
+    const interrupted_timer = st.timer_completion;
+    cancelTimerSpeech(model, fx);
+    if (interrupted_timer) |p| {
+        if (!model.focus_mode) model.timer.clock.failed(p);
+        timer_shell.save(&model.timer);
+    }
+    // A generated line belongs to the old character. Use the neutral
+    // fallback if a queued completion follows the user to another pet.
+    model.timer.generated_len = 0;
     if (st.session.busy()) fx.cancel(st.session.streamKey());
     st.session.load(&.{});
     setField(&st.pet, &st.pet_len, entry.slice());
@@ -875,7 +978,7 @@ fn run(model: *Model, action: session.Action, fx: *Effects) void {
         .refresh => startRefresh(model, fx),
         .done => finishReply(model, fx),
         // Unprompted, a failure is nobody's business: no pose, no error row.
-        .failed => if (model.chat.session.proactive()) quietFailure(model) else app.applyState(model, .failed, failed_ms, fx),
+        .failed => if (model.chat.timer_completion != null) timerReplyFinished(model, false) else if (model.chat.session.proactive()) quietFailure(model) else app.applyState(model, .failed, failed_ms, fx),
     }
 }
 
@@ -897,7 +1000,7 @@ const usage_context_bytes = 2048;
 /// resets count down. Last, so the persona's cached prefix holds.
 fn instructions(model: *const Model, now_s: i64) []const u8 {
     const base = persona_buf[0..persona_len];
-    if (model.chat.session.casualChatter()) return base;
+    if (model.chat.session.casualChatter() or model.chat.session.prompt == .timer_done) return base;
     var limits_buf: [usage_context_bytes - 2]u8 = undefined;
     const limits = usage_mod.context(&model.usage, now_s, &limits_buf);
     if (limits.len == 0) return base;
@@ -924,13 +1027,14 @@ fn requestMessages(model: *const Model, out: *[session.context_messages + 1]doma
         .none => return st.session.context(out[0..session.context_messages]),
         .briefing => st.session.context(out[0..session.context_messages]).len,
         .chatter => if (st.session.casualChatter()) 0 else st.session.chatterContext(out[0..session.chatter_context_messages]).len,
-        .nudge => 0,
+        .nudge, .timer_done => 0,
     };
     const prompt = switch (st.session.prompt) {
         .none => unreachable,
         .briefing => briefingPrompt(model),
         .chatter => chatterPrompt(st),
         .nudge => nudge_buf[0..nudge_len],
+        .timer_done => (st.timer_completion orelse unreachable).prompt(&timer_prompt_buf),
     };
     out[count] = .{ .role = .user, .text = prompt };
     return out[0 .. count + 1];
@@ -1076,7 +1180,7 @@ fn startRequest(model: *Model, fx: *Effects) void {
         .url = request.url,
         .headers = request.headers,
         .body = request.body,
-        .timeout_ms = stream_timeout_ms,
+        .timeout_ms = if (st.session.prompt == .timer_done) 15000 else stream_timeout_ms,
         .response = .stream,
         // The 4 KiB default cuts codex's lifecycle events, which echo the
         // persona; deltas are far below either bound.
@@ -1105,6 +1209,11 @@ fn onResponse(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) 
 
 fn finishReply(model: *Model, fx: *Effects) void {
     const st = &model.chat;
+    if (st.timer_completion != null) {
+        timerReplyFinished(model, true);
+        timerSpeech(model, fx);
+        return;
+    }
     const reply = st.session.lastReply() orelse return;
     if (ensureHistory()) |h| {
         _ = h.append(st.petSlug(), .assistant, reply, st.stream_kind, fx.wallMs());
@@ -1117,6 +1226,7 @@ fn finishReply(model: *Model, fx: *Effects) void {
 
 fn stop(model: *Model, fx: *Effects) void {
     const st = &model.chat;
+    if (st.timer_completion != null) return cancelTimerSpeech(model, fx);
     if (!st.session.busy()) return;
     const key = st.session.streamKey();
     st.session.cancel();
@@ -1126,6 +1236,7 @@ fn stop(model: *Model, fx: *Effects) void {
 
 fn clear(model: *Model, fx: *Effects) void {
     const st = &model.chat;
+    cancelTimerSpeech(model, fx);
     if (st.session.busy()) {
         const key = st.session.streamKey();
         st.session.cancel();

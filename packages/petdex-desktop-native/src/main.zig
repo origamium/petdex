@@ -33,6 +33,7 @@ const i18n = @import("i18n.zig");
 const chat = @import("chat/chat.zig");
 const chat_history = @import("chat_history.zig");
 const chat_shell = @import("chat_shell.zig");
+const timer_shell = @import("timer_shell.zig");
 const chat_view = @import("chat_view.zig");
 pub const desktop_auth = @import("desktop_auth.zig");
 const flock_mod = @import("flock.zig");
@@ -176,6 +177,18 @@ pub const Msg = union(enum) {
     auth_library_done: native_sdk.EffectExit,
     clear_notifications,
     // Pet chat (chat_shell.zig).
+    timer_toggle,
+    timer_reset,
+    timer_mode: @import("timer.zig").Mode,
+    timer_options,
+    timer_scrolled: canvas.ScrollState,
+    timer_auto,
+    timer_speak,
+    timer_work: canvas.TextInputEvent,
+    timer_short: canvas.TextInputEvent,
+    timer_long: canvas.TextInputEvent,
+    timer_minutes: canvas.TextInputEvent,
+    timer_seconds: canvas.TextInputEvent,
     open_chat,
     show_chat,
     chat_brief,
@@ -417,6 +430,7 @@ pub const Model = struct {
     auth_preview_next: usize = 0,
     auth_preview_ready: [12]bool = @splat(false),
     chat: chat_shell.State = .{},
+    timer: timer_shell.State = .{},
 };
 
 /// Petdex web tokens (globals.css) translated from OKLCH: brand purple
@@ -2298,6 +2312,7 @@ pub fn boot(model: *Model, fx: *Effects) void {
     }
     loadAuthSession(model, fx);
     chat_shell.boot(model);
+    timer_shell.boot(model);
     fx.startTimer(.{
         .key = poll_timer_key,
         .interval_ms = poll_interval_ms,
@@ -2854,6 +2869,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .chatgpt_sign_out,
         .chatgpt_token_response,
         => chat_shell.update(model, msg, fx),
+        .timer_toggle, .timer_reset, .timer_mode, .timer_options, .timer_scrolled, .timer_auto, .timer_speak, .timer_work, .timer_short, .timer_long, .timer_minutes, .timer_seconds => timer_shell.update(model, msg, fx),
         .update_boot_check => |timer| {
             if (timer.outcome == .fired and model.update_checks_enabled) startUpdateCheck(model, false, fx);
         },
@@ -3088,7 +3104,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.launch_at_login = plat.launchAtLoginEnabled();
         },
         .toggle_focus_mode => {
+            // Attribute a deadline already passed to the mode it ended
+            // in, even when this click arrives before the next poll.
+            timer_shell.tick(model, fx);
             model.focus_mode = !model.focus_mode;
+            timer_shell.tick(model, fx);
             if (model.focus_mode) clearBubble(model);
         },
         .toggle_rotate_pets => {

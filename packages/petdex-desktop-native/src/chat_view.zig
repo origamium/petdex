@@ -9,6 +9,7 @@ const app = @import("main.zig");
 const chat_shell = @import("chat_shell.zig");
 const chat = @import("chat/chat.zig");
 const i18n = @import("i18n.zig");
+const timer_view = @import("timer_view.zig");
 
 const Model = app.Model;
 const Msg = app.Msg;
@@ -30,7 +31,7 @@ pub const card_w: f32 = 300;
 const tail_len: f32 = @floatFromInt(app.tail_h);
 pub const window_w: f32 = if (bubble) card_w + tail_len else 360;
 /// The titled window's fixed height off macOS.
-const titled_h: f32 = 520;
+const titled_h: f32 = 680;
 const card_pad: f32 = 14;
 const text_w: f32 = card_w - card_pad * 2;
 /// The reply card's line cap; a longer reply scrolls inside it.
@@ -54,18 +55,21 @@ pub fn view(ui: *AppUi, model: *const Model) AppUi.Node {
     const st = &model.chat;
     // Oldest on top, the reply card last, right above the composer.
     const s = stacked(model);
-    const nodes = ui.arena.alloc(AppUi.Node, s.to - s.from + 3) catch return failedNode(ui);
+    const nodes = ui.arena.alloc(AppUi.Node, s.to - s.from + 4) catch return failedNode(ui);
     for (s.from..s.to, 0..) |i, j| nodes[j] = stackedBubble(ui, model, st.session.transcript.get(i));
-    nodes[nodes.len - 3] = speechCard(ui, model, st);
-    nodes[nodes.len - 2] = composer(ui, model, st);
-    nodes[nodes.len - 1] = controls(ui, model, st);
+    nodes[nodes.len - 4] = speechCard(ui, model, st);
+    nodes[nodes.len - 3] = composer(ui, model, st);
+    nodes[nodes.len - 2] = controls(ui, model, st);
+    nodes[nodes.len - 1] = timer_view.view(ui, model);
     const body = ui.column(.{ .gap = row_gap }, @as([]const AppUi.Node, nodes));
     if (!bubble) {
-        var root = ui.column(.{ .grow = 1 }, .{
+        var root = ui.el(.panel, .{ .grow = 1 }, .{ui.column(.{ .grow = 1 }, .{
             ui.el(.stack, .{ .height = app.companion_header_h, .window_drag = true }, .{}),
             ui.column(.{ .padding = 12, .cross = .center }, .{body}),
-        });
+        })});
         root.widget.style.background = app.settingsBackground(model);
+        root.widget.style.radius = 0;
+        root.widget.style.stroke_width = 0;
         return root;
     }
     // Right of the pet the tail sits on the card's left edge pointing
@@ -90,16 +94,22 @@ pub fn view(ui: *AppUi, model: *const Model) AppUi.Node {
 /// The window height for the current content. The descriptor uses it at
 /// creation and chat_shell.follow resizes to it afterwards.
 pub fn windowHeight(model: *const Model) f32 {
-    if (!bubble) return titled_h;
-    return speechTop(model) + cardHeight(model) + row_gap + pill_h + row_gap + control_h;
+    if (!bubble) return contentBudget(model) + app.companion_header_h + 24;
+    return speechTop(model) + cardHeight(model) + belowSpeech(model);
 }
 
-/// The stacked bubbles' height cap. With the reply card and composer the
-/// window then still fits a laptop screen: AppKit clamps a taller window
-/// by its top, which would push the composer off the bottom.
-/// ponytail: fixed, the SDK does not report screen size; derive it from
-/// the visible frame if that ever lands.
-const max_stack_h: f32 = 640;
+fn contentBudget(model: *const Model) f32 {
+    const screen_h: f32 = if (model.pet_screen) |s| @floatCast(s.h) else 720;
+    return if (bubble) screen_h - 32 else @min(titled_h, screen_h - 32) - app.companion_header_h - 24;
+}
+
+fn belowSpeech(model: *const Model) f32 {
+    return pill_h + control_h + 3 * row_gap + timer_view.height(model);
+}
+
+fn replyBudget(model: *const Model) f32 {
+    return @max(min_card_h, contentBudget(model) - belowSpeech(model));
+}
 
 const Stack = struct { from: usize, to: usize, top: f32 };
 
@@ -121,7 +131,8 @@ fn stacked(model: *const Model) Stack {
     }
     var top: f32 = 0;
     for (from..to) |i| top += stackedHeight(model, tr.get(i)) + row_gap;
-    while (top > max_stack_h and from < to) : (from += 1) top -= stackedHeight(model, tr.get(from)) + row_gap;
+    const stack_budget = @max(0, replyBudget(model) - cardHeight(model));
+    while (top > stack_budget and from < to) : (from += 1) top -= stackedHeight(model, tr.get(from)) + row_gap;
     return .{ .from = from, .to = to, .top = top };
 }
 
@@ -165,11 +176,11 @@ fn stackedBubble(ui: *AppUi, model: *const Model, m: Message) AppUi.Node {
 
 pub fn cardHeight(model: *const Model) f32 {
     const st = &model.chat;
-    if (st.history) return history_card_h;
+    if (st.history) return @min(history_card_h, replyBudget(model));
     var buf: [speech_buf_len]u8 = undefined;
     const sp = speech(st, &buf);
     const action: f32 = if (sp.action != null) action_gap + action_h else 0;
-    return @max(min_card_h, @ceil(card_pad * 2 + textHeight(model, sp.text) + action));
+    return @min(replyBudget(model), @max(min_card_h, @ceil(card_pad * 2 + textHeight(model, sp.text) + action)));
 }
 
 /// Wrapped height of `text` in the reply card, capped at max_lines.
@@ -252,7 +263,8 @@ fn speech(st: *const State, buf: []u8) Speech {
     // From the moment a request starts (a send, a retry, a briefing,
     // a credential refresh) until its first words: the thinking line.
     const reply = s.currentReply() orelse "";
-    if (s.busy() and reply.len == 0) return .{ .text = st.thinkingText() };
+    if (s.busy() and s.prompt != .timer_done and reply.len == 0) return .{ .text = st.thinkingText() };
+    if (reply.len > 0) return .{ .text = reply, .tone = .speech };
     if (!st.ready()) return .{
         .text = if (st.kind == .codex)
             i18n.bufPrint(buf, "Connect ChatGPT to talk to {s}.", "ChatGPTを接続して、{s}と話しましょう。", .{st.petName()}) catch i18n.t("Connect ChatGPT to start chatting.", "ChatGPTを接続して会話を始めましょう。")
@@ -261,7 +273,6 @@ fn speech(st: *const State, buf: []u8) Speech {
         .action = .open_chat_options,
         .action_label = i18n.t("Set up chat", "チャットを接続"),
     };
-    if (reply.len > 0) return .{ .text = reply, .tone = .speech };
     if (s.lost_text) return .{ .text = i18n.t("Part of this reply was lost.", "返事の一部が失われました。") };
     return .{ .text = i18n.bufPrint(buf, "Say hello to {s}.", "{s}に話しかけてみましょう。", .{st.petName()}) catch i18n.t("Say hello.", "話しかけてみましょう。") };
 }
@@ -283,7 +294,7 @@ fn speechContent(ui: *AppUi, model: *const Model, st: *const State) AppUi.Node {
     };
     // Sized to the estimate; a reply past max_lines scrolls in place.
     const lines = ui.scroll(.{
-        .height = textHeight(model, sp.text),
+        .height = @max(18, @min(textHeight(model, sp.text), cardHeight(model) - card_pad * 2 - @as(f32, if (sp.action != null) action_gap + action_h else 0))),
         .value = st.scroll,
         .on_scroll = AppUi.scrollMsg(.chat_scrolled),
     }, .{para});
@@ -670,8 +681,24 @@ test "a stack of long messages drops its oldest to stay on screen" {
         tr.append(.assistant, "and more " ** 80);
     }
     const top = speechTop(&model);
-    try std.testing.expect(top <= max_stack_h);
-    try std.testing.expect(top > max_stack_h / 2);
+    try std.testing.expect(top <= replyBudget(&model) - cardHeight(&model));
+    try std.testing.expect(top > 0);
+    try std.testing.expect(windowHeight(&model) <= if (bubble) contentBudget(&model) else titled_h);
+}
+
+test "timer and composer fit a small display with settings and history open" {
+    var model: Model = .{};
+    model.pet_screen = .{ .x = 0, .y = 0, .w = 1024, .h = 600 };
+    model.timer.options_open = true;
+    model.chat.history = true;
+    try std.testing.expect(windowHeight(&model) <= 568);
+    try std.testing.expect(cardHeight(&model) >= min_card_h);
+    model.chat.history = false;
+    for (0..8) |_| {
+        model.chat.session.transcript.append(.user, "A long draft " ** 100);
+        model.chat.session.transcript.append(.assistant, "A long reply " ** 100);
+    }
+    try std.testing.expect(windowHeight(&model) <= 568);
 }
 
 test "stacked bubbles cut long text at their line cap" {

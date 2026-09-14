@@ -138,6 +138,31 @@ Agent nudges are separate from this ratio and use the app's prompt and
 recent replies without the conversation. Nothing is said while you are typing
 in the chat, in Focus, or while another request is on the wire.
 
+## Timer
+
+The card below chat switches between **Pomodoro** and a plain **Timer**.
+Pomodoro starts with 25 minutes of focus, a 5-minute short break and a
+15-minute long break after every four focus intervals. Its inline settings
+accept 1–180 minutes per interval. The countdown defaults to 5 minutes and
+accepts 0:01–99:59. Start, pause, resume and reset stay on the card; reset
+unlocks duration and mode changes. **Auto-start next interval** is off by
+default, so each work or break interval starts when you choose.
+
+**Pet announces when finished** is on by default. Each completion asks the
+current pet for a short chat bubble using its persona and selected model,
+without audio or taking keyboard focus. A draft or ongoing request delays
+the notice; only the latest completion waits. Focus mode suppresses notices
+and never replays them afterwards. Missing credentials, a failed generation
+or a 15-second timeout uses a short English/Japanese fallback without retry.
+
+There is one timer for the app: closing chat, resetting the conversation or
+switching pets does not stop it. Configuration and clock transitions are
+saved atomically to `~/.petdex/timer.json`. Running and paused timers restore
+after restart. Sleep or downtime completes an expired interval once; an
+automatic next interval starts from the time the app wakes, without skipping
+through missed rounds. The chat reduces visible history to keep its input
+and timer inside the pet's display.
+
 ## Usage limits
 
 Show Usage Limits in the pet’s right-click menu or the menu-bar extra (macOS, off by default) puts a column beside the pet:

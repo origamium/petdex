@@ -37,6 +37,7 @@ pub const Prompt = enum {
     chatter,
     /// A coding agent started waiting on the user.
     nudge,
+    timer_done,
 };
 
 pub const Action = enum {
@@ -165,6 +166,10 @@ pub const Session = struct {
     wire: ?u64 = null,
     err_buf: [192]u8 = undefined,
     err_len: usize = 0,
+    /// Timer replies stay private until complete, so a new draft or
+    /// Focus mode can suppress the entire utterance, including deltas.
+    notice: [2048]u8 = undefined,
+    notice_len: usize = 0,
 
     pub fn busy(self: *const Session) bool {
         return self.phase == .streaming or self.phase == .refreshing;
@@ -182,7 +187,7 @@ pub const Session = struct {
 
     /// Nothing on screen asked for this request: the pet spoke unprompted.
     pub fn proactive(self: *const Session) bool {
-        return self.prompt == .chatter or self.prompt == .nudge;
+        return self.prompt == .chatter or self.prompt == .nudge or self.prompt == .timer_done;
     }
 
     /// Let a failed unprompted request pass as if it never went out: no
@@ -205,7 +210,7 @@ pub const Session = struct {
 
     /// Waiting for the first words of a reply.
     pub fn thinking(self: *const Session) bool {
-        return self.busy() and !self.pending;
+        return self.busy() and !self.pending and self.prompt != .timer_done;
     }
 
     pub fn context(self: *const Session, out: *[context_messages]Message) []const Message {
@@ -229,6 +234,7 @@ pub const Session = struct {
     /// one once idle. None while a request waits for its first words
     /// (a briefing leaves the previous reply newest) or after a failure.
     pub fn currentReply(self: *const Session) ?[]const u8 {
+        if (self.prompt == .timer_done) return self.lastReply();
         if (self.phase == .failed or self.thinking()) return null;
         return self.lastReply();
     }
@@ -291,6 +297,13 @@ pub const Session = struct {
         };
         switch (event) {
             .delta => |text| {
+                if (self.prompt == .timer_done) {
+                    const kept = domain.utf8Floor(text, self.notice.len - self.notice_len);
+                    @memcpy(self.notice[self.notice_len..][0..kept.len], kept);
+                    self.notice_len += kept.len;
+                    if (kept.len < text.len) self.lost_text = true;
+                    return;
+                }
                 if (!self.pending) {
                     self.transcript.append(.assistant, "");
                     self.pending = true;
@@ -312,12 +325,17 @@ pub const Session = struct {
         if (key != self.streamKey() or self.phase != .streaming) return .none;
         if (transport_error) |message| return self.fail(message);
         if (status >= 200 and status < 300 and !self.stream_failed) {
+            if (self.prompt == .timer_done) {
+                if (self.notice_len == 0 or self.lost_text) return self.fail("Incomplete timer reply");
+                self.phase = .idle;
+                return .done;
+            }
             if (!self.pending) return self.fail(i18n.t("The reply was empty.", "返事が空でした。"));
             self.pending = false;
             self.phase = .idle;
             return .done;
         }
-        if (provider.authExpired(kind, status) and !self.retried) {
+        if (provider.authExpired(kind, status) and !self.retried and self.prompt != .timer_done) {
             self.retried = true;
             self.dropPending();
             self.err_len = 0;
@@ -357,6 +375,7 @@ pub const Session = struct {
     }
 
     fn startRequest(self: *Session) Action {
+        self.notice_len = 0;
         self.request_id +%= 1;
         self.stream_failed = false;
         self.phase = .streaming;
@@ -382,6 +401,36 @@ pub const Session = struct {
         self.err_len = kept.len;
     }
 };
+
+test "timer generation stays private and never retries authentication" {
+    var s: Session = .{};
+    s.transcript.append(.assistant, "The previous reply");
+    try t.expectEqual(Action.request, s.brief(.timer_done, false, 0));
+    const key = s.streamKey();
+    var scratch: [4096]u8 = undefined;
+    s.onLine(.openai_compat, key, "data: {\"choices\":[{\"delta\":{\"content\":\"Time is up!\"}}]}", false, false, &scratch);
+    try t.expectEqualStrings("The previous reply", s.currentReply().?);
+    try t.expect(!s.thinking());
+    try t.expectEqual(Action.done, s.onResponse(.openai_compat, key, 200, null));
+    try t.expectEqualStrings("Time is up!", s.notice[0..s.notice_len]);
+    try t.expectEqual(@as(usize, 1), s.transcript.len());
+    _ = s.brief(.timer_done, false, 0);
+    try t.expectEqual(Action.failed, s.onResponse(.codex, s.streamKey(), 401, null));
+    try t.expectEqual(@as(usize, 1), s.transcript.len());
+}
+
+test "cancelled timer generations ignore late deltas and responses" {
+    var s: Session = .{};
+    _ = s.brief(.timer_done, false, 0);
+    const key = s.streamKey();
+    s.cancel();
+    s.quiet();
+    var scratch: [4096]u8 = undefined;
+    s.onLine(.openai_compat, key, "data: {\"choices\":[{\"delta\":{\"content\":\"Late reply\"}}]}", false, false, &scratch);
+    try t.expectEqual(Action.none, s.onResponse(.openai_compat, key, 200, null));
+    try t.expectEqual(@as(usize, 0), s.transcript.len());
+    try t.expect(s.wire == null);
+}
 
 // ── Tests ─────────────────────────────────────────────────────────────
 
