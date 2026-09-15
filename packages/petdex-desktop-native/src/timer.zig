@@ -13,6 +13,7 @@ pub const Config = struct {
     timer_seconds: u16 = 300,
     auto_start: bool = false,
     speak: bool = true,
+    visible: bool = true,
 
     fn valid(self: Config) bool {
         return self.work_minutes >= 1 and self.work_minutes <= 180 and
@@ -273,4 +274,26 @@ test "invalid saved state falls back and paused state round trips" {
     try t.expectEqualDeep(s, parse(t.allocator, bytes));
     s.setMode(.timer);
     try t.expectEqual(Mode.pomodoro, s.mode);
+}
+
+test "hidden timers persist and still complete with a pet announcement" {
+    const t = std.testing;
+    // Existing timer.json files keep the card visible without losing settings.
+    const previous = parse(t.allocator, "{\"config\":{\"work_minutes\":30}}");
+    try t.expect(previous.config.visible);
+    try t.expectEqual(@as(u16, 30), previous.config.work_minutes);
+
+    var s: State = .{};
+    s.start(1000);
+    s.config.visible = false;
+    const bytes = try std.json.Stringify.valueAlloc(t.allocator, s, .{});
+    defer t.allocator.free(bytes);
+    var restored = parse(t.allocator, bytes);
+    try t.expectEqualDeep(s, restored);
+    try t.expect(restored.tick(s.deadline_ms, false));
+    try t.expectEqual(Phase.work, restored.claim(false, false).?.phase);
+    try t.expect(!restored.tick(s.deadline_ms + 1000, false));
+    restored.reset();
+    restored.setMode(.timer);
+    try t.expect(!restored.config.visible);
 }

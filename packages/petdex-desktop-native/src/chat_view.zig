@@ -55,12 +55,14 @@ pub fn view(ui: *AppUi, model: *const Model) AppUi.Node {
     const st = &model.chat;
     // Oldest on top, the reply card last, right above the composer.
     const s = stacked(model);
-    const nodes = ui.arena.alloc(AppUi.Node, s.to - s.from + 4) catch return failedNode(ui);
+    const count = s.to - s.from;
+    const timer_visible = model.timer.clock.config.visible;
+    const nodes = ui.arena.alloc(AppUi.Node, count + 3 + @as(usize, @intFromBool(timer_visible))) catch return failedNode(ui);
     for (s.from..s.to, 0..) |i, j| nodes[j] = stackedBubble(ui, model, st.session.transcript.get(i));
-    nodes[nodes.len - 4] = speechCard(ui, model, st);
-    nodes[nodes.len - 3] = composer(ui, model, st);
-    nodes[nodes.len - 2] = controls(ui, model, st);
-    nodes[nodes.len - 1] = timer_view.view(ui, model);
+    nodes[count] = speechCard(ui, model, st);
+    nodes[count + 1] = composer(ui, model, st);
+    nodes[count + 2] = controls(ui, model, st);
+    if (timer_visible) nodes[count + 3] = timer_view.view(ui, model);
     const body = ui.column(.{ .gap = row_gap }, @as([]const AppUi.Node, nodes));
     if (!bubble) {
         var root = ui.el(.panel, .{ .grow = 1 }, .{ui.column(.{ .grow = 1 }, .{
@@ -104,7 +106,8 @@ fn contentBudget(model: *const Model) f32 {
 }
 
 fn belowSpeech(model: *const Model) f32 {
-    return pill_h + control_h + 3 * row_gap + timer_view.height(model);
+    const timer_h = if (model.timer.clock.config.visible) row_gap + timer_view.height(model) else 0;
+    return pill_h + control_h + 2 * row_gap + timer_h;
 }
 
 fn replyBudget(model: *const Model) f32 {
@@ -763,6 +766,23 @@ test "timer and composer fit a small display with settings and history open" {
         model.chat.session.transcript.append(.assistant, "A long reply " ** 100);
     }
     try std.testing.expect(windowHeight(&model) <= 568);
+}
+
+test "hiding the timer reclaims its card and gap for chat" {
+    for ([_]bool{ false, true }) |options_open| {
+        var model: Model = .{};
+        model.chat.open = true;
+        model.chat.local_url.set("http://localhost:1234/v1");
+        model.timer.options_open = options_open;
+        const shown_h = windowHeight(&model);
+        const shown_budget = replyBudget(&model);
+        const freed_h = timer_view.height(&model) + row_gap;
+        model.timer.clock.config.visible = false;
+        try std.testing.expectEqual(shown_budget + freed_h, replyBudget(&model));
+        if (bubble) try std.testing.expectEqual(shown_h - freed_h, windowHeight(&model));
+        model.timer.clock.config.visible = true;
+        try std.testing.expectEqual(shown_h, windowHeight(&model));
+    }
 }
 
 test "stacked bubbles cut long text at their line cap" {

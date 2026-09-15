@@ -47,7 +47,7 @@ deletes that file once it passes 32 MB.
 ## Navigation
 
 The pet’s right-click menu and the menu-bar extra share live Show/Hide
-controls for chat, agent bubbles, Flock and usage limits. Focus Mode,
+controls for chat, the timer, agent bubbles, Flock and usage limits. Focus Mode,
 waiting sound and clearing notifications live there too. Hiding agent bubbles
 keeps the existing behavior: current notifications are cleared. Focus Mode
 also pauses spontaneous chat; it ends when the app restarts.
@@ -139,6 +139,11 @@ recent replies without the conversation. Nothing is said while you are typing
 in the chat, in Focus, or while another request is on the wire.
 
 ## Timer
+
+Use **Hide Timer / Show Timer** in the pet's right-click menu or the menu-bar
+extra to toggle the card. The choice survives restarts. Showing the timer
+also opens chat if needed; hiding it removes the card and its spacing while
+the clock and enabled completion announcements keep working.
 
 The card below chat switches between **Pomodoro** and a plain **Timer**.
 Pomodoro starts with 25 minutes of focus, a 5-minute short break and a

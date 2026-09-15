@@ -22,6 +22,10 @@ pub const State = struct {
     generated: [2048]u8 = undefined,
     generated_len: usize = 0,
     generated_id: u64 = 0,
+
+    pub fn isVisible(self: *const State, chat_open: bool) bool {
+        return chat_open and self.clock.config.visible;
+    }
 };
 
 pub fn boot(model: *app.Model) void {
@@ -64,6 +68,13 @@ pub fn update(model: *app.Model, msg: app.Msg, fx: *app.Effects) void {
     const st = &model.timer;
     tick(model, fx);
     switch (msg) {
+        .timer_visibility => {
+            // A closed chat hides the card too: Show Timer must open it,
+            // even when the saved visibility preference is already on.
+            st.clock.config.visible = !st.isVisible(model.chat.open);
+            if (st.clock.config.visible) chat_shell.update(model, .show_chat, fx);
+            chat_shell.follow(model, fx);
+        },
         .timer_toggle => {
             if (st.invalid) return;
             if (st.clock.status == .running) st.clock.pause(st.now_ms) else st.clock.start(st.now_ms);

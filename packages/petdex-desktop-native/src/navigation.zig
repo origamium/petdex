@@ -31,6 +31,7 @@ pub fn quickActions(model: *const app.Model) Actions {
     var result: Actions = .{};
     result.add(.{ .label = if (model.chat.open) i18n.t("Hide Chat", "チャットを隠す") else i18n.t("Show Chat", "チャットを表示"), .command = "petdex.chat", .msg = .open_chat });
     result.add(.{ .label = i18n.t("Chat options…", "チャットの設定…"), .command = "petdex.chat-options", .msg = .open_chat_options });
+    result.add(.{ .label = if (model.timer.isVisible(model.chat.open)) i18n.t("Hide Timer", "タイマーを隠す") else i18n.t("Show Timer", "タイマーを表示"), .command = "petdex.timer", .msg = .timer_visibility });
     result.add(.{ .separator = true });
     result.add(.{ .label = if (model.bubbles_enabled) i18n.t("Hide Agent Bubbles", "通知吹き出しを隠す") else i18n.t("Show Agent Bubbles", "通知吹き出しを表示"), .command = "petdex.bubbles", .msg = .toggle_bubbles });
     result.add(.{ .label = if (model.flock.open) i18n.t("Hide Flock", "フロックを隠す") else i18n.t("Show Flock", "フロックを表示"), .command = "petdex.flock", .msg = .toggle_flock_window });
@@ -82,6 +83,34 @@ test "daily menu actions reflect live visibility and dispatch the same commands"
                 try std.testing.expect(on.enabled);
             } else if (!std.mem.eql(u8, on.command, "petdex.chat-options") and !std.mem.eql(u8, on.command, "petdex.notifications")) {
                 try std.testing.expect(!std.mem.eql(u8, off.label, on.label));
+            }
+        }
+    }
+}
+
+test "timer menu reflects both chat visibility and the saved card preference" {
+    const previous = i18n.current;
+    defer i18n.current = previous;
+    for ([_]i18n.Lang{ .en, .ja }) |lang| {
+        i18n.current = lang;
+        var model: app.Model = .{};
+        for ([_]bool{ false, true }) |chat_open| {
+            model.chat.open = chat_open;
+            for ([_]bool{ false, true }) |timer_visible| {
+                model.timer.clock.config.visible = timer_visible;
+                const actions = quickActions(&model);
+                var found = false;
+                for (actions.slice()) |action| {
+                    if (!std.mem.eql(u8, action.command, "petdex.timer")) continue;
+                    found = true;
+                    try std.testing.expectEqualStrings(
+                        if (chat_open and timer_visible) i18n.t("Hide Timer", "タイマーを隠す") else i18n.t("Show Timer", "タイマーを表示"),
+                        action.label,
+                    );
+                    try std.testing.expect(action.enabled);
+                    try std.testing.expectEqual(app.Msg.timer_visibility, action.msg.?);
+                }
+                try std.testing.expect(found);
             }
         }
     }

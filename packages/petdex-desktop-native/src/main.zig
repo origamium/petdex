@@ -177,6 +177,7 @@ pub const Msg = union(enum) {
     auth_library_done: native_sdk.EffectExit,
     clear_notifications,
     // Pet chat (chat_shell.zig).
+    timer_visibility,
     timer_toggle,
     timer_reset,
     timer_mode: @import("timer.zig").Mode,
@@ -2869,7 +2870,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .chatgpt_sign_out,
         .chatgpt_token_response,
         => chat_shell.update(model, msg, fx),
-        .timer_toggle, .timer_reset, .timer_mode, .timer_options, .timer_scrolled, .timer_auto, .timer_speak, .timer_work, .timer_short, .timer_long, .timer_minutes, .timer_seconds => timer_shell.update(model, msg, fx),
+        .timer_visibility, .timer_toggle, .timer_reset, .timer_mode, .timer_options, .timer_scrolled, .timer_auto, .timer_speak, .timer_work, .timer_short, .timer_long, .timer_minutes, .timer_seconds => timer_shell.update(model, msg, fx),
         .update_boot_check => |timer| {
             if (timer.outcome == .fired and model.update_checks_enabled) startUpdateCheck(model, false, fx);
         },
@@ -3538,6 +3539,7 @@ pub fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "petdex.updates")) return .check_updates;
     if (std.mem.eql(u8, name, "petdex.flock")) return .toggle_flock_window;
     if (std.mem.eql(u8, name, "petdex.chat")) return .open_chat;
+    if (std.mem.eql(u8, name, "petdex.timer")) return .timer_visibility;
     if (std.mem.eql(u8, name, "petdex.clear-notifications")) return .clear_notifications;
     if (std.mem.eql(u8, name, "petdex.reset-position")) return .reset_position;
     return null;
@@ -6196,7 +6198,7 @@ test "tray actions remain reachable and reflect notifications and updates" {
     var model: Model = .{};
     var scratch: PetdexApp.StatusItemScratch = .{};
     var state = petdexStatusItem(&model, &scratch);
-    for ([_][]const u8{ "petdex.chat", "petdex.chat-options", "petdex.settings", "petdex.pets", "petdex.connections", "petdex.bubbles", "petdex.notifications", "petdex.waiting-sound", "petdex.focus", "petdex.flock", "petdex.shuffle", "petdex.website", "petdex.pet-page", "petdex.reset-position", "petdex.updates", "petdex.quit" }) |command| {
+    for ([_][]const u8{ "petdex.chat", "petdex.chat-options", "petdex.timer", "petdex.settings", "petdex.pets", "petdex.connections", "petdex.bubbles", "petdex.notifications", "petdex.waiting-sound", "petdex.focus", "petdex.flock", "petdex.shuffle", "petdex.website", "petdex.pet-page", "petdex.reset-position", "petdex.updates", "petdex.quit" }) |command| {
         _ = try trayCommand(state.items, command);
         try std.testing.expect(onCommand(command) != null);
     }

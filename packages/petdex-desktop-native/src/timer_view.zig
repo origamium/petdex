@@ -76,7 +76,7 @@ fn statusLabel(model: *const app.Model) []const u8 {
     if (st.clock.status == .completed) return i18n.t("Finished · ready when you are", "終了しました · 次も自分のペースで");
     if (st.clock.status == .paused) return i18n.t("Paused · reset to edit duration", "一時停止中 · 変更するにはリセット");
     if (model.focus_mode) return i18n.t("Focus mode · pet announcements off", "集中モード中 · ペットのお知らせは休止");
-    if (st.clock.status == .running) return i18n.t("Keeps running when chat is closed", "チャットを閉じても計測を続けます");
+    if (st.clock.status == .running) return i18n.t("Keeps running while hidden", "非表示中も計測を続けます");
     return i18n.t("Make a little time for yourself", "あなたのペースで、ひと区切り");
 }
 
