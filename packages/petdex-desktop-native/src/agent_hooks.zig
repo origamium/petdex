@@ -40,6 +40,9 @@ pub const AgentKind = enum(u8) {
     cursor,
     junie,
     antigravity,
+    // Devin CLI / Grok CLI: MCP config only. Appended for the same atlas reason.
+    devin,
+    grok,
 
     pub fn displayName(self: AgentKind) []const u8 {
         return switch (self) {
@@ -56,6 +59,8 @@ pub const AgentKind = enum(u8) {
             .cursor => "Cursor",
             .junie => "Junie",
             .antigravity => "Antigravity",
+            .devin => "Devin",
+            .grok => "Grok",
         };
     }
 
@@ -74,12 +79,14 @@ pub const AgentKind = enum(u8) {
             .cursor => "cursor",
             .junie => "junie",
             .antigravity => "antigravity",
+            .devin => "devin",
+            .grok => "grok",
         };
     }
 
     pub fn prefersMcp(self: AgentKind) bool {
         return switch (self) {
-            .claude_code, .codex, .gemini, .cursor, .junie, .antigravity => true,
+            .claude_code, .codex, .gemini, .opencode, .cursor, .junie, .antigravity, .devin, .grok => true,
             else => false,
         };
     }
@@ -89,9 +96,12 @@ pub const AgentKind = enum(u8) {
             .claude_code => .claude_code,
             .codex => .codex,
             .gemini => .gemini,
+            .opencode => .opencode,
             .cursor => .cursor,
             .junie => .junie,
             .antigravity => .antigravity,
+            .devin => .devin,
+            .grok => .grok,
             else => null,
         };
     }
@@ -113,7 +123,7 @@ pub const AgentInfo = struct {
     status: HookStatus = .absent,
 };
 
-pub const agent_count = 13;
+pub const agent_count = 15;
 
 /// Claude Code keeps everything under ~/.claude unless CLAUDE_CONFIG_DIR
 /// points elsewhere — that env var is how people run several fully
@@ -553,6 +563,8 @@ pub fn scan(allocator: std.mem.Allocator, home: []const u8) [agent_count]AgentIn
         .{ .kind = .cursor },
         .{ .kind = .junie },
         .{ .kind = .antigravity },
+        .{ .kind = .devin },
+        .{ .kind = .grok },
     };
     // Several roots behind one row: cannot ride the single-dir/single-config
     // shape below, so it is resolved up front. The arms `continue` rather than
@@ -573,26 +585,27 @@ pub fn scan(allocator: std.mem.Allocator, home: []const u8) [agent_count]AgentIn
         }
         // MCP-first agents: presence + petdex MCP entry, no shell hooks.
         if (info.kind.mcpKind()) |mcp| {
+            const mcp_only = info.kind == .cursor or info.kind == .junie or info.kind == .antigravity or info.kind == .devin or info.kind == .grok;
             const mcp_status = agent_mcp.scanOne(allocator, home, mcp);
             if (mcp_status == .absent) {
-                // Claude / Codex / Gemini may still show via their hook config
-                // roots below when MCP is absent.
-                if (info.kind == .cursor or info.kind == .junie or info.kind == .antigravity) {
+                // Claude / Codex / Gemini / OpenCode may still show via their
+                // hook/plugin roots below when MCP is absent.
+                if (mcp_only) {
                     info.status = .absent;
                     continue;
                 }
             } else if (mcp_status == .current) {
                 info.status = .current;
                 continue;
-            } else if (info.kind == .cursor or info.kind == .junie or info.kind == .antigravity) {
+            } else if (mcp_only) {
                 info.status = .none;
                 continue;
             }
-            // claude/codex/gemini with MCP absent/none fall through to hook scan;
-            // leftover hooks count as outdated so Update migrates to MCP.
+            // claude/codex/gemini/opencode with MCP absent/none fall through;
+            // leftover hooks/plugin count as outdated so Update migrates to MCP.
         }
         if (info.kind == .hermes and builtin.os.tag == .windows) continue;
-        if (info.kind == .cursor or info.kind == .junie or info.kind == .antigravity) continue;
+        if (info.kind == .cursor or info.kind == .junie or info.kind == .antigravity or info.kind == .devin or info.kind == .grok) continue;
         const dir = switch (info.kind) {
             .claude_code => claudeConfigDir(&path, home) orelse continue,
             .codex => std.fmt.bufPrint(&path, "{s}/.codex", .{home}) catch continue,
@@ -603,7 +616,7 @@ pub fn scan(allocator: std.mem.Allocator, home: []const u8) [agent_count]AgentIn
             .codebuddy => std.fmt.bufPrint(&path, "{s}/.codebuddy", .{home}) catch continue,
             .omp => ompAgentDir(&path, home) orelse continue,
             .hermes => hermesHome(&path, home) orelse continue,
-            .dsh, .cursor, .junie, .antigravity => unreachable,
+            .dsh, .cursor, .junie, .antigravity, .devin, .grok => unreachable,
         };
         if (!dirExists(dir)) continue;
         info.status = .none;
@@ -617,15 +630,15 @@ pub fn scan(allocator: std.mem.Allocator, home: []const u8) [agent_count]AgentIn
             .codebuddy => std.fmt.bufPrint(&path, "{s}/.codebuddy/settings.json", .{home}) catch continue,
             .omp => ompExtensionPath(&path, home) orelse continue,
             .hermes => hermesConfigPath(&path, home) orelse continue,
-            .dsh, .cursor, .junie, .antigravity => unreachable,
+            .dsh, .cursor, .junie, .antigravity, .devin, .grok => unreachable,
         };
         if (readFileAlloc(allocator, cfg, 512 * 1024)) |content| {
             defer allocator.free(content);
-            // The opencode plugin never touches a runner: a current
-            // snapshot means connected, anything else shows as
-            // outdated so Update can refresh it.
+            // The opencode plugin never touches a runner. After the MCP
+            // migration a leftover plugin is outdated so Update writes MCP
+            // and clears it; a mismatched copy is outdated the same way.
             if (info.kind == .opencode) {
-                info.status = if (std.mem.eql(u8, std.mem.trim(u8, content, " \n"), std.mem.trim(u8, opencode_plugin, " \n"))) .current else .node;
+                info.status = .node;
             } else if (info.kind == .omp) {
                 // Same rule as the opencode plugin: this is a whole file we
                 // own, so a byte-identical copy is connected and anything
@@ -1886,12 +1899,12 @@ fn uninstallHermes(allocator: std.mem.Allocator, home: []const u8) bool {
 const opencode_plugin = @embedFile("assets/opencode-plugin.js");
 
 pub fn installOpencode(allocator: std.mem.Allocator, home: []const u8) bool {
+    if (!agent_mcp.install(allocator, home, .opencode)) return false;
+    // Drop the legacy event plugin so MCP alone owns the connection.
     var path_buf: [512]u8 = undefined;
-    const dir = std.fmt.bufPrint(&path_buf, "{s}/.config/opencode/plugins", .{home}) catch return false;
-    plat.makeDir(dir);
-    const path = std.fmt.bufPrint(&path_buf, "{s}/.config/opencode/plugins/petdex.js", .{home}) catch return false;
-    if (!backupOnce(allocator, path)) return false;
-    return writeFile(path, opencode_plugin);
+    const plugin = std.fmt.bufPrint(&path_buf, "{s}/.config/opencode/plugins/petdex.js", .{home}) catch return true;
+    plat.deleteFile(plugin);
+    return true;
 }
 
 /// JSON-hook agents (Claude Code, Gemini): std.json Value roundtrip of
@@ -2238,10 +2251,8 @@ pub fn migrateLegacyHooks(allocator: std.mem.Allocator, home: []const u8) Legacy
             .claude_code => installClaude(allocator, home),
             .codex => installCodex(allocator, home),
             .gemini => installGemini(allocator, home),
-            // An outdated OpenCode plugin has no subprocess stdin path.
-            // Keep its existing explicit Update action rather than changing
-            // it as part of this bubble-runner migration.
-            .opencode => continue,
+            // An outdated OpenCode plugin migrates to MCP on boot.
+            .opencode => installOpencode(allocator, home),
             // Unreachable: no legacy runner ever wrote these hooks, so this
             // cannot scan as .node. Install is the consistent answer anyway.
             .qoder => installQoder(allocator, home),
@@ -2252,7 +2263,7 @@ pub fn migrateLegacyHooks(allocator: std.mem.Allocator, home: []const u8) Legacy
             .dsh => continue,
             // MCP-first agents: Install already writes MCP; boot migration
             // only repairs legacy hook runners.
-            .cursor, .junie, .antigravity => continue,
+            .cursor, .junie, .antigravity, .devin, .grok => continue,
         };
         if (migrated) result.migrated += 1 else result.failed += 1;
     }
@@ -2284,10 +2295,13 @@ pub fn uninstall(allocator: std.mem.Allocator, home: []const u8, kind: AgentKind
         .cursor => return agent_mcp.uninstall(allocator, home, .cursor),
         .junie => return agent_mcp.uninstall(allocator, home, .junie),
         .antigravity => return agent_mcp.uninstall(allocator, home, .antigravity),
+        .devin => return agent_mcp.uninstall(allocator, home, .devin),
+        .grok => return agent_mcp.uninstall(allocator, home, .grok),
         .opencode => {
-            const p = std.fmt.bufPrint(&path_buf, "{s}/.config/opencode/plugins/petdex.js", .{home}) catch return false;
+            const mcp_ok = agent_mcp.uninstall(allocator, home, .opencode);
+            const p = std.fmt.bufPrint(&path_buf, "{s}/.config/opencode/plugins/petdex.js", .{home}) catch return mcp_ok;
             plat.deleteFile(p);
-            return true;
+            return mcp_ok;
         },
         .qoder => return uninstallQoder(allocator, home),
         .kimi_code => {

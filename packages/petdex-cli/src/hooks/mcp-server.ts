@@ -2,7 +2,8 @@
  * Petdex MCP Server — stdio Model Context Protocol server for coding agents.
  *
  * Any MCP-capable agent (Codex, Claude Code, Cursor, Gemini, Junie,
- * Antigravity, …) can connect and drive the desktop mascot by calling tools.
+ * Antigravity, OpenCode, Devin, Grok, …) can connect and drive the desktop
+ * mascot by calling tools.
  * Set `PETDEX_MCP_AGENT` (or pass `agent` on each tool call) so bubbles and
  * usage land under the right logo.
  *

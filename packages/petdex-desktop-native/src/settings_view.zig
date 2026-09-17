@@ -82,14 +82,6 @@ fn agentStatusCaption(info: agent_hooks.AgentInfo, codex_note: bool, dsh_busy: b
         };
     }
     if (info.kind == .codex and codex_note) return i18n.t("Installed - restart Codex to load Petdex MCP", "インストール済み。Codexを再起動してPetdex MCPを読み込んでください");
-    if (info.kind == .opencode) {
-        return switch (info.status) {
-            .absent => i18n.t("Not detected", "見つかりません"),
-            .none => i18n.t("Plugin not installed", "プラグイン未インストール"),
-            .node => i18n.t("Plugin outdated", "プラグインが古くなっています"),
-            .current => i18n.t("Connected", "接続済み"),
-        };
-    }
     if (info.kind.prefersMcp()) {
         return switch (info.status) {
             .absent => i18n.t("Not detected", "見つかりません"),

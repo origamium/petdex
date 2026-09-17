@@ -396,6 +396,8 @@ pub const Model = struct {
         .{ .kind = .cursor },
         .{ .kind = .junie },
         .{ .kind = .antigravity },
+        .{ .kind = .devin },
+        .{ .kind = .grok },
     },
     dsh_busy: bool = false,
     dsh_error: bool = false,
@@ -1709,6 +1711,8 @@ const installable_art = [agent_hooks.agent_count + 2]AgentArt{
     .{ .light = @embedFile("assets/agents/cursor.png"), .dark = @embedFile("assets/agents/cursor.png") },
     .{ .light = @embedFile("assets/agents/junie.png"), .dark = @embedFile("assets/agents/junie.png") },
     .{ .light = @embedFile("assets/agents/antigravity.png"), .dark = @embedFile("assets/agents/antigravity.png") },
+    .{ .light = @embedFile("assets/agents/devin.png"), .dark = @embedFile("assets/agents/devin.png") },
+    .{ .light = @embedFile("assets/agents/grok.png"), .dark = @embedFile("assets/agents/grok.png") },
     .{ .light = @embedFile("assets/agents/herdr.png"), .dark = @embedFile("assets/agents/herdr.png") },
     .{ .light = @embedFile("assets/agents/fallback.png"), .dark = @embedFile("assets/agents/fallback.png") },
 };
@@ -1721,10 +1725,8 @@ const agent_fallback_index = agent_hooks.agent_count + 1;
 /// in the strip, in this order, so append rather than insert.
 const ExtraAgent = struct { names: []const []const u8, display: []const u8, art: []const u8 };
 const extra_agents = [_]ExtraAgent{
-    .{ .names = &.{"devin"}, .display = "Devin", .art = @embedFile("assets/agents/devin.png") },
     .{ .names = &.{"droid"}, .display = "Droid", .art = @embedFile("assets/agents/droid.png") },
     .{ .names = &.{ "kilo", "kilocode", "kilo-code" }, .display = "Kilo Code", .art = @embedFile("assets/agents/kilo.png") },
-    .{ .names = &.{"grok"}, .display = "Grok", .art = @embedFile("assets/agents/grok.png") },
     .{ .names = &.{ "mastracode", "mastra" }, .display = "Mastra Code", .art = @embedFile("assets/agents/mastracode.png") },
     // The usage column's; Octicons' copilot mark (MIT) on a tile.
     .{ .names = &.{"copilot"}, .display = "Copilot", .art = @embedFile("assets/agents/copilot.png") },
@@ -2670,6 +2672,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 .cursor => agent_mcp.install(boot_allocator, home, .cursor),
                 .junie => agent_mcp.install(boot_allocator, home, .junie),
                 .antigravity => agent_mcp.install(boot_allocator, home, .antigravity),
+                .devin => agent_mcp.install(boot_allocator, home, .devin),
+                .grok => agent_mcp.install(boot_allocator, home, .grok),
                 .dsh => unreachable,
             };
             if (ok and kind == .codex) model.codex_trust_note = true;
@@ -5943,6 +5947,8 @@ test "agents Herdr relays get their own logo and name" {
     try std.testing.expectEqual(agentIconIndex("cursor"), agentIconIndex("cursor-agent"));
     try std.testing.expectEqual(@as(usize, @intFromEnum(agent_hooks.AgentKind.antigravity)), agentIconIndex("antigravity"));
     try std.testing.expectEqual(@as(usize, @intFromEnum(agent_hooks.AgentKind.junie)), agentIconIndex("junie"));
+    try std.testing.expectEqual(@as(usize, @intFromEnum(agent_hooks.AgentKind.devin)), agentIconIndex("devin"));
+    try std.testing.expectEqual(@as(usize, @intFromEnum(agent_hooks.AgentKind.grok)), agentIconIndex("grok"));
     try std.testing.expectEqual(agent_fallback_index, agentIconIndex("windsurf"));
     // The usage column's Copilot row has its logo too.
     try std.testing.expectEqual(extra_icon_base + extra_agents.len - 1, agentIconIndex("copilot"));

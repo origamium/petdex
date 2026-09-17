@@ -1,13 +1,14 @@
 //! MCP config install/detect for agents that speak Model Context Protocol.
 //!
 //! Shell hooks remain for agents without a usable MCP surface. For Codex,
-//! Claude Code, Gemini, Cursor, Junie and Antigravity the Connections
-//! Install button writes an MCP server entry that launches
-//! `npx -y petdex mcp-server` with `PETDEX_MCP_AGENT` set so bubbles and
-//! usage land under the right logo.
+//! Claude Code, Gemini, Cursor, Junie, Antigravity, OpenCode, Devin CLI and
+//! Grok CLI the Connections Install button writes an MCP server entry that
+//! launches `npx -y petdex mcp-server` with `PETDEX_MCP_AGENT` set so bubbles
+//! and usage land under the right logo.
 //!
-//! Config shapes differ (JSON `mcpServers` vs Codex TOML `[mcp_servers.*]`),
-//! but every writer preserves foreign entries and only owns the `petdex` key.
+//! Config shapes differ (JSON `mcpServers`, OpenCode `mcp.*`, Codex/Grok
+//! TOML `[mcp_servers.*]`), but every writer preserves foreign entries and
+//! only owns the `petdex` key.
 
 const std = @import("std");
 const plat = @import("plat.zig");
@@ -19,6 +20,9 @@ pub const McpAgent = enum(u8) {
     cursor,
     junie,
     antigravity,
+    opencode,
+    devin,
+    grok,
 
     pub fn displayName(self: McpAgent) []const u8 {
         return switch (self) {
@@ -28,6 +32,9 @@ pub const McpAgent = enum(u8) {
             .cursor => "Cursor",
             .junie => "Junie",
             .antigravity => "Antigravity",
+            .opencode => "opencode",
+            .devin => "Devin",
+            .grok => "Grok",
         };
     }
 
@@ -39,6 +46,9 @@ pub const McpAgent = enum(u8) {
             .cursor => "cursor",
             .junie => "junie",
             .antigravity => "antigravity",
+            .opencode => "opencode",
+            .devin => "devin",
+            .grok => "grok",
         };
     }
 };
@@ -99,6 +109,9 @@ fn presenceDir(buf: []u8, home: []const u8, kind: McpAgent) ?[]const u8 {
         .cursor => std.fmt.bufPrint(buf, "{s}/.cursor", .{home}) catch null,
         .junie => std.fmt.bufPrint(buf, "{s}/.junie", .{home}) catch null,
         .antigravity => std.fmt.bufPrint(buf, "{s}/.gemini", .{home}) catch null,
+        .opencode => std.fmt.bufPrint(buf, "{s}/.config/opencode", .{home}) catch null,
+        .devin => std.fmt.bufPrint(buf, "{s}/.config/devin", .{home}) catch null,
+        .grok => std.fmt.bufPrint(buf, "{s}/.grok", .{home}) catch null,
     };
 }
 
@@ -111,6 +124,9 @@ fn configPath(buf: []u8, home: []const u8, kind: McpAgent) ?[]const u8 {
         .junie => std.fmt.bufPrint(buf, "{s}/.junie/mcp/mcp.json", .{home}) catch null,
         // Prefer the shared Antigravity 2.0 path; fall back is handled at install.
         .antigravity => std.fmt.bufPrint(buf, "{s}/.gemini/config/mcp_config.json", .{home}) catch null,
+        .opencode => std.fmt.bufPrint(buf, "{s}/.config/opencode/opencode.json", .{home}) catch null,
+        .devin => std.fmt.bufPrint(buf, "{s}/.config/devin/mcp_config.json", .{home}) catch null,
+        .grok => std.fmt.bufPrint(buf, "{s}/.grok/config.toml", .{home}) catch null,
     };
 }
 
@@ -118,10 +134,31 @@ fn antigravityLegacyPath(buf: []u8, home: []const u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}/.gemini/antigravity/mcp_config.json", .{home}) catch null;
 }
 
+fn opencodeJsoncPath(buf: []u8, home: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/.config/opencode/opencode.jsonc", .{home}) catch null;
+}
+
+fn devinLegacyConfigPath(buf: []u8, home: []const u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/.config/devin/config.json", .{home}) catch null;
+}
+
+fn usesTomlMcp(kind: McpAgent) bool {
+    return kind == .codex or kind == .grok;
+}
+
 fn stdioEntryJson(kind: McpAgent, buf: []u8) ?[]const u8 {
     return std.fmt.bufPrint(
         buf,
         \\{{"command":"{s}","args":["{s}","{s}","{s}"],"env":{{"PETDEX_MCP_AGENT":"{s}"}}}}
+    ,
+        .{ mcp_command, mcp_args[0], mcp_args[1], mcp_args[2], kind.agentEnv() },
+    ) catch null;
+}
+
+fn opencodeEntryJson(kind: McpAgent, buf: []u8) ?[]const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        \\{{"type":"local","command":["{s}","{s}","{s}","{s}"],"enabled":true,"environment":{{"PETDEX_MCP_AGENT":"{s}"}}}}
     ,
         .{ mcp_command, mcp_args[0], mcp_args[1], mcp_args[2], kind.agentEnv() },
     ) catch null;
@@ -142,6 +179,22 @@ fn entryLooksCurrent(entry: std.json.Value, kind: McpAgent) bool {
     return agent == .string and std.mem.eql(u8, agent.string, kind.agentEnv());
 }
 
+fn opencodeEntryLooksCurrent(entry: std.json.Value, kind: McpAgent) bool {
+    if (entry != .object) return false;
+    const typ = entry.object.get("type") orelse return false;
+    if (typ != .string or !std.mem.eql(u8, typ.string, "local")) return false;
+    const command = entry.object.get("command") orelse return false;
+    if (command != .array or command.array.items.len < 4) return false;
+    if (command.array.items[0] != .string or !std.mem.eql(u8, command.array.items[0].string, mcp_command)) return false;
+    if (command.array.items[1] != .string or !std.mem.eql(u8, command.array.items[1].string, mcp_args[0])) return false;
+    if (command.array.items[2] != .string or !std.mem.eql(u8, command.array.items[2].string, mcp_args[1])) return false;
+    if (command.array.items[3] != .string or !std.mem.eql(u8, command.array.items[3].string, mcp_args[2])) return false;
+    const env = entry.object.get("environment") orelse return true;
+    if (env != .object) return false;
+    const agent = env.object.get("PETDEX_MCP_AGENT") orelse return false;
+    return agent == .string and std.mem.eql(u8, agent.string, kind.agentEnv());
+}
+
 fn jsonHasPetdex(content: []const u8, kind: McpAgent, allocator: std.mem.Allocator) Status {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return .none;
     defer parsed.deinit();
@@ -150,6 +203,26 @@ fn jsonHasPetdex(content: []const u8, kind: McpAgent, allocator: std.mem.Allocat
     if (servers != .object) return .none;
     const entry = servers.object.get(server_name) orelse return .none;
     return if (entryLooksCurrent(entry, kind)) .current else .none;
+}
+
+fn opencodeHasPetdex(content: []const u8, kind: McpAgent, allocator: std.mem.Allocator) Status {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return .none;
+    defer parsed.deinit();
+    if (parsed.value != .object) return .none;
+    const mcp = parsed.value.object.get("mcp") orelse return .none;
+    if (mcp != .object) return .none;
+    // V2: mcp.servers.petdex — V1 (current docs): mcp.petdex
+    if (mcp.object.get("servers")) |servers| {
+        if (servers == .object) {
+            if (servers.object.get(server_name)) |entry| {
+                return if (opencodeEntryLooksCurrent(entry, kind)) .current else .none;
+            }
+        }
+    }
+    if (mcp.object.get(server_name)) |entry| {
+        return if (opencodeEntryLooksCurrent(entry, kind)) .current else .none;
+    }
+    return .none;
 }
 
 fn tomlHasPetdex(content: []const u8, kind: McpAgent) Status {
@@ -203,10 +276,46 @@ pub fn scanOne(allocator: std.mem.Allocator, home: []const u8, kind: McpAgent) S
         return .none;
     }
 
+    if (kind == .opencode) {
+        if (configPath(&path_buf, home, kind)) |path| {
+            if (readFileAlloc(allocator, path, 512 * 1024)) |content| {
+                defer allocator.free(content);
+                const status = opencodeHasPetdex(content, kind, allocator);
+                if (status == .current) return .current;
+            }
+        }
+        var jsonc_buf: [576]u8 = undefined;
+        if (opencodeJsoncPath(&jsonc_buf, home)) |jsonc| {
+            if (readFileAlloc(allocator, jsonc, 512 * 1024)) |content| {
+                defer allocator.free(content);
+                return opencodeHasPetdex(content, kind, allocator);
+            }
+        }
+        return .none;
+    }
+
+    if (kind == .devin) {
+        if (configPath(&path_buf, home, kind)) |path| {
+            if (readFileAlloc(allocator, path, 512 * 1024)) |content| {
+                defer allocator.free(content);
+                const status = jsonHasPetdex(content, kind, allocator);
+                if (status == .current) return .current;
+            }
+        }
+        var legacy_buf: [576]u8 = undefined;
+        if (devinLegacyConfigPath(&legacy_buf, home)) |legacy| {
+            if (readFileAlloc(allocator, legacy, 512 * 1024)) |content| {
+                defer allocator.free(content);
+                return jsonHasPetdex(content, kind, allocator);
+            }
+        }
+        return .none;
+    }
+
     const path = configPath(&path_buf, home, kind) orelse return .none;
     const content = readFileAlloc(allocator, path, 512 * 1024) orelse return .none;
     defer allocator.free(content);
-    return if (kind == .codex) tomlHasPetdex(content, kind) else jsonHasPetdex(content, kind, allocator);
+    return if (usesTomlMcp(kind)) tomlHasPetdex(content, kind) else jsonHasPetdex(content, kind, allocator);
 }
 
 pub fn scan(allocator: std.mem.Allocator, home: []const u8) [agent_count]AgentInfo {
@@ -217,6 +326,9 @@ pub fn scan(allocator: std.mem.Allocator, home: []const u8) [agent_count]AgentIn
         .{ .kind = .cursor },
         .{ .kind = .junie },
         .{ .kind = .antigravity },
+        .{ .kind = .opencode },
+        .{ .kind = .devin },
+        .{ .kind = .grok },
     };
     for (&out) |*info| {
         info.status = scanOne(allocator, home, info.kind);
@@ -251,6 +363,42 @@ fn mergeJsonMcpServers(allocator: std.mem.Allocator, existing: ?[]const u8, kind
     return std.json.Stringify.valueAlloc(allocator, root, .{ .whitespace = .indent_2 }) catch null;
 }
 
+fn mergeOpencodeMcp(allocator: std.mem.Allocator, existing: ?[]const u8, kind: McpAgent) ?[]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var root: std.json.Value = .{ .object = std.json.ObjectMap.init(a, &.{}, &.{}) catch return null };
+    if (existing) |bytes| {
+        if (bytes.len > 0) {
+            const parsed = std.json.parseFromSlice(std.json.Value, a, bytes, .{}) catch return null;
+            if (parsed.value != .object) return null;
+            root = parsed.value;
+        }
+    }
+
+    const mcp_entry = root.object.getOrPut(a, "mcp") catch return null;
+    if (!mcp_entry.found_existing) {
+        mcp_entry.value_ptr.* = .{ .object = std.json.ObjectMap.init(a, &.{}, &.{}) catch return null };
+    } else if (mcp_entry.value_ptr.* != .object) return null;
+
+    var entry_buf: [320]u8 = undefined;
+    const entry_json = opencodeEntryJson(kind, &entry_buf) orelse return null;
+    const entry_parsed = std.json.parseFromSlice(std.json.Value, a, entry_json, .{}) catch return null;
+
+    // Prefer the documented V1 shape (mcp.petdex). If a V2 mcp.servers map
+    // already exists, keep petdex there too so either reader finds it.
+    mcp_entry.value_ptr.object.put(a, server_name, entry_parsed.value) catch return null;
+    if (mcp_entry.value_ptr.object.getPtr("servers")) |servers| {
+        if (servers.* == .object) {
+            const again = std.json.parseFromSlice(std.json.Value, a, entry_json, .{}) catch return null;
+            servers.object.put(a, server_name, again.value) catch return null;
+        }
+    }
+
+    return std.json.Stringify.valueAlloc(allocator, root, .{ .whitespace = .indent_2 }) catch null;
+}
+
 fn stripJsonPetdex(allocator: std.mem.Allocator, existing: []const u8) ?[]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -267,12 +415,45 @@ fn stripJsonPetdex(allocator: std.mem.Allocator, existing: []const u8) ?[]u8 {
     return std.json.Stringify.valueAlloc(allocator, root, .{ .whitespace = .indent_2 }) catch null;
 }
 
+fn stripOpencodePetdex(allocator: std.mem.Allocator, existing: []const u8) ?[]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parsed = std.json.parseFromSlice(std.json.Value, a, existing, .{}) catch return null;
+    if (parsed.value != .object) return null;
+    var root = parsed.value;
+    if (root.object.getPtr("mcp")) |mcp| {
+        if (mcp.* == .object) {
+            _ = mcp.object.orderedRemove(server_name);
+            if (mcp.object.getPtr("servers")) |servers| {
+                if (servers.* == .object) {
+                    _ = servers.object.orderedRemove(server_name);
+                    if (servers.object.count() == 0) _ = mcp.object.orderedRemove("servers");
+                }
+            }
+            if (mcp.object.count() == 0) _ = root.object.orderedRemove("mcp");
+        }
+    }
+    return std.json.Stringify.valueAlloc(allocator, root, .{ .whitespace = .indent_2 }) catch null;
+}
+
 fn installJson(allocator: std.mem.Allocator, path: []const u8, kind: McpAgent) bool {
     if (!ensureParentDir(path)) return false;
     const existing = readFileAlloc(allocator, path, 1024 * 1024);
     defer if (existing) |e| allocator.free(e);
     if (existing == null and fileExists(path)) return false;
     const merged = mergeJsonMcpServers(allocator, existing, kind) orelse return false;
+    defer allocator.free(merged);
+    if (existing) |_| backupBeside(path);
+    return writeFile(path, merged);
+}
+
+fn installOpencodeJson(allocator: std.mem.Allocator, path: []const u8, kind: McpAgent) bool {
+    if (!ensureParentDir(path)) return false;
+    const existing = readFileAlloc(allocator, path, 1024 * 1024);
+    defer if (existing) |e| allocator.free(e);
+    if (existing == null and fileExists(path)) return false;
+    const merged = mergeOpencodeMcp(allocator, existing, kind) orelse return false;
     defer allocator.free(merged);
     if (existing) |_| backupBeside(path);
     return writeFile(path, merged);
@@ -287,7 +468,16 @@ fn uninstallJson(allocator: std.mem.Allocator, path: []const u8) bool {
     return writeFile(path, stripped);
 }
 
-fn codexMcpBlock(kind: McpAgent, buf: []u8) ?[]const u8 {
+fn uninstallOpencodeJson(allocator: std.mem.Allocator, path: []const u8) bool {
+    const existing = readFileAlloc(allocator, path, 1024 * 1024) orelse return true;
+    defer allocator.free(existing);
+    const stripped = stripOpencodePetdex(allocator, existing) orelse return false;
+    defer allocator.free(stripped);
+    backupBeside(path);
+    return writeFile(path, stripped);
+}
+
+fn tomlMcpBlock(kind: McpAgent, buf: []u8) ?[]const u8 {
     return std.fmt.bufPrint(
         buf,
         \\
@@ -303,7 +493,7 @@ fn codexMcpBlock(kind: McpAgent, buf: []u8) ?[]const u8 {
     ) catch null;
 }
 
-fn stripCodexPetdex(out: *std.array_list.Managed(u8), content: []const u8) bool {
+fn stripTomlPetdex(out: *std.array_list.Managed(u8), content: []const u8) bool {
     out.clearRetainingCapacity();
     var line_start: usize = 0;
     var skipping = false;
@@ -326,7 +516,7 @@ fn stripCodexPetdex(out: *std.array_list.Managed(u8), content: []const u8) bool 
     return true;
 }
 
-fn installCodexToml(allocator: std.mem.Allocator, path: []const u8, kind: McpAgent) bool {
+fn installTomlMcp(allocator: std.mem.Allocator, path: []const u8, kind: McpAgent) bool {
     if (!ensureParentDir(path)) return false;
     const existing = readFileAlloc(allocator, path, 1024 * 1024);
     defer if (existing) |e| allocator.free(e);
@@ -335,22 +525,22 @@ fn installCodexToml(allocator: std.mem.Allocator, path: []const u8, kind: McpAge
     var cleaned = std.array_list.Managed(u8).init(allocator);
     defer cleaned.deinit();
     if (existing) |content| {
-        if (!stripCodexPetdex(&cleaned, content)) return false;
+        if (!stripTomlPetdex(&cleaned, content)) return false;
     }
 
     var block_buf: [320]u8 = undefined;
-    const block = codexMcpBlock(kind, &block_buf) orelse return false;
+    const block = tomlMcpBlock(kind, &block_buf) orelse return false;
     cleaned.appendSlice(block) catch return false;
     if (existing) |_| backupBeside(path);
     return writeFile(path, cleaned.items);
 }
 
-fn uninstallCodexToml(allocator: std.mem.Allocator, path: []const u8) bool {
+fn uninstallTomlMcp(allocator: std.mem.Allocator, path: []const u8) bool {
     const existing = readFileAlloc(allocator, path, 1024 * 1024) orelse return true;
     defer allocator.free(existing);
     var cleaned = std.array_list.Managed(u8).init(allocator);
     defer cleaned.deinit();
-    if (!stripCodexPetdex(&cleaned, existing)) return false;
+    if (!stripTomlPetdex(&cleaned, existing)) return false;
     backupBeside(path);
     return writeFile(path, cleaned.items);
 }
@@ -358,9 +548,9 @@ fn uninstallCodexToml(allocator: std.mem.Allocator, path: []const u8) bool {
 pub fn install(allocator: std.mem.Allocator, home: []const u8, kind: McpAgent) bool {
     var path_buf: [576]u8 = undefined;
     return switch (kind) {
-        .codex => blk: {
+        .codex, .grok => blk: {
             const path = configPath(&path_buf, home, kind) orelse break :blk false;
-            break :blk installCodexToml(allocator, path, kind);
+            break :blk installTomlMcp(allocator, path, kind);
         },
         .antigravity => blk: {
             const path = configPath(&path_buf, home, kind) orelse break :blk false;
@@ -368,6 +558,10 @@ pub fn install(allocator: std.mem.Allocator, home: []const u8, kind: McpAgent) b
             var legacy_buf: [576]u8 = undefined;
             const legacy = antigravityLegacyPath(&legacy_buf, home) orelse break :blk false;
             break :blk installJson(allocator, legacy, kind);
+        },
+        .opencode => blk: {
+            const path = configPath(&path_buf, home, kind) orelse break :blk false;
+            break :blk installOpencodeJson(allocator, path, kind);
         },
         else => blk: {
             const path = configPath(&path_buf, home, kind) orelse break :blk false;
@@ -379,9 +573,9 @@ pub fn install(allocator: std.mem.Allocator, home: []const u8, kind: McpAgent) b
 pub fn uninstall(allocator: std.mem.Allocator, home: []const u8, kind: McpAgent) bool {
     var path_buf: [576]u8 = undefined;
     return switch (kind) {
-        .codex => blk: {
+        .codex, .grok => blk: {
             const path = configPath(&path_buf, home, kind) orelse break :blk false;
-            break :blk uninstallCodexToml(allocator, path);
+            break :blk uninstallTomlMcp(allocator, path);
         },
         .antigravity => blk: {
             var ok = true;
@@ -390,6 +584,28 @@ pub fn uninstall(allocator: std.mem.Allocator, home: []const u8, kind: McpAgent)
             }
             var legacy_buf: [576]u8 = undefined;
             if (antigravityLegacyPath(&legacy_buf, home)) |legacy| {
+                if (fileExists(legacy)) ok = uninstallJson(allocator, legacy) and ok;
+            }
+            break :blk ok;
+        },
+        .opencode => blk: {
+            var ok = true;
+            if (configPath(&path_buf, home, kind)) |path| {
+                if (fileExists(path)) ok = uninstallOpencodeJson(allocator, path) and ok;
+            }
+            var jsonc_buf: [576]u8 = undefined;
+            if (opencodeJsoncPath(&jsonc_buf, home)) |jsonc| {
+                if (fileExists(jsonc)) ok = uninstallOpencodeJson(allocator, jsonc) and ok;
+            }
+            break :blk ok;
+        },
+        .devin => blk: {
+            var ok = true;
+            if (configPath(&path_buf, home, kind)) |path| {
+                if (fileExists(path)) ok = uninstallJson(allocator, path) and ok;
+            }
+            var legacy_buf: [576]u8 = undefined;
+            if (devinLegacyConfigPath(&legacy_buf, home)) |legacy| {
                 if (fileExists(legacy)) ok = uninstallJson(allocator, legacy) and ok;
             }
             break :blk ok;
@@ -410,6 +626,9 @@ pub fn fromHookName(name: []const u8) ?McpAgent {
     if (std.mem.eql(u8, name, "cursor") or std.mem.eql(u8, name, "cursor-agent")) return .cursor;
     if (std.mem.eql(u8, name, "junie")) return .junie;
     if (std.mem.eql(u8, name, "antigravity")) return .antigravity;
+    if (std.mem.eql(u8, name, "opencode") or std.mem.eql(u8, name, "open-code")) return .opencode;
+    if (std.mem.eql(u8, name, "devin")) return .devin;
+    if (std.mem.eql(u8, name, "grok")) return .grok;
     return null;
 }
 
@@ -459,6 +678,48 @@ test "cursor mcp json install detects current" {
     try t.expectEqual(Status.current, scanOne(a, home, .cursor));
     try t.expect(uninstall(a, home, .cursor));
     try t.expectEqual(Status.none, scanOne(a, home, .cursor));
+}
+
+test "opencode mcp uses local command array shape" {
+    const t = std.testing;
+    const a = t.allocator;
+    const home = ".zig-cache/petdex-agent-mcp-opencode";
+    plat.makeDir(home ++ "/.config/opencode");
+    plat.deleteFile(home ++ "/.config/opencode/opencode.json");
+
+    try t.expect(install(a, home, .opencode));
+    try t.expectEqual(Status.current, scanOne(a, home, .opencode));
+
+    var path_buf: [576]u8 = undefined;
+    const path = configPath(&path_buf, home, .opencode).?;
+    const written = readFileAlloc(a, path, 64 * 1024).?;
+    defer a.free(written);
+    try t.expect(std.mem.indexOf(u8, written, "\"type\": \"local\"") != null or std.mem.indexOf(u8, written, "\"type\":\"local\"") != null);
+    try t.expect(std.mem.indexOf(u8, written, "PETDEX_MCP_AGENT") != null);
+    try t.expect(std.mem.indexOf(u8, written, "opencode") != null);
+
+    try t.expect(uninstall(a, home, .opencode));
+    try t.expectEqual(Status.none, scanOne(a, home, .opencode));
+}
+
+test "devin mcp_config and grok toml install" {
+    const t = std.testing;
+    const a = t.allocator;
+    const home = ".zig-cache/petdex-agent-mcp-devin-grok";
+    plat.makeDir(home ++ "/.config/devin");
+    plat.makeDir(home ++ "/.grok");
+    plat.deleteFile(home ++ "/.config/devin/mcp_config.json");
+    plat.deleteFile(home ++ "/.grok/config.toml");
+
+    try t.expect(install(a, home, .devin));
+    try t.expectEqual(Status.current, scanOne(a, home, .devin));
+    try t.expect(install(a, home, .grok));
+    try t.expectEqual(Status.current, scanOne(a, home, .grok));
+
+    try t.expect(uninstall(a, home, .devin));
+    try t.expect(uninstall(a, home, .grok));
+    try t.expectEqual(Status.none, scanOne(a, home, .devin));
+    try t.expectEqual(Status.none, scanOne(a, home, .grok));
 }
 
 test "absent when agent home missing" {

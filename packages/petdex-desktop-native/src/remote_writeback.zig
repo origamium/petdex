@@ -38,7 +38,7 @@ pub const Output = struct {
 /// and writes (for pushback), as fake-home-relative paths. The remote
 /// path is always "~/" ++ rel, which is what keeps this table the
 /// single place that mapping can drift.
-const opencode_files = [_][]const u8{".config/opencode/plugins/petdex.js"};
+const opencode_files = [_][]const u8{".config/opencode/opencode.json"};
 const codex_files = [_][]const u8{ ".codex/hooks.json", ".codex/config.toml" };
 const hermes_files = [_][]const u8{
     ".hermes/config.yaml",
@@ -460,7 +460,7 @@ test "staging rejects paths that escape the private fake home" {
     try t.expect(!stageFetched(".zig-cache/petdex-wb-safe", "/absolute", "x"));
 }
 
-test "opencode writeback is the plugin alone, no hook script" {
+test "opencode writeback is the MCP config, no hook script" {
     if (@import("builtin").os.tag == .windows) return;
     const fake = ".zig-cache/petdex-wb-opencode";
     plat.makeDir(fake);
@@ -471,8 +471,9 @@ test "opencode writeback is the plugin alone, no hook script" {
     defer arena.deinit();
     const outs = collectOutputs(arena.allocator(), .opencode, fake, "", "~/.hermes").?;
     try t.expectEqual(@as(usize, 1), outs.len);
-    try t.expectEqualStrings("~/.config/opencode/plugins/petdex.js", outs[0].remote);
-    try t.expect(std.mem.indexOf(u8, outs[0].bytes, "HOOK_SERVER_URL") != null);
+    try t.expectEqualStrings("~/.config/opencode/opencode.json", outs[0].remote);
+    try t.expect(std.mem.indexOf(u8, outs[0].bytes, "PETDEX_MCP_AGENT") != null);
+    try t.expect(std.mem.indexOf(u8, outs[0].bytes, "mcp-server") != null);
     try t.expect(!outs[0].executable);
 }
 

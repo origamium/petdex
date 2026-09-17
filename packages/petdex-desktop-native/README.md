@@ -190,6 +190,10 @@ resets; click it again to close them.
   `~/.junie/mcp/mcp.json` so Junie can drive the pet over MCP.
 - **Cursor** and **Antigravity** install the same MCP server into their
   config files (`~/.cursor/mcp.json`, `~/.gemini/config/mcp_config.json`).
+- **OpenCode** installs MCP into `~/.config/opencode/opencode.json` (and
+  retires the older `plugins/petdex.js` event plugin).
+- **Devin CLI** writes `~/.config/devin/mcp_config.json`; **Grok CLI** uses
+  `~/.grok/config.toml` (`[mcp_servers.petdex]`, same shape as Codex).
 - **Copilot** and **Cursor** usage are asked every five minutes, with the
   sign-ins their own apps keep (`~/.config/github-copilot/apps.json`, Cursor's
   settings database).
@@ -280,7 +284,8 @@ Remote shell-exec agents (codex, hermes) invoke `~/.petdex/bin/petdex-hook` on
 the remote, where a small POSIX sh + curl script (`src/assets/petdex-remote-hook.sh`)
 mirrors the desktop hook runner's contract: stdin drain, killswitch
 (`~/.petdex/runtime/hooks-disabled`), token-gated POSTs to `127.0.0.1:7777`,
-never fails outward. The opencode plugin POSTs directly and works unchanged.
+never fails outward. Remote OpenCode drives the pet over MCP through the
+same tunnel (`opencode.json` on the remote).
 
 Notes:
 - SSH only; there is no API fallback transport. Windows remotes are out of scope.
