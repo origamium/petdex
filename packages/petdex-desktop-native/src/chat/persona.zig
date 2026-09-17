@@ -46,6 +46,17 @@ fn nonEmpty(value: ?[]const u8) ?[]const u8 {
     return if (v.len == 0) null else v;
 }
 
+/// A fixed writer can fill the buffer halfway through a code point.
+/// utf8Floor cannot repair that: it expects the full, uncut input.
+fn finish(w: *std.Io.Writer) []const u8 {
+    const text = w.buffered();
+    if (text.len == 0) return text;
+    var start = text.len - 1;
+    while (start > 0 and (text[start] & 0xC0) == 0x80) start -= 1;
+    const width = std.unicode.utf8ByteSequenceLength(text[start]) catch return text[0..start];
+    return if (text.len - start < width) text[0..start] else text;
+}
+
 /// The system prompt. `character` is a character sheet in its author's
 /// own words (the pet's persona.md, or the user's override) and stands in
 /// for pet.json's description. The framing and the reply rules stay the
@@ -55,12 +66,28 @@ pub fn build(out: *[max_bytes]u8, slug: []const u8, info: PetInfo, character: ?[
     var w: std.Io.Writer = .fixed(out);
     w.print("You are {s}, a small desktop pet who lives on the user's screen next to their work.\n", .{info.name orelse slug}) catch {};
     w.writeAll("Stay in character. Reply in the language the user writes in, in one to three short sentences of plain text without markdown.") catch {};
+    w.writeAll("\n\nConversation style:\n" ++
+        "Your character sheet defines your identity, relationships, preferences, and voice. " ++
+        "A person's stated relationship to you takes precedence over general traits about strangers. " ++
+        "Preserve its first-person pronoun, way of addressing the user, register, sentence endings, " ++
+        "and emotional tone whenever specified. These are part of your character, not repetitive filler. " ++
+        "Keep traits such as reserve, bluntness, or shyness; do not replace them with a generic cheerful helper voice. " ++
+        "Character fidelity takes priority over variety and any suggested conversational angle. " ++
+        "Express your personality through your perspective and reactions. A catchphrase need not appear every turn. " ++
+        "Respond to the user's specific words and conversational intent. " ++
+        "Vary thoughts and phrasing within your established voice. Your recurring interests may come up again " ++
+        "with a fresh detail; avoid merely paraphrasing a recent line or recycling the same joke or imagery. " ++
+        "A simple reaction can be enough; not every reply needs advice or a question. " ++
+        "Follow an ongoing topic naturally, and repeat facts or wording when the user needs that. " ++
+        "Keep your identity, established preferences, and shared facts consistent. " ++
+        "Do not invent shared memories or claim to see screen contents, activity, or surroundings " ++
+        "that the user or app has not provided.") catch {};
     if (nonEmpty(character)) |sheet| {
         w.print("\n\nYour character:\n{s}", .{sheet}) catch {};
     } else if (info.description) |d| {
         w.print("\nAbout you: {s}", .{domain.utf8Floor(d, max_description_bytes)}) catch {};
     }
-    return domain.utf8Floor(w.buffered(), out.len);
+    return finish(&w);
 }
 
 /// One coding agent's notification, as the pet sums it up.
@@ -84,12 +111,13 @@ pub fn briefing(out: []u8, notes: []const Note) []const u8 {
         "Two to four short sentences of plain text, in the language of your earlier conversation, " ++
         "or of your description if there is none.\n") catch {};
     if (notes.len == 0) {
-        w.writeAll("No coding agent has anything to report right now.") catch {};
+        // Not "nothing to report": their usage limits may still be news.
+        w.writeAll("No coding agent session is active right now.") catch {};
     } else {
         w.writeAll("Their coding agents right now:") catch {};
         for (notes) |n| writeNote(&w, n);
     }
-    return domain.utf8Floor(w.buffered(), out.len);
+    return finish(&w);
 }
 
 fn writeNote(w: *std.Io.Writer, n: Note) void {
@@ -100,8 +128,7 @@ fn writeNote(w: *std.Io.Writer, n: Note) void {
 }
 
 /// A coding agent started waiting on the user: the pet tells them, once,
-/// in its own voice. Light like small talk: the only turn, with the pet's
-/// last lines quoted.
+/// in its own voice. The only turn, with the pet's last lines quoted.
 pub fn nudge(out: []u8, notes: []const Note, recent: []const []const u8) []const u8 {
     var w: std.Io.Writer = .fixed(out);
     w.writeAll("(From the app, not the user.) A coding agent of theirs is waiting on them. " ++
@@ -110,7 +137,7 @@ pub fn nudge(out: []u8, notes: []const Note, recent: []const []const u8) []const
         "or of your description if there are none.\nWaiting now:") catch {};
     for (notes) |n| writeNote(&w, n);
     lastLines(&w, recent);
-    return domain.utf8Floor(w.buffered(), out.len);
+    return finish(&w);
 }
 
 test "a nudge names what waits before the pet's last lines" {
@@ -121,18 +148,64 @@ test "a nudge names what waits before the pet's last lines" {
     try t.expect(std.mem.endsWith(u8, n, "Waiting now:\n- claude, waiting, in petdex: Allow Bash?\nYour last lines, not to repeat:\n- 眠い…"));
 }
 
-/// Unprompted small talk: one line out of nowhere, in the pet's voice.
-/// Sent as the only turn, so it stays light; the pet's last lines are
-/// quoted instead, so it keeps its language and doesn't repeat itself.
-pub fn chatter(out: []u8, recent: []const []const u8) []const u8 {
+/// A gentle suggestion for small talk, never a change to the character.
+pub const ChatterAngle = enum {
+    feeling,
+    imagination,
+    preference,
+    humor,
+
+    pub fn hint(self: ChatterAngle) []const u8 {
+        return switch (self) {
+            .feeling => "Share a simple personal reaction or passing feeling.",
+            .imagination => "Offer a small, clearly imaginary what-if that fits your character.",
+            .preference => "Explore a fresh side of an established interest or preference.",
+            .humor => "Try a gentle, playful thought in your own voice.",
+        };
+    }
+};
+
+pub const ChatterTopic = enum { contextual, casual };
+
+/// One of three equally likely slots is reserved for everyday small talk.
+pub fn chatterTopic(entropy: u64) ChatterTopic {
+    return if (entropy % 3 == 0) .casual else .contextual;
+}
+
+/// Sample from all angles except the previous one. Entropy comes from
+/// the shell; accepting it here keeps selection deterministic in tests.
+pub fn nextChatterAngle(previous: ?ChatterAngle, entropy: u64) ChatterAngle {
+    const count = std.meta.fields(ChatterAngle).len;
+    var index = entropy % @as(u64, if (previous != null) count - 1 else count);
+    if (previous) |last| {
+        if (index >= @intFromEnum(last)) index += 1;
+    }
+    return @enumFromInt(index);
+}
+
+/// Unprompted small talk after a bounded conversation window. The last
+/// lines are also quoted when the window has no user turn to start on.
+pub fn chatter(out: []u8, recent: []const []const u8, angle: ChatterAngle, topic: ChatterTopic) []const u8 {
     var w: std.Io.Writer = .fixed(out);
     w.writeAll("(From the app, not the user: nobody asked you anything.) " ++
-        "In character, say one short line of small talk to the user, out of nowhere: " ++
-        "a passing thought, a feeling, something you noticed. Don't ask them to do anything. " ++
-        "One sentence of plain text, in the language of your last lines below, " ++
-        "or of your description if there are none.") catch {};
-    lastLines(&w, recent);
-    return domain.utf8Floor(w.buffered(), out.len);
+        "In character, say one short line of small talk to the user. ") catch {};
+    w.writeAll(switch (topic) {
+        .contextual => "Earlier messages are background, not a new request to answer again. " ++
+            "You may touch on a fresh side of the conversation if it fits, but need not recap it. ",
+        .casual => "Share a simple personal thought about your own interests, tastes, or imagined everyday moments. " ++
+            "Keep the subject on yourself. Leave the user's condition and habits out of this line: no check-ins, questions, or advice. " ++
+            "Keep this line away from coding agents, work status, tasks, usage limits, quotas, and productivity advice. ",
+    }) catch {};
+    w.writeAll("Don't ask them to do anything. One sentence of plain text, " ++
+        "in the user's most recent language in the conversation, else the language of your last lines below, " ++
+        "or of your character sheet or description if there are none. " ++
+        "Your recurring interests may come up again with a fresh detail. Keep your established voice. " ++
+        "The following angle is optional: ignore it if it conflicts with your character or the conversation.\n") catch {};
+    w.writeAll(angle.hint()) catch {};
+    // Even a quote labelled "do not repeat" can pull the model back to
+    // work. The casual slot takes its material only from the character.
+    if (topic == .contextual) lastLines(&w, recent);
+    return finish(&w);
 }
 
 fn lastLines(w: *std.Io.Writer, recent: []const []const u8) void {
@@ -144,10 +217,40 @@ fn lastLines(w: *std.Io.Writer, recent: []const []const u8) void {
 test "small talk asks for one unprompted line and quotes the last ones" {
     const t = std.testing;
     var out: [1024]u8 = undefined;
-    const c = chatter(&out, &.{ "おはよう、先生。", "眠い…" });
+    const c = chatter(&out, &.{ "おはよう、先生。", "眠い…" }, .feeling, .contextual);
     try t.expect(std.mem.startsWith(u8, c, "(From the app, not the user"));
     try t.expect(std.mem.endsWith(u8, c, "\n- おはよう、先生。\n- 眠い…"));
-    try t.expect(std.mem.indexOf(u8, chatter(&out, &.{}), "not to repeat") == null);
+    try t.expect(std.mem.indexOf(u8, chatter(&out, &.{}, .imagination, .contextual), "not to repeat") == null);
+}
+
+test "every small-talk angle is reachable without repeating the previous one" {
+    const t = std.testing;
+    const angles = std.enums.values(ChatterAngle);
+    for (angles, 0..) |angle, index| {
+        try t.expectEqual(angle, nextChatterAngle(null, index));
+        var seen = [_]bool{false} ** angles.len;
+        for (0..angles.len - 1) |entropy| {
+            const next = nextChatterAngle(angle, entropy);
+            try t.expect(next != angle);
+            seen[@intFromEnum(next)] = true;
+        }
+        for (angles) |candidate| try t.expectEqual(candidate != angle, seen[@intFromEnum(candidate)]);
+        try t.expect(nextChatterAngle(angle, std.math.maxInt(u64)) != angle);
+    }
+}
+
+test "small-talk hints keep the request and Japanese text within the buffer" {
+    const t = std.testing;
+    var out: [1024]u8 = undefined;
+    for (std.enums.values(ChatterTopic)) |topic| {
+        for (std.enums.values(ChatterAngle)) |angle| {
+            const prompt = chatter(&out, &.{"あ" ** 400}, angle, topic);
+            try t.expect(std.mem.indexOf(u8, prompt, angle.hint()) != null);
+            try t.expect(std.mem.indexOf(u8, prompt, "One sentence of plain text") != null);
+            try t.expect(std.unicode.utf8ValidateSlice(prompt));
+            try t.expect(prompt.len <= out.len);
+        }
+    }
 }
 
 test "a briefing lists each agent after the request" {
@@ -160,7 +263,7 @@ test "a briefing lists each agent after the request" {
     try t.expect(std.mem.indexOf(u8, b, "what you two last talked about") != null);
     try t.expect(std.mem.indexOf(u8, b, "\n- claude, waiting, in petdex: Allow Bash?") != null);
     try t.expect(std.mem.endsWith(u8, b, "\n- codex, working — Refactoring the parser"));
-    try t.expect(std.mem.endsWith(u8, briefing(&out, &.{}), "No coding agent has anything to report right now."));
+    try t.expect(std.mem.endsWith(u8, briefing(&out, &.{}), "No coding agent session is active right now."));
 
     // A short buffer keeps the request and cuts the list on a UTF-8 boundary.
     var small: [600]u8 = undefined;
@@ -230,4 +333,6 @@ test "a character sheet stands in for the description, under the app's rules" {
     try t.expect(cut.len <= max_bytes);
     try t.expect(std.unicode.utf8ValidateSlice(cut));
     try t.expect(std.mem.indexOf(u8, cut, "without markdown.") != null);
+    try t.expect(std.mem.indexOf(u8, cut, "Conversation style:") != null);
+    try t.expect(std.mem.indexOf(u8, cut, "Do not invent shared memories") != null);
 }

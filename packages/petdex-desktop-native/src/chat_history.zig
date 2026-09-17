@@ -63,12 +63,16 @@ pub const History = struct {
         stmt.bindText(4, @tagName(kind)) catch return false;
         stmt.bindInt(5, now_ms) catch return false;
         _ = stmt.step() catch return false;
+        // Bound user turns too: a failed or cancelled reply must not
+        // postpone retention until the next successful assistant turn.
+        self.prune(pet);
+        self.trim(total_limit);
         return true;
     }
 
     /// Keep this pet's newest `per_pet_limit` messages. With fewer rows
     /// the subquery is NULL and nothing matches.
-    pub fn prune(self: *History, pet: []const u8) void {
+    fn prune(self: *History, pet: []const u8) void {
         var stmt = self.db.prepare("DELETE FROM message WHERE pet = ?1 AND id < (SELECT id FROM message WHERE pet = ?1 ORDER BY id DESC LIMIT 1 OFFSET ?2)") catch return;
         defer stmt.finalize();
         stmt.bindText(1, pet) catch return;
@@ -188,7 +192,7 @@ test "a database from a newer app is left alone" {
     try t.expect(History.open(path) == null);
 }
 
-test "each pet keeps only its newest messages" {
+test "every append keeps only the pet's newest messages" {
     if (!sqlite.load()) return error.SkipZigTest;
     var h = History.open(":memory:").?;
     defer h.close();
@@ -199,8 +203,6 @@ test "each pet keeps only its newest messages" {
     }
     for (0..3) |_| try t.expect(h.append("droid", .user, "hey", .codex, 0));
     try h.db.exec("COMMIT;");
-    h.prune("boba");
-    h.prune("droid");
     try t.expectEqual(@as(i64, per_pet_limit), count(&h, "boba"));
     try t.expectEqual(@as(i64, 3), count(&h, "droid"));
 
@@ -212,6 +214,34 @@ test "each pet keeps only its newest messages" {
     var last_buf: [16]u8 = undefined;
     try t.expectEqualStrings(try std.fmt.bufPrint(&last_buf, "m{d}", .{per_pet_limit + 49}), tr.last().?.text);
     try t.expectEqual(domain.Role.assistant, tr.last().?.role);
+}
+
+test "user turns stay bounded even when no assistant reply succeeds" {
+    if (!sqlite.load()) return error.SkipZigTest;
+    var h = History.open(":memory:").?;
+    defer h.close();
+    for (0..per_pet_limit + 5) |i| {
+        try t.expect(h.append("boba", .user, "still waiting", .codex, @intCast(i)));
+        try t.expect(count(&h, "boba") <= per_pet_limit);
+    }
+    try t.expectEqual(@as(i64, per_pet_limit), count(&h, "boba"));
+    try t.expectEqual(@as(i64, 5), try h.db.scalarInt("SELECT min(created_ms) FROM message"));
+}
+
+test "the global limit is enforced on append without restarting" {
+    if (!sqlite.load()) return error.SkipZigTest;
+    var h = History.open(":memory:").?;
+    defer h.close();
+    // Fill many pets in one fixture query; each is under its own cap.
+    var sql: [512]u8 = undefined;
+    try h.db.exec(try std.fmt.bufPrintZ(&sql, "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < {d}) " ++
+        "INSERT INTO message (pet,role,content,provider,created_ms) " ++
+        "SELECT 'pet-' || n,'assistant','hello','codex',n FROM seq;", .{total_limit}));
+    try t.expect(h.append("new-pet", .assistant, "a casual thought", .openai_compat, total_limit + 1));
+    try t.expectEqual(@as(i64, total_limit), try h.db.scalarInt("SELECT count(*) FROM message"));
+    try t.expectEqual(@as(i64, 0), count(&h, "pet-1"));
+    try t.expectEqual(@as(i64, 1), count(&h, "pet-2"));
+    try t.expectEqual(@as(i64, 1), count(&h, "new-pet"));
 }
 
 test "the global cap and clear" {

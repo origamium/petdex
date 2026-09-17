@@ -14,6 +14,8 @@
 const std = @import("std");
 const hook_server = @import("hook_server.zig");
 const plat = @import("plat.zig");
+const usage = @import("usage.zig");
+const agent_hooks = @import("agent_hooks.zig");
 
 const jsonString = hook_server.jsonStringPub;
 
@@ -104,6 +106,10 @@ pub fn run(phase: []const u8, arg_agent: ?[]const u8, origin_app: plat.OriginApp
     const hosted = std.mem.eql(u8, agent, "codex");
     settings.focus_url = plat.safeWarpFocusUrl(warp_focus_raw) orelse
         (if (hosted) plat.warpFocusUrlOf("codex", jsonString(payload, "cwd") orelse "", &focus_buf) else null) orelse "";
+    // The account's limits ride Codex's rollout, current at a turn's end;
+    // the usage column reads what this leaves. The settings above were
+    // copied out of scan_buf, so it is free again.
+    if (hosted and isStopPhase(phase)) captureCodexLimits(payload, &scan_buf, home);
 
     var text_buf: [256]u8 = undefined;
     var text = formatBubble(phase, payload, &text_buf) orelse "";
@@ -161,6 +167,49 @@ pub fn run(phase: []const u8, arg_agent: ?[]const u8, origin_app: plat.OriginApp
         }
     }
     waitForPosts(posts[0..post_count]);
+}
+
+/// ponytail: the 64 KiB tail only. A turn ends with a token_count line, so
+/// it is near the end; when it isn't, the last value stands.
+fn captureCodexLimits(payload: []const u8, scan_buf: []u8, home: []const u8) void {
+    const path = jsonString(payload, "transcript_path") orelse return;
+    const line = plat.lastLineMatching(path, scan_buf, usage.carriesCodexLimits) orelse return;
+    usage.writeWindows(home, .codex, usage.windowsFromCodexLine(line) orelse return);
+}
+
+/// argv tail after "statusline": Claude Code's statusline command, wrapped
+/// (agent_hooks.installClaudeStatusline). Leaves the usage limits Claude
+/// Code hands it for the usage column, then runs the command it wrapped on
+/// the same input; that command's output is the status line.
+pub fn statusline(home: []const u8, environ_map: *const std.process.Environ.Map) void {
+    var stdin_buf: [stdin_cap]u8 = undefined;
+    const payload = readStdin(&stdin_buf);
+    if (usage.windowsFromClaudeStatusline(payload)) |windows| usage.writeWindows(home, .@"claude-code", windows);
+    runWrappedStatusline(home, payload, environ_map);
+}
+
+/// `environ_map` is passed on whole: spawned without one, the command
+/// would run with an empty environment, no HOME and no PATH.
+fn runWrappedStatusline(home: []const u8, payload: []const u8, environ_map: *const std.process.Environ.Map) void {
+    var path_buf: [512]u8 = undefined;
+    const path = agent_hooks.savedStatuslinePath(&path_buf, home) orelse return;
+    var saved_buf: [16 * 1024]u8 = undefined;
+    const saved = cReadFile(path, &saved_buf) orelse return;
+    // "null" when Claude Code had no statusline: nothing to run.
+    const Saved = struct { command: ?[]const u8 = null };
+    var parsed = std.json.parseFromSlice(Saved, std.heap.page_allocator, saved, .{ .ignore_unknown_fields = true }) catch return;
+    defer parsed.deinit();
+    const command = parsed.value.command orelse return;
+    var scope = plat.Scope.init();
+    defer scope.deinit();
+    const io = scope.io();
+    var child = std.process.spawn(io, .{ .argv = &.{ "/bin/sh", "-c", command }, .environ_map = environ_map, .stdin = .pipe }) catch return;
+    if (child.stdin) |stdin| {
+        stdin.writeStreamingAll(io, payload) catch {};
+        stdin.close(io);
+        child.stdin = null;
+    }
+    _ = child.wait(io) catch {};
 }
 
 /// The hook command identifies the agent that actually invoked this runner.

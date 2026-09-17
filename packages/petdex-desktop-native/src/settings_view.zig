@@ -1,5 +1,4 @@
-//! The Settings window's view tree: the pet picker, the Agents rows,
-//! the install banner, and every Appearance control.
+//! Category-based preferences, with the existing pet library kept intact.
 //!
 //! Extracted from main.zig (#613). Six of the last seven PRs to touch
 //! main.zig added a row here, so this was the busiest contended region
@@ -29,7 +28,6 @@ const catalog_len = &catalog_mod.catalog_len;
 const max_catalog = catalog_mod.max_catalog;
 const agent_hooks = @import("agent_hooks.zig");
 const remote_runtime = @import("remote_runtime.zig");
-const chat_view = @import("chat_view.zig");
 const i18n = @import("i18n.zig");
 const settingsBackground = app.settingsBackground;
 const companion_header_h = app.companion_header_h;
@@ -520,7 +518,94 @@ fn themePanel(ui: *AppUi, model: *const Model) AppUi.Node {
     });
 }
 
+/// Navigation is session state; changing pages never changes preferences.
+pub const Page = enum(u8) {
+    pets,
+    agents,
+    notifications,
+    appearance,
+    general,
+
+    pub fn title(self: Page) []const u8 {
+        return switch (self) {
+            .pets => i18n.t("Pets", "ペット"),
+            .agents => i18n.t("Connections", "連携"),
+            .notifications => i18n.t("Notifications", "通知"),
+            .appearance => i18n.t("Appearance", "外観"),
+            .general => i18n.t("General", "一般"),
+        };
+    }
+
+    fn caption(self: Page) []const u8 {
+        return switch (self) {
+            .pets => i18n.t("Your collection, always close by.", "お気に入りのペットを、いつもそばに。"),
+            .agents => i18n.t("Connect the coding agents you work with.", "一緒に働くコーディングエージェントを接続。"),
+            .notifications => i18n.t("Choose how agent activity stays on screen.", "エージェントの動きをどう表示するか調整。"),
+            .appearance => i18n.t("Make Petdex comfortable to read.", "Petdexを、自分にとって読みやすく。"),
+            .general => i18n.t("Startup and app updates.", "アプリの起動とアップデート。"),
+        };
+    }
+};
+
+fn sidebar(ui: *AppUi, model: *const Model) AppUi.Node {
+    var tabs: [5]AppUi.Node = undefined;
+    for (std.enums.values(Page), &tabs) |page, *tab| {
+        tab.* = ui.el(.list_item, .{
+            .height = 40,
+            .padding = 12,
+            .cross = .center,
+            .selected = model.settings_page == page,
+            .on_press = Msg{ .set_settings_page = @intFromEnum(page) },
+            .style_tokens = .{ .background = if (model.settings_page == page) .surface else .surface_subtle, .radius = .md },
+            .semantics = .{ .label = page.title() },
+        }, .{ui.text(.{ .size = .sm }, page.title())});
+    }
+    var rail = ui.el(.panel, .{ .width = 148, .style_tokens = .{ .background = .surface_subtle } }, .{ui.column(.{ .grow = 1, .padding = 12, .gap = 6 }, .{
+        ui.column(.{ .padding = 8, .gap = 4 }, .{
+            ui.text(.{ .size = .lg }, "Petdex"),
+            ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, i18n.t("Settings", "設定")),
+        }),
+        ui.el(.stack, .{ .height = 12 }, .{}),
+        ui.column(.{ .gap = 4 }, @as([]const AppUi.Node, &tabs)),
+        ui.el(.stack, .{ .grow = 1 }, .{}),
+        ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .open_chat_options }, i18n.t("Chat options…", "チャットの設定…")),
+    })});
+    rail.widget.style.radius = 0;
+    rail.widget.style.stroke_width = 0;
+    return rail;
+}
+
 pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: ThumbAtlas, cloud_images: CloudImages) AppUi.Node {
+    const content = switch (model.settings_page) {
+        .pets => petsPage(ui, model, thumbs, cloud_images),
+        .agents => ui.column(.{ .gap = 12 }, .{ agentsSection(ui, model, icons), herdrSection(ui, model, icons), remoteSection(ui, model) }),
+        .notifications => notificationsPage(ui, model),
+        .appearance => appearancePage(ui, model),
+        .general => generalPage(ui, model),
+    };
+    const page = ui.column(.{ .grow = 1 }, .{
+        ui.column(.{ .padding = 20, .gap = 6 }, .{
+            ui.text(.{ .size = .lg }, model.settings_page.title()),
+            mutedParagraph(ui, model.settings_page.caption()),
+        }),
+        ui.scroll(.{ .grow = 1, .value = model.settings_scroll, .on_scroll = AppUi.scrollMsg(.settings_scrolled) }, .{
+            ui.column(.{ .padding = 20, .gap = 12 }, .{
+                content,
+                ui.el(.stack, .{ .height = 12 }, .{}),
+            }),
+        }),
+    });
+    var root = ui.el(.panel, .{ .grow = 1 }, .{ui.column(.{ .grow = 1 }, .{
+        ui.el(.stack, .{ .height = companion_header_h, .window_drag = true }, .{}),
+        ui.row(.{ .grow = 1 }, .{ sidebar(ui, model), page }),
+    })});
+    root.widget.style.background = settingsBackground(model);
+    root.widget.style.radius = 0;
+    root.widget.style.stroke_width = 0;
+    return root;
+}
+
+fn petsPage(ui: *AppUi, model: *const Model, thumbs: ThumbAtlas, cloud_images: CloudImages) AppUi.Node {
     var rows: [max_catalog]AppUi.Node = undefined;
     var shown: usize = 0;
     var matches: usize = 0;
@@ -588,11 +673,7 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
         }
     }
     const scale_fraction: f32 = (model.scale - app.min_scale) / (app.max_scale - app.min_scale);
-    const bubble_text_fraction: f32 = (model.bubble_text_px - bubble_text_min_px) / (bubble_text_max_px - bubble_text_min_px);
-    // One scrollable page: the root scroll takes the window frame and
-    // everything - full pet catalog included - flows inside it. No
-    // more per-section band budgets.
-    const page = ui.scroll(.{ .grow = 1, .value = model.settings_scroll, .on_scroll = AppUi.scrollMsg(.settings_scrolled) }, .{ui.column(.{ .padding = 12, .gap = 10 }, .{
+    return ui.column(.{ .gap = 10 }, .{
         cloudLibrarySection(ui, model, cloud_images),
         petsTop(ui, model, filter),
         // Search-first catalog: six rows collapsed, the whole catalog
@@ -609,17 +690,6 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
             ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, if (model.pet_source == .installed) i18n.t("No installed pets match your search", "一致するインストール済みのペットはありません") else i18n.t("No pets match your search", "一致するペットはありません"))
         else
             ui.el(.stack, .{}, .{}),
-        ui.el(.stack, .{ .height = 10 }, .{}),
-        ui.text(.{ .size = .lg }, i18n.t("Agents", "エージェント")),
-        agentsSection(ui, model, icons),
-        herdrSection(ui, model, icons),
-        remoteSection(ui, model),
-        ui.el(.stack, .{ .height = 10 }, .{}),
-        chat_view.settingsSection(ui, model),
-        ui.el(.stack, .{ .height = 10 }, .{}),
-        ui.text(.{ .size = .lg }, i18n.t("Appearance", "外観")),
-        languagePanel(ui, model),
-        themePanel(ui, model),
         ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
                 ui.column(.{ .grow = 1 }, .{
@@ -632,45 +702,32 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
         ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
                 ui.column(.{ .grow = 1 }, .{
-                    ui.text(.{}, i18n.t("Bubble text size", "吹き出しの文字サイズ")),
-                    mutedParagraph(ui, i18n.t("Size of the bubble text", "吹き出しに表示する文字の大きさ")),
+                    ui.text(.{}, i18n.t("Rotate pet daily", "毎日ペットを入れ替える")),
+                    mutedParagraph(ui, i18n.t("Wake up to a different pet each day", "毎日違うペットに会えます")),
                 }),
-                ui.el(.slider, .{ .width = 150, .value = bubble_text_fraction, .on_value = AppUi.valueMsg(.set_bubble_text_size), .semantics = .{ .label = i18n.t("Bubble text size", "吹き出しの文字サイズ") } }, .{}),
-            }),
-        }),
-        ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
-            ui.column(.{ .padding = 12, .gap = 8 }, .{
-                ui.text(.{}, i18n.t("Custom font file", "カスタムフォントファイル")),
-                mutedParagraph(ui, if (model.font_load_failed)
-                    i18n.t("Could not load this TrueType font; the default font is active", "このTrueTypeフォントを読み込めませんでした。標準のフォントを使用しています")
-                else if (model.font_path_dirty)
-                    i18n.t("Saved; restart Petdex to apply", "保存しました。Petdexを再起動すると反映されます")
-                else if (custom_font_active.*)
-                    i18n.t("Applied to all app text; restart after changing the path", "アプリのすべての文字に適用中。パスを変えたら再起動してください")
-                else
-                    i18n.t("Optional local .ttf path; leave empty for the default font", "ローカルの.ttfファイルのパス。空欄なら標準のフォントを使います")),
-                ui.el(.input, .{
-                    .height = 34,
-                    .text = model.font_path.text(),
-                    .on_input = AppUi.inputMsg(.font_path_input),
-                    .placeholder = "/path/to/font.ttf",
-                    .semantics = .{ .label = i18n.t("Custom font file path", "カスタムフォントファイルのパス") },
+                ui.el(.switch_control, .{
+                    .selected = model.rotate_pets,
+                    .on_toggle = .toggle_rotate_pets,
+                    .semantics = .{ .label = i18n.t("Rotate pet daily", "毎日ペットを入れ替える") },
                 }, .{}),
             }),
         }),
         ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
                 ui.column(.{ .grow = 1 }, .{
-                    ui.text(.{}, i18n.t("Show messages", "メッセージを表示")),
-                    mutedParagraph(ui, i18n.t("Agent activity bubbles over the pet", "エージェントの動きをペットの吹き出しで表示")),
+                    ui.text(.{}, i18n.t("Custom pets", "カスタムペット")),
+                    ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, "~/.petdex/pets"),
                 }),
-                ui.el(.switch_control, .{
-                    .selected = model.bubbles_enabled,
-                    .on_toggle = .toggle_bubbles,
-                    .semantics = .{ .label = i18n.t("Show messages", "メッセージを表示") },
-                }, .{}),
+                ui.button(.{ .on_press = .open_pets_folder }, i18n.t("Open folder", "フォルダを開く")),
             }),
         }),
+    });
+}
+
+fn notificationsPage(ui: *AppUi, model: *const Model) AppUi.Node {
+    const bubble_text_fraction: f32 = (model.bubble_text_px - bubble_text_min_px) / (bubble_text_max_px - bubble_text_min_px);
+    return ui.column(.{ .gap = 12 }, .{
+        mutedParagraph(ui, i18n.t("Show or hide notifications, usage limits and Flock from the pet’s menu or the menu bar.", "通知・利用上限・フロックの表示は、ペットの右クリックかメニューバーから切り替えられます。")),
         ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
                 ui.column(.{ .grow = 1 }, .{
@@ -702,21 +759,47 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
         ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
                 ui.column(.{ .grow = 1 }, .{
-                    ui.text(.{}, i18n.t("Rotate pet daily", "毎日ペットを入れ替える")),
-                    mutedParagraph(ui, i18n.t("Wake up to a different pet each day", "毎日違うペットに会えます")),
+                    ui.text(.{}, i18n.t("Bubble text size", "吹き出しの文字サイズ")),
+                    mutedParagraph(ui, i18n.t("Size of the bubble text", "吹き出しに表示する文字の大きさ")),
                 }),
-                ui.el(.switch_control, .{
-                    .selected = model.rotate_pets,
-                    .on_toggle = .toggle_rotate_pets,
-                    .semantics = .{ .label = i18n.t("Rotate pet daily", "毎日ペットを入れ替える") },
+                ui.el(.slider, .{ .width = 150, .value = bubble_text_fraction, .on_value = AppUi.valueMsg(.set_bubble_text_size), .semantics = .{ .label = i18n.t("Bubble text size", "吹き出しの文字サイズ") } }, .{}),
+            }),
+        }),
+    });
+}
+
+fn appearancePage(ui: *AppUi, model: *const Model) AppUi.Node {
+    return ui.column(.{ .gap = 12 }, .{
+        themePanel(ui, model),
+        languagePanel(ui, model),
+        ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
+            ui.column(.{ .padding = 12, .gap = 8 }, .{
+                ui.text(.{}, i18n.t("Custom font file", "カスタムフォントファイル")),
+                mutedParagraph(ui, if (model.font_load_failed)
+                    i18n.t("Could not load this TrueType font; the default font is active", "このTrueTypeフォントを読み込めませんでした。標準のフォントを使用しています")
+                else if (model.font_path_dirty)
+                    i18n.t("Saved; restart Petdex to apply", "保存しました。Petdexを再起動すると反映されます")
+                else if (custom_font_active.*)
+                    i18n.t("Applied to all app text; restart after changing the path", "アプリのすべての文字に適用中。パスを変えたら再起動してください")
+                else
+                    i18n.t("Optional local .ttf path; leave empty for the default font", "ローカルの.ttfファイルのパス。空欄なら標準のフォントを使います")),
+                ui.el(.input, .{
+                    .height = 34,
+                    .text = model.font_path.text(),
+                    .on_input = AppUi.inputMsg(.font_path_input),
+                    .placeholder = "/path/to/font.ttf",
+                    .semantics = .{ .label = i18n.t("Custom font file path", "カスタムフォントファイルのパス") },
                 }, .{}),
             }),
         }),
-        // Login items ride SMAppService, so like the Dock row this one
-        // only exists on macOS.
+    });
+}
+
+fn generalPage(ui: *AppUi, model: *const Model) AppUi.Node {
+    return ui.column(.{ .gap = 12 }, .{
         if (builtin.os.tag == .macos)
-            ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
-                ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
+            ui.el(.panel, .{ .padding = 12, .style_tokens = .{ .background = .surface, .radius = .md } }, .{
+                ui.row(.{ .cross = .center, .gap = 12 }, .{
                     ui.column(.{ .grow = 1 }, .{
                         ui.text(.{}, i18n.t("Launch at login", "ログイン時に起動")),
                         mutedParagraph(ui, i18n.t("Start Petdex when you log in", "ログインしたときにPetdexを起動します")),
@@ -730,14 +813,12 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
             })
         else
             ui.el(.stack, .{}, .{}),
-        // Dock presence is an AppKit concept; other platforms have no
-        // equivalent toggle to offer, so the row only exists on macOS.
         if (builtin.os.tag == .macos)
-            ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
-                ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
+            ui.el(.panel, .{ .padding = 12, .style_tokens = .{ .background = .surface, .radius = .md } }, .{
+                ui.row(.{ .cross = .center, .gap = 12 }, .{
                     ui.column(.{ .grow = 1 }, .{
                         ui.text(.{}, i18n.t("Hide Dock icon", "Dockにアイコンを表示しない")),
-                        mutedParagraph(ui, i18n.t("Petdex lives in the menu bar only", "Petdexはメニューバーにだけ表示されます")),
+                        mutedParagraph(ui, i18n.t("Keep Petdex in the menu bar", "Petdexをメニューバーだけに表示します")),
                     }),
                     ui.el(.switch_control, .{
                         .selected = model.hide_dock,
@@ -748,40 +829,8 @@ pub fn settingsView(ui: *AppUi, model: *const Model, icons: IconAtlas, thumbs: T
             })
         else
             ui.el(.stack, .{}, .{}),
-        ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
-            ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
-                ui.column(.{ .grow = 1 }, .{
-                    ui.text(.{}, i18n.t("Waiting sound", "待機中の通知音")),
-                    mutedParagraph(ui, i18n.t("Play a chime when your agent is waiting for your input", "エージェントが入力を待っているときにチャイムを鳴らします")),
-                }),
-                ui.el(.switch_control, .{
-                    .selected = model.waiting_sound,
-                    .on_toggle = .toggle_waiting_sound,
-                    .semantics = .{ .label = i18n.t("Waiting sound", "待機中の通知音") },
-                }, .{}),
-            }),
-        }),
-        ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
-            ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
-                ui.column(.{ .grow = 1 }, .{
-                    ui.text(.{}, i18n.t("Custom pets", "カスタムペット")),
-                    ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, "~/.petdex/pets"),
-                }),
-                ui.button(.{ .on_press = .open_pets_folder }, i18n.t("Open folder", "フォルダを開く")),
-            }),
-        }),
-        ui.el(.stack, .{ .height = 10 }, .{}),
         updatesSection(ui, model),
-        // Trailing spacer: the column's own bottom padding is not part
-        // of the scroll extent, so the last card needs explicit air.
-        ui.el(.stack, .{ .height = 8 }, .{}),
-    })});
-    var root = ui.column(.{ .grow = 1 }, .{
-        ui.el(.stack, .{ .height = companion_header_h, .window_drag = true }, .{}),
-        page,
     });
-    root.widget.style.background = settingsBackground(model);
-    return root;
 }
 
 test "settings descriptions use wrapped paragraphs" {

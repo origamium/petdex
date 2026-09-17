@@ -235,6 +235,14 @@ pub fn fileSize(path: []const u8) ?u64 {
     return stat.size;
 }
 
+/// Last modification, in nanoseconds; null when the path is missing.
+pub fn fileMtime(path: []const u8) ?i96 {
+    var scope = Scope.init();
+    defer scope.deinit();
+    const stat = std.Io.Dir.cwd().statFile(scope.io(), path, .{}) catch return null;
+    return stat.mtime.toNanoseconds();
+}
+
 pub fn dirExists(path: []const u8) bool {
     var scope = Scope.init();
     defer scope.deinit();

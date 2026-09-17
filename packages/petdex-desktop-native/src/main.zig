@@ -33,10 +33,12 @@ const i18n = @import("i18n.zig");
 const chat = @import("chat/chat.zig");
 const chat_history = @import("chat_history.zig");
 const chat_shell = @import("chat_shell.zig");
+const timer_shell = @import("timer_shell.zig");
 const chat_view = @import("chat_view.zig");
 pub const desktop_auth = @import("desktop_auth.zig");
 const flock_mod = @import("flock.zig");
 const bubble_sim = @import("bubble_sim.zig");
+const usage_mod = @import("usage.zig");
 pub const updates = @import("updates.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
@@ -103,6 +105,9 @@ pub const Msg = union(enum) {
     frame_clock,
     cycle_state,
     open_settings,
+    open_chat_options,
+    close_chat_options,
+    set_settings_page: u32,
     settings_closed,
     close_pet,
     select_pet: u32,
@@ -115,6 +120,10 @@ pub const Msg = union(enum) {
     toggle_bubbles,
     toggle_bubbles_per_conversation,
     toggle_waiting_sound,
+    toggle_usage_limits,
+    usage_select: u32,
+    usage_copilot_response: native_sdk.EffectResponse,
+    usage_cursor_response: native_sdk.EffectResponse,
     chime_done: native_sdk.EffectExit,
     set_bubble_text_size: f32,
     bubble_lifetime_input: canvas.TextInputEvent,
@@ -168,6 +177,19 @@ pub const Msg = union(enum) {
     auth_library_done: native_sdk.EffectExit,
     clear_notifications,
     // Pet chat (chat_shell.zig).
+    timer_visibility,
+    timer_toggle,
+    timer_reset,
+    timer_mode: @import("timer.zig").Mode,
+    timer_options,
+    timer_scrolled: canvas.ScrollState,
+    timer_auto,
+    timer_speak,
+    timer_work: canvas.TextInputEvent,
+    timer_short: canvas.TextInputEvent,
+    timer_long: canvas.TextInputEvent,
+    timer_minutes: canvas.TextInputEvent,
+    timer_seconds: canvas.TextInputEvent,
     open_chat,
     show_chat,
     chat_brief,
@@ -201,7 +223,7 @@ pub const Msg = union(enum) {
     hook_press,
     noop,
 
-    pub const view_unbound = .{ "frame_tick", "poll_tick", "bubble_tick", "frame_clock", "cycle_state", "native_drag_watchdog", "chime_done", "quit_app", "toggle_focus_mode", "shuffle_pet", "dsh_install_done", "dsh_remove_done", "remote_line", "remote_done", "remote_backoff", "update_boot_check", "update_response", "homebrew_done", "homebrew_timeout", "brew_command_copied", "auth_token_response", "auth_avatar_response", "auth_preview_response", "auth_library_done", "chat_line", "chat_response", "chat_models_response", "chatgpt_token_response" };
+    pub const view_unbound = .{ "frame_tick", "poll_tick", "bubble_tick", "frame_clock", "cycle_state", "native_drag_watchdog", "chime_done", "quit_app", "toggle_focus_mode", "shuffle_pet", "dsh_install_done", "dsh_remove_done", "remote_line", "remote_done", "remote_backoff", "update_boot_check", "update_response", "homebrew_done", "homebrew_timeout", "brew_command_copied", "auth_token_response", "auth_avatar_response", "auth_preview_response", "auth_library_done", "chat_line", "chat_response", "chat_models_response", "chatgpt_token_response", "usage_copilot_response", "usage_cursor_response" };
 };
 
 pub const Model = struct {
@@ -283,6 +305,8 @@ pub const Model = struct {
     press_ms: i64 = 0,
     pat_flip: bool = false,
     settings_open: bool = false,
+    settings_page: settings_view.Page = .pets,
+    chat_options_open: bool = false,
     /// Sprite scale, persisted. The settings slider maps min_scale..
     /// max_scale over this.
     scale: f32 = 0.7,
@@ -308,6 +332,16 @@ pub const Model = struct {
     /// follow-up ping already fired (see waiting_escalation_ms).
     waiting_since_ms: i64 = 0,
     waiting_escalated: bool = false,
+    /// The usage column beside the pet (usage.zig). Off by default:
+    /// turning it on wraps Claude Code's statusline.
+    usage_limits: bool = false,
+    usage: usage_mod.State = .{},
+    /// The usage window has been moved beside the pet since it opened;
+    /// until then it stays invisible.
+    usage_placed: bool = false,
+    /// The column sits right of the pet, so a row's breakdown opens on its
+    /// far side, the column staying next to the pet.
+    usage_right: bool = false,
     /// Bubble text size in points, persisted. The bubble rendered at a
     /// fixed 13 (the `.sm` rung); this keeps 13 as the floor and lets
     /// the settings slider raise it to 20.
@@ -397,6 +431,7 @@ pub const Model = struct {
     auth_preview_next: usize = 0,
     auth_preview_ready: [12]bool = @splat(false),
     chat: chat_shell.State = .{},
+    timer: timer_shell.State = .{},
 };
 
 /// Petdex web tokens (globals.css) translated from OKLCH: brand purple
@@ -468,7 +503,8 @@ fn onAppearance(appearance: native_sdk.platform.Appearance) ?Msg {
 
 // Catalog table and slug lookup live in catalog.zig (#613).
 const catalog_mod = @import("catalog.zig");
-const settings_view = @import("settings_view.zig");
+pub const settings_view = @import("settings_view.zig");
+const navigation = @import("navigation.zig");
 pub const max_catalog = catalog_mod.max_catalog;
 pub const CatalogEntry = catalog_mod.CatalogEntry;
 const catalogIndexOf = catalog_mod.catalogIndexOf;
@@ -914,6 +950,9 @@ fn drainPendingInstall(model: *Model, fx: *Effects) void {
     // in front of the user, so the progress banner would render into a
     // closed Settings page. Opening it is the whole feedback channel.
     if (model.install.busy() or model.install.error_len > 0) {
+        model.settings_page = .pets;
+        model.chat_options_open = false;
+        model.settings_scroll = 0;
         if (!model.settings_open) {
             model.settings_open = true;
             loadAgentsAtlas(model.dark, fx);
@@ -1412,7 +1451,7 @@ fn saveSettings(model: *const Model) void {
 // whole save): keep room for the configurable bubble fields, rotation
 // state, a long slug, and negative coordinates. Grown with every key
 // added; `font_path` alone can escape to 1024.
-const settings_json_bytes = 2360;
+const settings_json_bytes = 2384;
 
 fn settingsJson(model: *const Model, buf: []u8) ?[]const u8 {
     const active = if (model.active_pet < catalog_mod.catalog_len) catalog[model.active_pet].slice() else "";
@@ -1429,7 +1468,7 @@ fn settingsJson(model: *const Model, buf: []u8) ?[]const u8 {
     const font_path = std.mem.trim(u8, model.font_path.text(), " \t\r\n");
     const escaped_font = jsonEscapeString(font_path, &escaped_font_buf) orelse return null;
     const latest = model.latest_version[0..model.latest_version_len];
-    return std.fmt.bufPrint(buf, "{{\"active_pet\":\"{s}\",\"scale\":{d:.2},\"bubbles\":{},\"bubbles_per_conversation\":{},\"waiting_sound\":{},\"bubble_text\":{d:.1},\"bubble_lifetime\":{d:.0},\"font_path\":\"{s}\",\"hide_dock\":{},\"rotate_pets\":{},\"rotation_day\":{d},\"update_checks\":{},\"last_update_check_ms\":{d},\"latest_desktop_version\":\"{s}\"{s},\"agents_prompted\":{},\"language\":\"{s}\",\"theme\":\"{s}\"}}", .{ active, model.scale, model.bubbles_enabled, model.bubbles_per_conversation, model.waiting_sound, model.bubble_text_px, model.bubble_lifetime_secs, escaped_font, model.hide_dock, model.rotate_pets, model.rotation_day, model.update_checks_enabled, model.last_update_check_ms, latest, pos, model.agents_prompted, @tagName(model.language), @tagName(model.theme) }) catch null;
+    return std.fmt.bufPrint(buf, "{{\"active_pet\":\"{s}\",\"scale\":{d:.2},\"bubbles\":{},\"bubbles_per_conversation\":{},\"waiting_sound\":{},\"usage_limits\":{},\"bubble_text\":{d:.1},\"bubble_lifetime\":{d:.0},\"font_path\":\"{s}\",\"hide_dock\":{},\"rotate_pets\":{},\"rotation_day\":{d},\"update_checks\":{},\"last_update_check_ms\":{d},\"latest_desktop_version\":\"{s}\"{s},\"agents_prompted\":{},\"language\":\"{s}\",\"theme\":\"{s}\"}}", .{ active, model.scale, model.bubbles_enabled, model.bubbles_per_conversation, model.waiting_sound, model.usage_limits, model.bubble_text_px, model.bubble_lifetime_secs, escaped_font, model.hide_dock, model.rotate_pets, model.rotation_day, model.update_checks_enabled, model.last_update_check_ms, latest, pos, model.agents_prompted, @tagName(model.language), @tagName(model.theme) }) catch null;
 }
 
 fn setUnsignedText(buffer: []u8, length: *usize, value: u16) void {
@@ -1569,7 +1608,7 @@ fn applyTheme(model: *Model, fx: *Effects) void {
     registerTail(model.dark, fx);
     // The strip is themed, so bubbles drawing from it have to re-pack on
     // an appearance flip exactly like settings does.
-    if (model.settings_open or model.bubbles_len > 0) loadAgentsAtlas(model.dark, fx);
+    if (model.settings_open or model.bubbles_len > 0 or usageActive(model)) loadAgentsAtlas(model.dark, fx);
 }
 
 test "the theme follows the system only under auto" {
@@ -1590,6 +1629,7 @@ var initial_pet: u32 = 0;
 var initial_bubbles: bool = true;
 var initial_bubbles_per_conversation: bool = true;
 var initial_waiting_sound: bool = false;
+var initial_usage_limits: bool = false;
 var initial_bubble_text_px: f32 = bubble_text_default_px;
 var initial_bubble_lifetime_secs: f32 = bubble_lifetime_default_secs;
 var initial_hide_dock: bool = false;
@@ -1682,6 +1722,8 @@ const extra_agents = [_]ExtraAgent{
     .{ .names = &.{ "kilo", "kilocode", "kilo-code" }, .display = "Kilo Code", .art = @embedFile("assets/agents/kilo.png") },
     .{ .names = &.{"grok"}, .display = "Grok", .art = @embedFile("assets/agents/grok.png") },
     .{ .names = &.{ "mastracode", "mastra" }, .display = "Mastra Code", .art = @embedFile("assets/agents/mastracode.png") },
+    // The usage column's; Octicons' copilot mark (MIT) on a tile.
+    .{ .names = &.{"copilot"}, .display = "Copilot", .art = @embedFile("assets/agents/copilot.png") },
 };
 const extra_icon_base = agent_fallback_index + 1;
 
@@ -1946,6 +1988,10 @@ fn resolveInitialPet(io: std.Io, allocator: std.mem.Allocator, environ_map: *std
             // only an explicit true (never a missing key) enables it.
             if (std.mem.indexOf(u8, json, "\"waiting_sound\":true") != null) {
                 initial_waiting_sound = true;
+            }
+            // Opt-in: it edits Claude Code's settings.
+            if (std.mem.indexOf(u8, json, "\"usage_limits\":true") != null) {
+                initial_usage_limits = true;
             }
             // Opt-in like the sound: only an explicit true hides the
             // Dock icon, a missing key keeps the stock behavior.
@@ -2267,6 +2313,7 @@ pub fn boot(model: *Model, fx: *Effects) void {
     }
     loadAuthSession(model, fx);
     chat_shell.boot(model);
+    timer_shell.boot(model);
     fx.startTimer(.{
         .key = poll_timer_key,
         .interval_ms = poll_interval_ms,
@@ -2280,6 +2327,7 @@ pub fn boot(model: *Model, fx: *Effects) void {
     model.scale = initial_scale;
     model.language = initial_language;
     model.theme = initial_theme;
+    model.dark = resolveDark(model.theme, model.system_dark);
     model.bubbles_enabled = initial_bubbles;
     model.bubbles_per_conversation = initial_bubbles_per_conversation;
     model.waiting_sound = initial_waiting_sound;
@@ -2308,6 +2356,9 @@ pub fn boot(model: *Model, fx: *Effects) void {
         model.agents = agent_hooks.scan(boot_allocator, home);
         model.herdr_status = herdr_status.detect(boot_allocator, home);
     }
+    model.usage_limits = initial_usage_limits and usage_supported;
+    // Wrapped again if something replaced it since (a plugin update).
+    syncClaudeStatusline(model);
     loadAgentsAtlas(model.dark, fx);
 
     // First point where the platform codec is reachable: `init_fx` runs
@@ -2401,6 +2452,25 @@ fn setThrowState(model: *Model, state: State, fx: *Effects) void {
     model.frame_index = 0;
     registerStateFrames(state, fx);
     armFrameTimer(model, fx);
+}
+
+fn openChatOptions(model: *Model) void {
+    model.chat_options_open = true;
+    model.settings_scroll = 0;
+    model.settings_open = true;
+}
+
+fn closeChatOptions(model: *Model) void {
+    model.chat_options_open = false;
+    model.settings_open = false;
+    model.settings_scroll = 0;
+}
+
+fn selectSettingsPage(model: *Model, raw: u32) bool {
+    const page = std.enums.fromInt(settings_view.Page, raw) orelse return false;
+    model.settings_page = page;
+    model.settings_scroll = 0;
+    return true;
 }
 
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
@@ -2556,6 +2626,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             _ = agent_hooks.uninstall(boot_allocator, home, model.agents[index].kind);
             if (model.agents[index].kind == .codex) model.codex_trust_note = false;
             model.agents = agent_hooks.scan(boot_allocator, home);
+            syncClaudeStatusline(model);
         },
         .install_agent => |index| {
             if (index >= agent_hooks.agent_count) return;
@@ -2595,6 +2666,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             };
             if (ok and kind == .codex) model.codex_trust_note = true;
             model.agents = agent_hooks.scan(boot_allocator, home);
+            syncClaudeStatusline(model);
         },
         .dsh_install_done => |exit| {
             model.dsh_busy = false;
@@ -2616,6 +2688,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
         },
         .open_settings => {
+            if (model.chat_options_open) model.settings_scroll = 0;
+            model.chat_options_open = false;
             if (env_home) |home| {
                 model.agents = agent_hooks.scan(boot_allocator, home);
                 model.herdr_status = herdr_status.detect(boot_allocator, home);
@@ -2633,6 +2707,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 return;
             }
             model.settings_open = true;
+        },
+        .open_chat_options => {
+            openChatOptions(model);
+            fx.focusWindow(settings_window_label);
+        },
+        .close_chat_options => {
+            closeChatOptions(model);
+            update(model, .show_chat, fx);
+        },
+        .set_settings_page => |raw| {
+            if (!selectSettingsPage(model, raw)) return;
+            if (!model.settings_open or model.chat_options_open) update(model, .open_settings, fx) else fx.focusWindow(settings_window_label);
         },
         .auth_sign_in => {
             if (!desktop_auth.available or model.auth.phase == .authorizing or model.auth.phase == .exchanging) return;
@@ -2741,7 +2827,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.auth.refreshing = false;
             startAuthImages(model, fx);
         },
-        .settings_closed => model.settings_open = false,
+        .settings_closed => {
+            model.settings_open = false;
+            model.chat_options_open = false;
+            model.settings_scroll = 0;
+        },
         .clear_notifications => clearBubble(model),
         .reset_position => resetPetPosition(model, fx),
         .set_language => |raw| {
@@ -2780,6 +2870,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .chatgpt_sign_out,
         .chatgpt_token_response,
         => chat_shell.update(model, msg, fx),
+        .timer_visibility, .timer_toggle, .timer_reset, .timer_mode, .timer_options, .timer_scrolled, .timer_auto, .timer_speak, .timer_work, .timer_short, .timer_long, .timer_minutes, .timer_seconds => timer_shell.update(model, msg, fx),
         .update_boot_check => |timer| {
             if (timer.outcome == .fired and model.update_checks_enabled) startUpdateCheck(model, false, fx);
         },
@@ -2929,6 +3020,21 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // prompt just to preview a volume level is busywork.
             if (model.waiting_sound) playWaitingChime(fx);
         },
+        .toggle_usage_limits => {
+            model.usage_limits = !model.usage_limits;
+            // Empty until the next poll, which reads everything at once.
+            model.usage = .{};
+            syncClaudeStatusline(model);
+            saveSettings(model);
+        },
+        .usage_copilot_response => |response| onUsageResponse(model, .copilot, response, usage_mod.windowsFromCopilot, fx),
+        .usage_cursor_response => |response| onUsageResponse(model, .cursor, response, usage_mod.windowsFromCursor, fx),
+        .usage_select => |index| {
+            if (index >= usage_mod.agent_count) return;
+            const agent: usage_mod.Agent = @enumFromInt(index);
+            model.usage.selected = if (model.usage.selected == agent) null else agent;
+            syncUsageWindow(model, fx);
+        },
         .chime_done => {},
         .remote_line => |line| {
             const decoded = remote_runtime.slotOpFromKey(line.key) orelse return;
@@ -2999,7 +3105,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.launch_at_login = plat.launchAtLoginEnabled();
         },
         .toggle_focus_mode => {
+            // Attribute a deadline already passed to the mode it ended
+            // in, even when this click arrives before the next poll.
+            timer_shell.tick(model, fx);
             model.focus_mode = !model.focus_mode;
+            timer_shell.tick(model, fx);
             if (model.focus_mode) clearBubble(model);
         },
         .toggle_rotate_pets => {
@@ -3086,7 +3196,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     for (model.agents) |info| {
                         if (info.status == .node or info.status == .current) any_hooked = true;
                     }
-                    if (!any_hooked) model.settings_open = true;
+                    if (!any_hooked) {
+                        model.settings_page = .agents;
+                        model.settings_open = true;
+                    }
                     model.agents_prompted = true;
                     saveSettings(model);
                 }
@@ -3295,6 +3408,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             if (!model.sheet_loaded) return;
             if (model.settings_open and thumbs_built < catalog_mod.catalog_len) buildNextThumb(fx);
             const now = fx.wallMs();
+            refreshUsage(model, fx, now);
             var drained: [hook_server.max_bubbles]hook_server.Bubble = undefined;
             if (hook_server.mailbox.takeBubbles(&drained)) |raw_count| {
                 if (model.settings_open) {
@@ -3402,6 +3516,13 @@ pub fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
 pub fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "petdex.cycle")) return .cycle_state;
     if (std.mem.eql(u8, name, "petdex.settings")) return .open_settings;
+    if (std.mem.eql(u8, name, "petdex.chat-options")) return .open_chat_options;
+    if (std.mem.eql(u8, name, "petdex.pets")) return .{ .set_settings_page = @intFromEnum(settings_view.Page.pets) };
+    if (std.mem.eql(u8, name, "petdex.connections")) return .{ .set_settings_page = @intFromEnum(settings_view.Page.agents) };
+    if (std.mem.eql(u8, name, "petdex.notifications")) return .{ .set_settings_page = @intFromEnum(settings_view.Page.notifications) };
+    if (std.mem.eql(u8, name, "petdex.bubbles")) return .toggle_bubbles;
+    if (builtin.os.tag == .macos and std.mem.eql(u8, name, "petdex.usage-limits")) return .toggle_usage_limits;
+    if (std.mem.eql(u8, name, "petdex.waiting-sound")) return .toggle_waiting_sound;
     if (std.mem.eql(u8, name, "petdex.close")) return .close_pet;
     if (builtin.target.os.tag == .linux and std.mem.eql(u8, name, "native-sdk.window-drag.begin"))
         return .{ .native_drag_started = null };
@@ -3418,6 +3539,7 @@ pub fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "petdex.updates")) return .check_updates;
     if (std.mem.eql(u8, name, "petdex.flock")) return .toggle_flock_window;
     if (std.mem.eql(u8, name, "petdex.chat")) return .open_chat;
+    if (std.mem.eql(u8, name, "petdex.timer")) return .timer_visibility;
     if (std.mem.eql(u8, name, "petdex.clear-notifications")) return .clear_notifications;
     if (std.mem.eql(u8, name, "petdex.reset-position")) return .reset_position;
     return null;
@@ -3426,33 +3548,6 @@ pub fn onCommand(name: []const u8) ?Msg {
 // ------------------------------------------------------------------- view
 
 pub const AppUi = canvas.Ui(Msg);
-
-fn petMenu(comptime lang: i18n.Lang) [7]AppUi.ContextMenuItem {
-    return .{
-        .{ .label = i18n.pick(lang, "Open Settings", "設定…"), .msg = .open_settings },
-        .{ .label = i18n.pick(lang, "Open Flock", "フロックを開く"), .msg = .toggle_flock_window },
-        .{ .label = i18n.pick(lang, "View Pet on Petdex", "Petdexでペットを見る"), .msg = .open_active_pet_page },
-        .{ .label = i18n.pick(lang, "Chat", "チャット"), .msg = .open_chat },
-        .{ .label = i18n.pick(lang, "Reset Position", "位置のリセット"), .msg = .reset_position },
-        .{ .label = i18n.pick(lang, "Clear Notifications", "通知を消去"), .msg = .clear_notifications },
-        .{ .label = i18n.pick(lang, "Close Pet", "ペットを閉じる"), .msg = .close_pet },
-    };
-}
-const pet_menu_en = petMenu(.en);
-const pet_menu_ja = petMenu(.ja);
-
-fn petMenuFor() *const [7]AppUi.ContextMenuItem {
-    return if (i18n.current == .ja) &pet_menu_ja else &pet_menu_en;
-}
-
-test "pet context menu opens the flock" {
-    try std.testing.expectEqualStrings("Open Flock", pet_menu_en[1].label);
-    const msg = pet_menu_en[1].msg orelse return error.TestUnexpectedResult;
-    switch (msg) {
-        .toggle_flock_window => {},
-        else => return error.TestUnexpectedResult,
-    }
-}
 
 /// An opened bubble's card holds two lines at this width. Fits "Claude
 /// Code - Action Required" at the default text size.
@@ -3627,7 +3722,6 @@ fn bubbleSettingsLine(ui: *AppUi, bubble: *const hook_server.Bubble) ?[]const u8
     if (effort.len > 0) return effort;
     return null;
 }
-
 
 /// The card's first line: the project the agent works in (the last part
 /// of its cwd), else the session title, else the agent.
@@ -3963,7 +4057,7 @@ fn clearBubble(model: *Model) void {
     hook_server.mailbox.clearBubbles();
 }
 
-const close_pet_window_labels = [_][]const u8{ "bubble", "main" };
+const close_pet_window_labels = [_][]const u8{ "bubble", usage_window_label, "main" };
 
 fn closePet(model: *Model, fx: *Effects) void {
     clearBubble(model);
@@ -4214,6 +4308,9 @@ fn bubblePetTopY(model: *const Model) f64 {
 /// throws, scale changes, and text-size changes all need no
 /// special-casing.
 fn syncBubbleWindow(model: *Model, fx: *Effects) void {
+    // The usage column rides every placement of the bubbles: each place
+    // the pet moves already calls here.
+    syncUsageWindow(model, fx);
     if (!bubbleActive(model)) {
         model.bubble_above_blocked = false;
         model.bubble_placed = false;
@@ -4400,6 +4497,331 @@ fn bubbleFlipOnScreen(model: *const Model, screen: Screen) bool {
     return flipForRoom(model.bubble_flipped, roomAbove(model, screen), model.hook_sim.closedHeight());
 }
 
+// ------------------------------------------------------------- usage
+
+/// macOS only: the column is placed on the pet's own screen, which only
+/// AppKit reports, and Claude Code's relay is a POSIX shell command.
+const usage_supported = builtin.target.os.tag == .macos;
+const usage_window_label = "usage";
+const usage_canvas_label = "usage-canvas";
+const usage_copilot_key: u64 = 60;
+const usage_cursor_key: u64 = 61;
+/// The column: rows of logo and percent.
+const usage_rows_w: f32 = 60;
+const usage_row_h: f32 = 22;
+const usage_icon_px: f32 = 16;
+const usage_pad: f32 = 8;
+/// The breakdown a pressed row opens beside the column.
+const usage_detail_w: f32 = 176;
+const usage_detail_gap: f32 = 12;
+const usage_title_h: f32 = 18;
+/// One window in the breakdown: its name and percent, the bar, the reset.
+const usage_line_h: f32 = 16;
+const usage_bar_h: f32 = 4;
+const usage_window_block_h: f32 = usage_line_h + 4 + usage_bar_h + 4 + usage_line_h;
+const usage_block_gap: f32 = 8;
+/// Between the column and the pet's frame, as between the chat and it.
+const usage_pet_gap: f64 = 4;
+var usage_window_size: [2]f32 = .{ 0, 0 };
+
+fn usageActive(model: *const Model) bool {
+    return usage_supported and model.usage_limits and model.sheet_loaded and model.usage.len() > 0;
+}
+
+/// The pressed row's windows, while it still has a row.
+fn usageDetail(model: *const Model) ?usage_mod.Windows {
+    const agent = model.usage.selected orelse return null;
+    if (model.usage.used(agent) == null) return null;
+    return model.usage.windows[@intFromEnum(agent)];
+}
+
+fn usageDetailHeight(windows: usize) f32 {
+    const n: f32 = @floatFromInt(windows);
+    return usage_title_h + usage_block_gap + n * usage_window_block_h + @max(n - 1, 0) * usage_block_gap;
+}
+
+/// The window's size: the column, and the breakdown while a row is open.
+fn usageSize(model: *const Model) [2]f32 {
+    const rows_h = @as(f32, @floatFromInt(model.usage.len())) * usage_row_h;
+    const detail = usageDetail(model) orelse return .{ usage_rows_w + usage_pad * 2, rows_h + usage_pad * 2 };
+    return .{
+        usage_rows_w + usage_detail_gap + usage_detail_w + usage_pad * 2,
+        @max(rows_h, usageDetailHeight(detail.len)) + usage_pad * 2,
+    };
+}
+
+/// The column's window origin: left of the pet, or right of it when the
+/// chat took the left or the screen ends there; level with the pet's
+/// middle, inside its screen.
+fn usageSpot(model: *const Model, screen: Screen, w: f64, h: f64) struct { x: f64, y: f64, right: bool } {
+    const pet_w: f64 = frame_w * model.scale;
+    const pet_h: f64 = frame_h * model.scale;
+    const chat_left = chat_shell.besidePet(&model.chat) and model.chat.place.left;
+    const right = chat_left or model.pet_x - usage_pet_gap - w < screen.x;
+    const x = if (right) model.pet_x + pet_w + usage_pet_gap else model.pet_x - usage_pet_gap - w;
+    const y = model.pet_y + pet_h / 2 - h / 2;
+    return .{
+        .x = std.math.clamp(x, screen.x, @max(screen.x, screen.x + screen.w - w)),
+        .y = std.math.clamp(y, screen.y, @max(screen.y, screen.y + screen.h - h)),
+        .right = right,
+    };
+}
+
+/// Keep the usage column beside the pet (syncBubbleWindow calls this).
+fn syncUsageWindow(model: *Model, fx: *Effects) void {
+    if (!usageActive(model)) {
+        model.usage_placed = false;
+        return;
+    }
+    const screen = model.pet_screen orelse return;
+    const size = usageSize(model);
+    if (@abs(size[0] - usage_window_size[0]) > 0.5 or @abs(size[1] - usage_window_size[1]) > 0.5) {
+        _ = fx.resizeWindow(usage_window_label, size[0], size[1], .top_left);
+        usage_window_size = size;
+    }
+    const cur = fx.moveWindow(usage_window_label, 0, 0, false) orelse {
+        model.usage_placed = false;
+        return;
+    };
+    const at = usageSpot(model, screen, size[0], size[1]);
+    model.usage_right = at.right;
+    if (bubbleMovePlan(cur.x, cur.y, at.x, at.y)) |plan| {
+        _ = fx.moveWindow(usage_window_label, plan.dx, plan.dy, false) orelse return;
+    }
+    model.usage_placed = true;
+}
+
+/// The column's sources on their own clocks: the local files every
+/// minute, Copilot's and Cursor's endpoints every five.
+fn refreshUsage(model: *Model, fx: *Effects, now: i64) void {
+    if (!model.usage_limits) return;
+    const home = env_home orelse return;
+    if (now >= model.usage.next_file_ms) {
+        model.usage.next_file_ms = now + usage_mod.file_interval_ms;
+        usage_mod.readFiles(&model.usage, home, now);
+    }
+    if (now >= model.usage.next_net_ms) {
+        model.usage.next_net_ms = now + usage_mod.net_interval_ms;
+        fetchUsage(model, fx, home);
+    }
+}
+
+/// Copilot's and Cursor's endpoints, with the sign-ins their own apps
+/// keep. Without one, that row stays hidden.
+fn fetchUsage(model: *Model, fx: *Effects, home: []const u8) void {
+    var token_buf: [256]u8 = undefined;
+    if (usage_mod.copilotToken(home, &token_buf)) |token| {
+        var auth_buf: [300]u8 = undefined;
+        const headers = [_]std.http.Header{
+            .{ .name = "authorization", .value = std.fmt.bufPrint(&auth_buf, "token {s}", .{token}) catch return },
+            .{ .name = "accept", .value = "application/json" },
+            // What Copilot's own editor plugins send; the endpoint is theirs.
+            .{ .name = "editor-version", .value = "vscode/1.96.2" },
+            .{ .name = "editor-plugin-version", .value = "copilot-chat/0.26.7" },
+            .{ .name = "user-agent", .value = "GitHubCopilotChat/0.26.7" },
+            .{ .name = "x-github-api-version", .value = "2025-04-01" },
+        };
+        fx.fetch(.{ .key = usage_copilot_key, .url = usage_mod.copilot_url, .headers = &headers, .timeout_ms = 15000, .on_response = Effects.responseMsg(.usage_copilot_response) });
+    } else model.usage.set(.copilot, null);
+
+    var cursor_buf: [2048]u8 = undefined;
+    var cookie_buf: [2200]u8 = undefined;
+    const cookie = if (usage_mod.cursorToken(home, &cursor_buf)) |token| usage_mod.cursorCookie(token, &cookie_buf) else null;
+    if (cookie) |value| {
+        const headers = [_]std.http.Header{
+            .{ .name = "cookie", .value = value },
+            .{ .name = "accept", .value = "application/json" },
+        };
+        fx.fetch(.{ .key = usage_cursor_key, .url = usage_mod.cursor_url, .headers = &headers, .timeout_ms = 15000, .on_response = Effects.responseMsg(.usage_cursor_response) });
+    } else model.usage.set(.cursor, null);
+}
+
+/// An endpoint's answer. Unreachable keeps the last number; refused or
+/// unreadable hides the row, the number no longer known; a 429 backs the
+/// fetches off.
+fn onUsageResponse(model: *Model, agent: usage_mod.Agent, response: native_sdk.EffectResponse, parse: *const fn ([]const u8) ?usage_mod.Windows, fx: *Effects) void {
+    // Named in the log: a row that never shows says why nowhere else.
+    if (response.outcome != .ok or response.status != 200) {
+        std.debug.print("petdex: {s} usage: {s} {d}\n", .{ @tagName(agent), @tagName(response.outcome), response.status });
+    }
+    if (response.outcome != .ok) return;
+    if (response.status == 429) {
+        model.usage.next_net_ms = fx.wallMs() + usage_mod.net_backoff_ms;
+        return;
+    }
+    model.usage.now_s = @divFloor(fx.wallMs(), 1000);
+    model.usage.set(agent, if (response.status == 200 and !response.truncated) parse(response.body) else null);
+}
+
+/// The relay goes in with the usage column, and only into a Claude Code
+/// that has Petdex's hooks: removing those means staying out of it.
+fn syncClaudeStatusline(model: *const Model) void {
+    const home = env_home orelse return;
+    const status = model.agents[@intFromEnum(agent_hooks.AgentKind.claude_code)].status;
+    const hooked = status == .node or status == .current;
+    _ = if (model.usage_limits and hooked)
+        agent_hooks.installClaudeStatusline(boot_allocator, home)
+    else
+        agent_hooks.uninstallClaudeStatusline(boot_allocator, home);
+}
+
+/// The usage column: each agent's logo and the share of its tightest
+/// limit used. A row pressed opens its breakdown on the column's far
+/// side, so the column stays next to the pet. Plain numbers, no color:
+/// the number is the news.
+fn usageView(ui: *AppUi, model: *const Model) AppUi.Node {
+    const fg = if (model.dark) canvas.Color.rgb8(237, 237, 238) else canvas.Color.rgb8(17, 17, 17);
+    var rows: [usage_mod.agent_count]AppUi.Node = undefined;
+    var count: usize = 0;
+    for (std.enums.values(usage_mod.Agent)) |agent| {
+        const pct = model.usage.used(agent) orelse continue;
+        var label = ui.text(.{ .size = .sm }, ui.fmt("{d}%", .{pct}));
+        label.widget.style.foreground = fg;
+        var row = ui.row(.{ .width = usage_rows_w, .height = usage_row_h, .gap = 6, .cross = .center, .on_press = Msg{ .usage_select = @intFromEnum(agent) } }, .{
+            agentLogo(ui, agentIconIndex(@tagName(agent)), usage_icon_px),
+            label,
+        });
+        row.widget.semantics.label = ui.fmt("{s} {d}%", .{ usage_mod.displayName(agent), pct });
+        rows[count] = row;
+        count += 1;
+    }
+    const column = ui.column(.{ .width = usage_rows_w, .cross = .start }, @as([]const AppUi.Node, rows[0..count]));
+    const body = if (usageDetail(model)) |windows| blk: {
+        const detail = usageDetailView(ui, model, windows, fg);
+        break :blk if (model.usage_right)
+            ui.row(.{ .grow = 1, .gap = usage_detail_gap, .cross = .start }, .{ column, detail })
+        else
+            ui.row(.{ .grow = 1, .gap = usage_detail_gap, .cross = .start }, .{ detail, column });
+    } else column;
+    var card = ui.el(.panel, .{ .grow = 1, .padding = usage_pad }, .{body});
+    styleSpeechCard(&card, model.dark);
+    card.widget.style.radius = 12;
+    // Born at the screen's center like the bubbles: hidden until placed.
+    if (!model.usage_placed) card.widget.opacity = 0;
+    return card;
+}
+
+/// A row's breakdown: its agent, then each window's name and percent,
+/// its bar, and how long until it resets.
+fn usageDetailView(ui: *AppUi, model: *const Model, windows: usage_mod.Windows, fg: canvas.Color) AppUi.Node {
+    const muted = if (model.dark) canvas.Color.rgb8(156, 158, 168) else canvas.Color.rgb8(88, 92, 106);
+    const track = if (model.dark) canvas.Color.rgba8(255, 255, 255, 38) else canvas.Color.rgba8(0, 0, 0, 20);
+    var parts: [1 + 2]AppUi.Node = undefined;
+    var title = ui.text(.{ .size = .sm }, usage_mod.displayName(model.usage.selected.?));
+    title.widget.style.foreground = fg;
+    parts[0] = ui.el(.stack, .{ .width = usage_detail_w, .height = usage_title_h }, .{title});
+    for (windows.slice(), 0..) |w, i| {
+        const pct = usage_mod.percent(usage_mod.current(w, model.usage.now_s));
+        var name = ui.text(.{ .size = .sm }, usageWindowName(ui, w.minutes));
+        name.widget.style.foreground = fg;
+        var value = ui.text(.{ .size = .sm }, ui.fmt("{d}%", .{pct}));
+        value.widget.style.foreground = fg;
+        var fill = ui.el(.panel, .{ .width = usage_detail_w * @as(f32, @floatFromInt(pct)) / 100, .height = usage_bar_h }, .{});
+        fill.widget.style.background = fg;
+        fill.widget.style.radius = usage_bar_h / 2;
+        var bar = ui.el(.panel, .{ .width = usage_detail_w, .height = usage_bar_h }, .{fill});
+        bar.widget.style.background = track;
+        bar.widget.style.radius = usage_bar_h / 2;
+        var reset = ui.text(.{ .size = .sm }, usageResetText(ui, w.resets_at, model.usage.now_s));
+        reset.widget.style.foreground = muted;
+        parts[1 + i] = ui.column(.{ .width = usage_detail_w, .height = usage_window_block_h, .gap = 4 }, .{
+            ui.row(.{ .width = usage_detail_w, .height = usage_line_h, .cross = .center }, .{ name, ui.el(.stack, .{ .grow = 1 }, .{}), value }),
+            bar,
+            ui.el(.stack, .{ .width = usage_detail_w, .height = usage_line_h }, .{reset}),
+        });
+    }
+    return ui.column(.{ .width = usage_detail_w, .gap = usage_block_gap, .cross = .start }, @as([]const AppUi.Node, parts[0 .. 1 + windows.len]));
+}
+
+/// A window by its length: the ones the agents use, else in hours.
+fn usageWindowName(ui: *AppUi, minutes: u32) []const u8 {
+    return switch (minutes) {
+        usage_mod.five_hour_minutes => i18n.t("5 hours", "5時間"),
+        usage_mod.week_minutes => i18n.t("Week", "週"),
+        usage_mod.month_minutes => i18n.t("Month", "月"),
+        0 => i18n.t("Limit", "上限"),
+        else => i18n.fmt(ui, "{d} hours", "{d}時間", .{minutes / 60}),
+    };
+}
+
+/// How long until a window resets, to the minute: no clock time, so no
+/// time zone to get wrong.
+fn usageResetText(ui: *AppUi, resets_at: i64, now_s: i64) []const u8 {
+    if (resets_at == 0) return "";
+    const left = resets_at - now_s;
+    if (left <= 0) return i18n.t("Reset", "リセット済み");
+    const c = usage_mod.countdown(left);
+    if (c.days > 0) return i18n.fmt(ui, "Resets in {d}d {d}h", "あと{d}日{d}時間でリセット", .{ c.days, c.hours });
+    if (c.hours > 0) return i18n.fmt(ui, "Resets in {d}h {d}m", "あと{d}時間{d}分でリセット", .{ c.hours, c.minutes });
+    return i18n.fmt(ui, "Resets in {d}m", "あと{d}分でリセット", .{c.minutes});
+}
+
+test "the usage column takes the pet's left, else its right" {
+    var model: Model = .{};
+    model.scale = 1;
+    const screen: Screen = .{ .x = 0, .y = 0, .w = 1920, .h = 1080 };
+    model.pet_x = 800;
+    model.pet_y = 400;
+    const w: f64 = usage_rows_w + usage_pad * 2;
+    const h: f64 = 60;
+    const left = usageSpot(&model, screen, w, h);
+    try std.testing.expect(!left.right);
+    try std.testing.expectEqual(model.pet_x - usage_pet_gap - w, left.x);
+    try std.testing.expectEqual(model.pet_y + frame_h / 2 - h / 2, left.y);
+    // At the screen's left edge: the right, clear of the pet.
+    model.pet_x = 20;
+    const edge = usageSpot(&model, screen, w, h);
+    try std.testing.expect(edge.right);
+    try std.testing.expectEqual(model.pet_x + frame_w + usage_pet_gap, edge.x);
+    // The chat beside the pet on its left: the right too.
+    model.pet_x = 800;
+    model.chat.open = true;
+    model.chat.place.left = true;
+    if (chat_shell.besidePet(&model.chat)) {
+        try std.testing.expectEqual(model.pet_x + frame_w + usage_pet_gap, usageSpot(&model, screen, w, h).x);
+    }
+}
+
+test "a pressed row opens its breakdown beside the column" {
+    var model: Model = .{};
+    var claude: usage_mod.Windows = .{};
+    claude.items = .{ .{ .used = 42, .minutes = usage_mod.five_hour_minutes }, .{ .used = 18, .minutes = usage_mod.week_minutes } };
+    claude.len = 2;
+    model.usage.set(.@"claude-code", claude);
+    model.usage.set(.codex, usage_mod.Windows.one(15, 0, usage_mod.week_minutes));
+    const closed = usageSize(&model);
+    try std.testing.expectEqual(usage_rows_w + usage_pad * 2, closed[0]);
+    try std.testing.expectEqual(2 * usage_row_h + usage_pad * 2, closed[1]);
+    model.usage.selected = .@"claude-code";
+    const open = usageSize(&model);
+    try std.testing.expectEqual(usage_rows_w + usage_detail_gap + usage_detail_w + usage_pad * 2, open[0]);
+    // Two windows stand taller than two rows.
+    try std.testing.expectEqual(usageDetailHeight(2) + usage_pad * 2, open[1]);
+    // A row gone takes its breakdown with it.
+    model.usage.set(.@"claude-code", null);
+    try std.testing.expect(usageDetail(&model) == null);
+    try std.testing.expectEqual(usage_rows_w + usage_pad * 2, usageSize(&model)[0]);
+}
+
+test "the usage window exists only with the setting on and a row to show" {
+    var model: Model = .{};
+    model.sheet_loaded = true;
+    var scratch: PetdexApp.WindowsScratch = undefined;
+    model.usage.set(.codex, usage_mod.Windows.one(15, 0, usage_mod.week_minutes));
+    try std.testing.expectEqual(@as(usize, 0), petdexWindows(&model, &scratch).len);
+    model.usage_limits = true;
+    const windows = petdexWindows(&model, &scratch);
+    try std.testing.expectEqual(@as(usize, if (usage_supported) 1 else 0), windows.len);
+    if (usage_supported) {
+        try std.testing.expectEqualStrings(usage_window_label, windows[0].label);
+        // Its rows take the press that opens their breakdown.
+        try std.testing.expect(!windows[0].click_through and windows[0].transparent);
+        try std.testing.expectEqual(usage_row_h + usage_pad * 2, windows[0].height);
+    }
+    model.usage.set(.codex, null);
+    try std.testing.expectEqual(@as(usize, 0), petdexWindows(&model, &scratch).len);
+}
+
 /// What the pet window shows before there is a pet to draw.
 ///
 /// This used to be a bare panel: a grey rectangle with no text and no
@@ -4490,15 +4912,15 @@ pub fn rootView(ui: *AppUi, model: *const Model) AppUi.Node {
         // Bind the menu to the sprite itself, not only its layout parent.
         // Linux resolves the deepest context-menu node on the right-click
         // hit route before mounting the canvas fallback menu.
-        node.context_menu = petMenuFor();
-        return ui.column(.{ .grow = 1, .main = .end, .cross = .center, .window_drag = true, .context_menu = petMenuFor() }, .{
+        node.context_menu = navigation.contextMenu(ui, model);
+        return ui.column(.{ .grow = 1, .main = .end, .cross = .center, .window_drag = true, .context_menu = navigation.contextMenu(ui, model) }, .{
             node,
             ui.el(.stack, .{ .width = 1, .height = pet_edge_pad }, .{}),
         });
     }
     // Win/mac keep the upstream sprite-only root and app-owned drag path;
     // their bubble is a separate companion window.
-    return ui.column(.{ .grow = 1, .main = .end, .cross = .center, .on_press = .noop, .context_menu = petMenuFor() }, .{node});
+    return ui.column(.{ .grow = 1, .main = .end, .cross = .center, .on_press = .noop, .context_menu = navigation.contextMenu(ui, model) }, .{node});
 }
 
 // ----------------------------------------------------------- bubble
@@ -4973,8 +5395,8 @@ fn petdexWindows(model: *const Model, scratch: *PetdexApp.WindowsScratch) []cons
         scratch.windows[count] = .{
             .label = settings_window_label,
             .canvas_label = settings_canvas_label,
-            .title = i18n.t("Petdex Settings", "Petdex設定"),
-            .width = 420,
+            .title = if (model.chat_options_open) i18n.t("Chat options", "チャットの設定") else i18n.t("Petdex Settings", "Petdex設定"),
+            .width = 680,
             .height = 680,
             .resizable = false,
             .titlebar = .hidden_inset,
@@ -4999,6 +5421,30 @@ fn petdexWindows(model: *const Model, scratch: *PetdexApp.WindowsScratch) []cons
             .transparent = chat_view.bubble,
             .quiet_show = model.chat.quiet_open,
             .on_close = .chat_closed,
+        };
+        count += 1;
+    }
+    // Last, and only with a slot left: the SDK holds four windows beside
+    // the pet's, and the bubbles, the flock, settings and the chat can take
+    // them all. ponytail: then the column waits; patch max_ui_app_windows
+    // if that ever matters.
+    if (usageActive(model) and count < scratch.windows.len) {
+        scratch.windows[count] = .{
+            .label = usage_window_label,
+            .canvas_label = usage_canvas_label,
+            .title = "",
+            .width = usageSize(model)[0],
+            .height = usageSize(model)[1],
+            .x = @floatCast(model.pet_x - usage_pet_gap - usageSize(model)[0]),
+            .y = @floatCast(model.pet_y),
+            .resizable = false,
+            .titlebar = .chromeless,
+            .floating = true,
+            .fullscreen_overlay = true,
+            .transparent = true,
+            // A pressed row opens its breakdown. The card fills the
+            // window, so no transparent gap swallows a desktop click.
+            .click_through = false,
         };
         count += 1;
     }
@@ -5059,11 +5505,47 @@ test "companion windows use the unified opaque shell" {
     try std.testing.expect(!windows[1].floating);
 }
 
+test "chat options reuse the preferences window without losing the conversation" {
+    var model: Model = .{};
+    model.chat.open = true;
+    model.chat.input.set("An unfinished message");
+    model.chat.session.transcript.append(.user, "Keep this conversation");
+    model.settings_open = true;
+    model.settings_scroll = 460;
+    openChatOptions(&model);
+    try std.testing.expect(model.chat_options_open);
+    try std.testing.expectEqual(@as(f32, 0), model.settings_scroll);
+    var scratch: PetdexApp.WindowsScratch = .{};
+    const windows = petdexWindows(&model, &scratch);
+    try std.testing.expectEqual(@as(usize, 2), windows.len);
+    try std.testing.expectEqualStrings(settings_window_label, windows[0].label);
+    try std.testing.expectEqualStrings(chat_shell.window_label, windows[1].label);
+    closeChatOptions(&model);
+    try std.testing.expect(!model.settings_open);
+    try std.testing.expect(!model.chat_options_open);
+    try std.testing.expect(model.chat.open);
+    try std.testing.expectEqualStrings("An unfinished message", model.chat.inputText());
+    try std.testing.expectEqual(@as(usize, 1), model.chat.session.transcript.len());
+}
+
+test "preference navigation resets scrolling and ignores invalid destinations" {
+    var model: Model = .{};
+    model.settings_open = true;
+    model.settings_scroll = 900;
+    try std.testing.expect(selectSettingsPage(&model, @intFromEnum(settings_view.Page.notifications)));
+    try std.testing.expectEqual(settings_view.Page.notifications, model.settings_page);
+    try std.testing.expectEqual(@as(f32, 0), model.settings_scroll);
+    try std.testing.expect(!selectSettingsPage(&model, 99));
+    try std.testing.expectEqual(settings_view.Page.notifications, model.settings_page);
+}
+
 fn petdexWindowView(ui: *PetdexApp.Ui, model: *const Model, window_label: []const u8) PetdexApp.Ui.Node {
     if (std.mem.eql(u8, window_label, "bubble")) return bubbleView(ui, model);
+    if (std.mem.eql(u8, window_label, usage_window_label)) return usageView(ui, model);
     if (std.mem.eql(u8, window_label, flock_window_label)) return flockView(ui, model);
     if (std.mem.eql(u8, window_label, chat_shell.window_label)) return chat_view.view(ui, model);
     std.debug.assert(std.mem.eql(u8, window_label, settings_window_label));
+    if (model.chat_options_open) return chat_view.optionsView(ui, model);
     return settings_view.settingsView(ui, model, .{
         .ready = agents_icons_ready,
         .image = agent_icon_atlas_id,
@@ -5126,29 +5608,30 @@ fn petdexStatusItem(model: *const Model, scratch: *PetdexApp.StatusItemScratch) 
         .current => i18n.bufPrint(&scratch.title_buffer, "Petdex is up to date · {s}", "Petdexは最新です · {s}", .{updates.current_version}) catch i18n.t("Petdex is up to date", "Petdexは最新です"),
         .idle, .failed => i18n.bufPrint(&scratch.title_buffer, "Check for Updates… · {s}", "アップデートを確認… · {s}", .{updates.current_version}) catch i18n.t("Check for Updates…", "アップデートを確認…"),
     };
-    scratch.items[0] = .{ .id = 1, .label = i18n.t("Open Settings", "設定…"), .command = "petdex.settings" };
-    scratch.items[1] = .{ .id = 12, .label = i18n.t("Chat…", "チャット…"), .command = "petdex.chat" };
-    scratch.items[2] = .{ .id = 14, .label = i18n.t("Reset Position", "位置のリセット"), .command = "petdex.reset-position" };
-    scratch.items[3] = .{ .id = 2, .label = i18n.t("Open petdex.dev", "petdex.devを開く"), .command = "petdex.website" };
-    scratch.items[4] = .{ .id = 3, .separator = true };
-    scratch.items[5] = .{
-        .id = 4,
-        .label = if (model.focus_mode) i18n.t("Focus Mode: On", "集中モード：オン") else i18n.t("Focus Mode: Off", "集中モード：オフ"),
-        .command = "petdex.focus",
+    const actions = navigation.quickActions(model);
+    for (actions.slice(), 0..) |action, i| scratch.items[i] = .{
+        .id = @intCast(i + 1),
+        .label = action.label,
+        .command = action.command,
+        .enabled = action.enabled,
+        .separator = action.separator,
     };
-    scratch.items[6] = .{ .id = 13, .label = i18n.t("Clear Notifications", "通知を消去"), .command = "petdex.clear-notifications", .enabled = model.bubbles_len > 0 };
-    scratch.items[7] = .{ .id = 5, .label = i18n.t("Shuffle Pet", "ペットをシャッフル"), .command = "petdex.shuffle" };
-    scratch.items[8] = .{
-        .id = 6,
-        .label = if (model.flock.open) i18n.t("Hide Flock", "フロックを隠す") else i18n.t("Show Flock", "フロックを表示"),
-        .command = "petdex.flock",
+    const tail = [_]native_sdk.platform.TrayMenuItem{
+        .{ .id = 20, .separator = true },
+        .{ .id = 21, .label = i18n.t("Pets…", "ペット…"), .command = "petdex.pets" },
+        .{ .id = 22, .label = i18n.t("Shuffle Pet", "ペットをシャッフル"), .command = "petdex.shuffle" },
+        .{ .id = 23, .label = i18n.t("Reset Position", "位置のリセット"), .command = "petdex.reset-position" },
+        .{ .id = 24, .label = i18n.t("View Pet on Petdex", "Petdexでペットを見る"), .command = "petdex.pet-page" },
+        .{ .id = 25, .separator = true },
+        .{ .id = 26, .label = i18n.t("Connections…", "エージェント連携…"), .command = "petdex.connections" },
+        .{ .id = 27, .label = i18n.t("Settings…", "設定…"), .command = "petdex.settings" },
+        .{ .id = 28, .label = i18n.t("Open petdex.dev", "petdex.devを開く"), .command = "petdex.website" },
+        .{ .id = 29, .label = update_label, .command = "petdex.updates", .enabled = model.update_phase != .checking },
+        .{ .id = 30, .separator = true },
+        .{ .id = 31, .label = i18n.t("Quit Petdex", "Petdexを終了"), .command = "petdex.quit" },
     };
-    scratch.items[9] = .{ .id = 7, .label = i18n.t("View Pet on Petdex", "Petdexでペットを見る"), .command = "petdex.pet-page" };
-    scratch.items[10] = .{ .id = 8, .separator = true };
-    scratch.items[11] = .{ .id = 9, .label = update_label, .command = "petdex.updates", .enabled = model.update_phase != .checking };
-    scratch.items[12] = .{ .id = 10, .separator = true };
-    scratch.items[13] = .{ .id = 11, .label = i18n.t("Quit Petdex", "Petdexを終了"), .command = "petdex.quit" };
-    return .{ .items = scratch.items[0..14] };
+    @memcpy(scratch.items[actions.len .. actions.len + tail.len], &tail);
+    return .{ .items = scratch.items[0 .. actions.len + tail.len] };
 }
 
 /// The menu-bar button icon: the brand mark's silhouette with the face
@@ -5175,17 +5658,30 @@ fn materializeTrayIcon() void {
 }
 
 /// Built once at launch, so a language change reaches it after a restart.
-fn appMenus(comptime lang: i18n.Lang) [1]native_sdk.platform.Menu {
-    return .{.{
-        .title = i18n.pick(lang, "Pet", "ペット"),
-        .items = &.{
-            .{ .label = i18n.pick(lang, "Settings...", "設定…"), .command = "petdex.settings", .key = ",", .modifiers = .{ .primary = true } },
-            .{ .label = i18n.pick(lang, "Chat...", "チャット…"), .command = "petdex.chat", .key = "k", .modifiers = .{ .primary = true } },
-            .{ .label = i18n.pick(lang, "Reset Position", "位置のリセット"), .command = "petdex.reset-position" },
+fn appMenus(comptime lang: i18n.Lang) [3]native_sdk.platform.Menu {
+    return .{
+        .{ .title = i18n.pick(lang, "Pet", "ペット"), .items = &.{
+            .{ .label = i18n.pick(lang, "Pets…", "ペット…"), .command = "petdex.pets" },
+            .{ .label = i18n.pick(lang, "Settings…", "設定…"), .command = "petdex.settings", .key = ",", .modifiers = .{ .primary = true } },
+            .{ .label = i18n.pick(lang, "Connections…", "エージェント連携…"), .command = "petdex.connections" },
             .{ .separator = true },
+            .{ .label = i18n.pick(lang, "Reset Position", "位置のリセット"), .command = "petdex.reset-position" },
             .{ .label = i18n.pick(lang, "Close Pet", "ペットを閉じる"), .command = "petdex.close", .key = "w", .modifiers = .{ .primary = true } },
-        },
-    }};
+        } },
+        .{ .title = i18n.pick(lang, "Chat", "チャット"), .items = &.{
+            .{ .label = i18n.pick(lang, "Show / Hide Chat", "チャットを表示／非表示"), .command = "petdex.chat", .key = "k", .modifiers = .{ .primary = true } },
+            .{ .label = i18n.pick(lang, "Chat options…", "チャットの設定…"), .command = "petdex.chat-options" },
+        } },
+        .{ .title = i18n.pick(lang, "View", "表示"), .items = &.{
+            .{ .label = i18n.pick(lang, "Agent Bubbles", "通知吹き出し"), .command = "petdex.bubbles" },
+            .{ .label = i18n.pick(lang, "Flock", "フロック"), .command = "petdex.flock" },
+            .{ .label = i18n.pick(lang, "Usage Limits", "利用上限"), .command = "petdex.usage-limits", .enabled = builtin.os.tag == .macos },
+            .{ .separator = true },
+            .{ .label = i18n.pick(lang, "Focus Mode", "集中モード"), .command = "petdex.focus" },
+            .{ .label = i18n.pick(lang, "Waiting Sound", "待機中の通知音"), .command = "petdex.waiting-sound" },
+            .{ .label = i18n.pick(lang, "Clear Notifications", "通知を消去"), .command = "petdex.clear-notifications" },
+        } },
+    };
 }
 const app_menus_en = appMenus(.en);
 const app_menus_ja = appMenus(.ja);
@@ -5242,6 +5738,12 @@ pub fn main(init: std.process.Init) !void {
             // one would bring the wrong pane forward.
             const in_warp = std.mem.eql(u8, init.environ_map.get("TERM_PROGRAM") orelse "", "WarpTerminal");
             hook_runner.run(phase, agent, origin_app, init.environ_map.get("PWD"), init.environ_map.get("HERDR_PANE_ID"), if (in_warp) init.environ_map.get("WARP_FOCUS_URL") else null, env_home orelse return);
+            return;
+        }
+        // Claude Code's statusline, wrapped for the usage column: runs as
+        // often as a hook, so it leaves before the UI too.
+        if (std.mem.eql(u8, cmd, "statusline")) {
+            hook_runner.statusline(env_home orelse return, init.environ_map);
             return;
         }
     }
@@ -5432,7 +5934,9 @@ test "agents Herdr relays get their own logo and name" {
     try std.testing.expectEqual(extra_icon_base + 1, agentIconIndex("cursor"));
     try std.testing.expectEqual(agentIconIndex("cursor"), agentIconIndex("cursor-agent"));
     try std.testing.expectEqual(extra_icon_base, agentIconIndex("antigravity"));
-    try std.testing.expectEqual(agent_fallback_index, agentIconIndex("copilot"));
+    try std.testing.expectEqual(agent_fallback_index, agentIconIndex("windsurf"));
+    // The usage column's Copilot row has its logo too.
+    try std.testing.expectEqual(extra_icon_base + extra_agents.len - 1, agentIconIndex("copilot"));
     var bubble: hook_server.Bubble = .{};
     @memcpy(bubble.agent[0.."junie".len], "junie");
     bubble.agent_len = "junie".len;
@@ -5616,25 +6120,42 @@ test "empty-state copy fits the pet window" {
 }
 
 test "menus fit the SDK's label limits in both languages" {
-    for ([_][7]AppUi.ContextMenuItem{ pet_menu_en, pet_menu_ja }) |menu| {
+    const previous = i18n.current;
+    defer i18n.current = previous;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var ui = AppUi.init(arena.allocator());
+    const model: Model = .{};
+    for ([_]i18n.Lang{ .en, .ja }) |lang| {
+        i18n.current = lang;
+        const menu = navigation.contextMenu(&ui, &model);
+        try std.testing.expect(menu.len <= native_sdk.platform.max_context_menu_items);
         for (menu) |item| try std.testing.expect(item.label.len <= 128);
     }
-    for ([_][1]native_sdk.platform.Menu{ app_menus_en, app_menus_ja }) |menus| {
-        try std.testing.expect(menus[0].title.len <= 64);
-        for (menus[0].items) |item| try std.testing.expect(item.label.len <= 128);
+    for ([_][3]native_sdk.platform.Menu{ app_menus_en, app_menus_ja }) |menus| {
+        for (menus) |menu| {
+            try std.testing.expect(menu.title.len <= 64);
+            for (menu.items) |item| try std.testing.expect(item.label.len <= 128);
+        }
     }
 }
 
+fn trayCommand(items: []const native_sdk.platform.TrayMenuItem, command: []const u8) !native_sdk.platform.TrayMenuItem {
+    for (items) |item| if (std.mem.eql(u8, item.command, command)) return item;
+    return error.MissingTrayCommand;
+}
+
 test "the tray speaks Japanese and keeps the version in its update label" {
+    const previous = i18n.current;
     i18n.current = .ja;
-    defer i18n.current = .en;
+    defer i18n.current = previous;
     var model: Model = .{};
     var scratch: PetdexApp.StatusItemScratch = undefined;
     const tray = petdexStatusItem(&model, &scratch);
-    try std.testing.expectEqualStrings("設定…", tray.items[0].label);
-    try std.testing.expectEqualStrings("位置のリセット", tray.items[2].label);
+    try std.testing.expectEqualStrings("設定…", (try trayCommand(tray.items, "petdex.settings")).label);
+    try std.testing.expectEqualStrings("位置のリセット", (try trayCommand(tray.items, "petdex.reset-position")).label);
     var buf: [96]u8 = undefined;
-    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "アップデートを確認… · {s}", .{updates.current_version}), tray.items[11].label);
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "アップデートを確認… · {s}", .{updates.current_version}), (try trayCommand(tray.items, "petdex.updates")).label);
     for (tray.items) |item| try std.testing.expect(item.label.len <= 128);
 }
 
@@ -5670,36 +6191,26 @@ test "cached update versions restore the correct phase" {
     try std.testing.expectEqual(updates.Phase.current, model.update_phase);
 }
 
-test "tray exposes website active pet and updater commands" {
-    try std.testing.expectEqual(std.meta.Tag(Msg).open_website, std.meta.activeTag(onCommand("petdex.website").?));
-    try std.testing.expectEqual(std.meta.Tag(Msg).open_active_pet_page, std.meta.activeTag(onCommand("petdex.pet-page").?));
-    try std.testing.expectEqual(std.meta.Tag(Msg).check_updates, std.meta.activeTag(onCommand("petdex.updates").?));
-
+test "tray actions remain reachable and reflect notifications and updates" {
+    const previous = i18n.current;
+    i18n.current = .en;
+    defer i18n.current = previous;
     var model: Model = .{};
     var scratch: PetdexApp.StatusItemScratch = .{};
     var state = petdexStatusItem(&model, &scratch);
-    try std.testing.expectEqual(@as(usize, 14), state.items.len);
-    try std.testing.expectEqualStrings("petdex.chat", state.items[1].command);
-    // Right under Chat, where a pet lost off a missing display is looked for.
-    try std.testing.expectEqualStrings("petdex.reset-position", state.items[2].command);
-    try std.testing.expectEqualStrings("Open petdex.dev", state.items[3].label);
-    try std.testing.expectEqualStrings("petdex.clear-notifications", state.items[6].command);
-    // Nothing to clear, nothing to press.
-    try std.testing.expect(!state.items[6].enabled);
-    try std.testing.expectEqualStrings("Show Flock", state.items[8].label);
-    try std.testing.expectEqualStrings("View Pet on Petdex", state.items[9].label);
-    try std.testing.expect(std.mem.startsWith(u8, state.items[11].label, "Check for Updates"));
-    try std.testing.expectEqual(std.meta.Tag(Msg).open_chat, std.meta.activeTag(onCommand("petdex.chat").?));
-    try std.testing.expectEqual(std.meta.Tag(Msg).clear_notifications, std.meta.activeTag(onCommand("petdex.clear-notifications").?));
-    try std.testing.expectEqual(std.meta.Tag(Msg).reset_position, std.meta.activeTag(onCommand("petdex.reset-position").?));
-
+    for ([_][]const u8{ "petdex.chat", "petdex.chat-options", "petdex.timer", "petdex.settings", "petdex.pets", "petdex.connections", "petdex.bubbles", "petdex.notifications", "petdex.waiting-sound", "petdex.focus", "petdex.flock", "petdex.shuffle", "petdex.website", "petdex.pet-page", "petdex.reset-position", "petdex.updates", "petdex.quit" }) |command| {
+        _ = try trayCommand(state.items, command);
+        try std.testing.expect(onCommand(command) != null);
+    }
+    try std.testing.expect(!(try trayCommand(state.items, "petdex.clear-notifications")).enabled);
+    try std.testing.expectEqualStrings("Show Flock", (try trayCommand(state.items, "petdex.flock")).label);
     testPushBubble(&model, "alpha", "waiting", false, -1);
     model.update_phase = .available;
     @memcpy(model.latest_version[0.."0.10.0".len], "0.10.0");
     model.latest_version_len = "0.10.0".len;
     state = petdexStatusItem(&model, &scratch);
-    try std.testing.expect(state.items[6].enabled);
-    try std.testing.expectEqualStrings("Update to Petdex 0.10.0…", state.items[11].label);
+    try std.testing.expect((try trayCommand(state.items, "petdex.clear-notifications")).enabled);
+    try std.testing.expectEqualStrings("Update to Petdex 0.10.0…", (try trayCommand(state.items, "petdex.updates")).label);
 }
 
 test "bubble text default is its own value, not the range floor" {
@@ -5762,6 +6273,7 @@ test {
     _ = remote_writeback;
     _ = sdk_log;
     _ = settings_view;
+    _ = usage_mod;
 }
 
 test "the bubble window holds a row whatever the text, and grows by the card when one opens" {
@@ -6306,7 +6818,8 @@ test "closing the pet clears its bubble and closes both windows" {
     try std.testing.expectEqual(@as(usize, 0), model.bubbles_len);
     try std.testing.expectEqual(@as(u32, close_pet_window_labels.len), fx.windowActionState().close_count);
     try std.testing.expectEqualStrings("bubble", close_pet_window_labels[0]);
-    try std.testing.expectEqualStrings("main", close_pet_window_labels[1]);
+    try std.testing.expectEqualStrings(usage_window_label, close_pet_window_labels[1]);
+    try std.testing.expectEqualStrings("main", close_pet_window_labels[2]);
     try std.testing.expectEqualStrings("main", fx.windowActionState().lastLabel());
 }
 

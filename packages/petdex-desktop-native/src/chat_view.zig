@@ -1,4 +1,4 @@
-//! The chat window and the Chat section of Settings. Pure views over
+//! The chat window and its dedicated options screen. Pure views over
 //! `Model.chat`; every interaction is a Msg that chat_shell handles.
 
 const std = @import("std");
@@ -9,6 +9,7 @@ const app = @import("main.zig");
 const chat_shell = @import("chat_shell.zig");
 const chat = @import("chat/chat.zig");
 const i18n = @import("i18n.zig");
+const timer_view = @import("timer_view.zig");
 
 const Model = app.Model;
 const Msg = app.Msg;
@@ -30,7 +31,7 @@ pub const card_w: f32 = 300;
 const tail_len: f32 = @floatFromInt(app.tail_h);
 pub const window_w: f32 = if (bubble) card_w + tail_len else 360;
 /// The titled window's fixed height off macOS.
-const titled_h: f32 = 520;
+const titled_h: f32 = 680;
 const card_pad: f32 = 14;
 const text_w: f32 = card_w - card_pad * 2;
 /// The reply card's line cap; a longer reply scrolls inside it.
@@ -54,18 +55,23 @@ pub fn view(ui: *AppUi, model: *const Model) AppUi.Node {
     const st = &model.chat;
     // Oldest on top, the reply card last, right above the composer.
     const s = stacked(model);
-    const nodes = ui.arena.alloc(AppUi.Node, s.to - s.from + 3) catch return failedNode(ui);
+    const count = s.to - s.from;
+    const timer_visible = model.timer.clock.config.visible;
+    const nodes = ui.arena.alloc(AppUi.Node, count + 3 + @as(usize, @intFromBool(timer_visible))) catch return failedNode(ui);
     for (s.from..s.to, 0..) |i, j| nodes[j] = stackedBubble(ui, model, st.session.transcript.get(i));
-    nodes[nodes.len - 3] = speechCard(ui, model, st);
-    nodes[nodes.len - 2] = composer(ui, model, st);
-    nodes[nodes.len - 1] = controls(ui, model, st);
+    nodes[count] = speechCard(ui, model, st);
+    nodes[count + 1] = composer(ui, model, st);
+    nodes[count + 2] = controls(ui, model, st);
+    if (timer_visible) nodes[count + 3] = timer_view.view(ui, model);
     const body = ui.column(.{ .gap = row_gap }, @as([]const AppUi.Node, nodes));
     if (!bubble) {
-        var root = ui.column(.{ .grow = 1 }, .{
+        var root = ui.el(.panel, .{ .grow = 1 }, .{ui.column(.{ .grow = 1 }, .{
             ui.el(.stack, .{ .height = app.companion_header_h, .window_drag = true }, .{}),
             ui.column(.{ .padding = 12, .cross = .center }, .{body}),
-        });
+        })});
         root.widget.style.background = app.settingsBackground(model);
+        root.widget.style.radius = 0;
+        root.widget.style.stroke_width = 0;
         return root;
     }
     // Right of the pet the tail sits on the card's left edge pointing
@@ -90,38 +96,53 @@ pub fn view(ui: *AppUi, model: *const Model) AppUi.Node {
 /// The window height for the current content. The descriptor uses it at
 /// creation and chat_shell.follow resizes to it afterwards.
 pub fn windowHeight(model: *const Model) f32 {
-    if (!bubble) return titled_h;
-    return speechTop(model) + cardHeight(model) + row_gap + pill_h + row_gap + control_h;
+    if (!bubble) return contentBudget(model) + app.companion_header_h + 24;
+    return speechTop(model) + cardHeight(model) + belowSpeech(model);
 }
 
-/// The stacked bubbles' height cap. With the reply card and composer the
-/// window then still fits a laptop screen: AppKit clamps a taller window
-/// by its top, which would push the composer off the bottom.
-/// ponytail: fixed, the SDK does not report screen size; derive it from
-/// the visible frame if that ever lands.
-const max_stack_h: f32 = 640;
+fn contentBudget(model: *const Model) f32 {
+    const screen_h: f32 = if (model.pet_screen) |s| @floatCast(s.h) else 720;
+    return if (bubble) screen_h - 32 else @min(titled_h, screen_h - 32) - app.companion_header_h - 24;
+}
+
+fn belowSpeech(model: *const Model) f32 {
+    const timer_h = if (model.timer.clock.config.visible) row_gap + timer_view.height(model) else 0;
+    return pill_h + control_h + 2 * row_gap + timer_h;
+}
+
+fn replyBudget(model: *const Model) f32 {
+    return @max(min_card_h, contentBudget(model) - belowSpeech(model));
+}
 
 const Stack = struct { from: usize, to: usize, top: f32 };
 
 /// The transcript range stacked above the reply card and the height it
 /// takes: the last `st.stack` exchanges, minus the reply the card itself
-/// shows, dropping the oldest messages past max_stack_h.
+/// shows, dropping the oldest messages past the available screen height.
 fn stacked(model: *const Model) Stack {
     const st = &model.chat;
     if (st.history) return .{ .from = 0, .to = 0, .top = 0 };
     const tr = &st.session.transcript;
     var to = tr.len();
     if (st.session.currentReply() != null) to -= 1;
-    // Each exchange opens on a user turn.
-    var from = to;
+    // Count the current reply too. A user message and the reply directly
+    // after it form one exchange; each unprompted pet message is its own.
+    var from = tr.len();
     var left: usize = st.stack;
+    // A visible proactive request has no transcript entry until its first
+    // delta, but its thinking/error card already occupies an exchange.
+    // Timer drafts stay hidden and keep showing the previous reply.
+    if (st.session.prompt != .none and st.session.prompt != .timer_done and
+        (st.session.thinking() or st.session.phase == .failed)) left -|= 1;
     while (from > 0 and left > 0) {
         from -= 1;
-        if (tr.get(from).role == .user) left -= 1;
+        if (tr.get(from).role == .assistant and from > 0 and tr.get(from - 1).role == .user) from -= 1;
+        left -= 1;
     }
     var top: f32 = 0;
     for (from..to) |i| top += stackedHeight(model, tr.get(i)) + row_gap;
-    while (top > max_stack_h and from < to) : (from += 1) top -= stackedHeight(model, tr.get(from)) + row_gap;
+    const stack_budget = @max(0, replyBudget(model) - cardHeight(model));
+    while (top > stack_budget and from < to) : (from += 1) top -= stackedHeight(model, tr.get(from)) + row_gap;
     return .{ .from = from, .to = to, .top = top };
 }
 
@@ -165,11 +186,11 @@ fn stackedBubble(ui: *AppUi, model: *const Model, m: Message) AppUi.Node {
 
 pub fn cardHeight(model: *const Model) f32 {
     const st = &model.chat;
-    if (st.history) return history_card_h;
+    if (st.history) return @min(history_card_h, replyBudget(model));
     var buf: [speech_buf_len]u8 = undefined;
     const sp = speech(st, &buf);
     const action: f32 = if (sp.action != null) action_gap + action_h else 0;
-    return @max(min_card_h, @ceil(card_pad * 2 + textHeight(model, sp.text) + action));
+    return @min(replyBudget(model), @max(min_card_h, @ceil(card_pad * 2 + textHeight(model, sp.text) + action)));
 }
 
 /// Wrapped height of `text` in the reply card, capped at max_lines.
@@ -252,16 +273,16 @@ fn speech(st: *const State, buf: []u8) Speech {
     // From the moment a request starts (a send, a retry, a briefing,
     // a credential refresh) until its first words: the thinking line.
     const reply = s.currentReply() orelse "";
-    if (s.busy() and reply.len == 0) return .{ .text = st.thinkingText() };
+    if (s.busy() and s.prompt != .timer_done and reply.len == 0) return .{ .text = st.thinkingText() };
+    if (reply.len > 0) return .{ .text = reply, .tone = .speech };
     if (!st.ready()) return .{
         .text = if (st.kind == .codex)
-            i18n.bufPrint(buf, "Sign in to ChatGPT in Settings to talk to {s}.", "{s}と話すには、設定でChatGPTにサインインしてください。", .{st.petName()}) catch i18n.t("Sign in to ChatGPT in Settings.", "設定でChatGPTにサインインしてください。")
+            i18n.bufPrint(buf, "Connect ChatGPT to talk to {s}.", "ChatGPTを接続して、{s}と話しましょう。", .{st.petName()}) catch i18n.t("Connect ChatGPT to start chatting.", "ChatGPTを接続して会話を始めましょう。")
         else
-            i18n.t("Set the local server URL in Settings.", "設定でローカルサーバーのURLを指定してください。"),
-        .action = .open_settings,
-        .action_label = i18n.t("Open Settings", "設定を開く"),
+            i18n.t("Connect a local server to start chatting.", "ローカルサーバーを接続して会話を始めましょう。"),
+        .action = .open_chat_options,
+        .action_label = i18n.t("Set up chat", "チャットを接続"),
     };
-    if (reply.len > 0) return .{ .text = reply, .tone = .speech };
     if (s.lost_text) return .{ .text = i18n.t("Part of this reply was lost.", "返事の一部が失われました。") };
     return .{ .text = i18n.bufPrint(buf, "Say hello to {s}.", "{s}に話しかけてみましょう。", .{st.petName()}) catch i18n.t("Say hello.", "話しかけてみましょう。") };
 }
@@ -283,7 +304,7 @@ fn speechContent(ui: *AppUi, model: *const Model, st: *const State) AppUi.Node {
     };
     // Sized to the estimate; a reply past max_lines scrolls in place.
     const lines = ui.scroll(.{
-        .height = textHeight(model, sp.text),
+        .height = @max(18, @min(textHeight(model, sp.text), cardHeight(model) - card_pad * 2 - @as(f32, if (sp.action != null) action_gap + action_h else 0))),
         .value = st.scroll,
         .on_scroll = AppUi.scrollMsg(.chat_scrolled),
     }, .{para});
@@ -408,11 +429,15 @@ fn composer(ui: *AppUi, model: *const Model, st: *const State) AppUi.Node {
 /// Small round buttons under the composer. Each wears the bubble surface
 /// so it stays legible over any desktop.
 fn controls(ui: *AppUi, model: *const Model, st: *const State) AppUi.Node {
+    var options = ui.button(.{ .size = .sm, .height = control_h, .on_press = .open_chat_options, .semantics = .{ .label = i18n.t("Chat options", "チャットの設定") } }, i18n.t("Options", "会話の設定"));
+    app.styleSpeechCard(&options, model.dark);
+    options.widget.style.radius = control_h / 2;
     return ui.row(.{ .gap = 6, .width = card_w }, .{
+        options,
         ui.el(.stack, .{ .grow = 1 }, .{}),
         // Starts over: the conversation and its saved history go.
-        roundButton(ui, model, "edit", i18n.t("New Chat", "新しいチャット"), .chat_clear, st.session.transcript.len() == 0 and !st.session.busy()),
-        roundButton(ui, model, "clock", if (st.history) i18n.t("Latest Reply", "最新の返事") else i18n.t("Earlier Messages", "以前のメッセージ"), .chat_toggle_history, false),
+        roundButton(ui, model, "refresh-cw", i18n.t("Reset conversation", "会話をリセット"), .chat_clear, st.session.transcript.len() == 0 and !st.session.busy()),
+        roundButton(ui, model, if (st.history) "arrow-down" else "clock", if (st.history) i18n.t("Latest Reply", "最新の返事") else i18n.t("Earlier Messages", "以前のメッセージ"), .chat_toggle_history, false),
         roundButton(ui, model, "x", i18n.t("Close Chat", "チャットを閉じる"), .chat_closed, false),
     });
 }
@@ -432,16 +457,39 @@ fn roundButton(ui: *AppUi, model: *const Model, icon: []const u8, label: []const
     return button;
 }
 
-// ── Settings ──────────────────────────────────────────────────────────
+// The options use the preferences window's slot so opening them never
+// evicts a companion window. They have their own title and return action.
+pub fn optionsView(ui: *AppUi, model: *const Model) AppUi.Node {
+    var root = ui.el(.panel, .{ .grow = 1 }, .{ui.column(.{ .grow = 1 }, .{
+        ui.el(.stack, .{ .height = app.companion_header_h, .window_drag = true }, .{}),
+        ui.row(.{ .padding = 20, .gap = 12, .cross = .center }, .{
+            ui.column(.{ .grow = 1, .gap = 6 }, .{
+                ui.text(.{ .size = .lg }, i18n.t("Chat options", "チャットの設定")),
+                muted(ui, i18n.t("Connection and conversation, in one place.", "接続先と会話のふるまいを、ここで。")),
+            }),
+            ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .close_chat_options }, i18n.t("Back to chat", "チャットに戻る")),
+        }),
+        ui.scroll(.{ .grow = 1, .value = model.settings_scroll, .on_scroll = AppUi.scrollMsg(.settings_scrolled) }, .{
+            ui.column(.{ .padding = 20, .gap = 12 }, .{
+                optionsSection(ui, model),
+                ui.el(.stack, .{ .height = 12 }, .{}),
+            }),
+        }),
+    })});
+    root.widget.style.radius = 0;
+    root.widget.style.stroke_width = 0;
+    root.widget.style.background = app.settingsBackground(model);
+    return root;
+}
 
-pub fn settingsSection(ui: *AppUi, model: *const Model) AppUi.Node {
+fn optionsSection(ui: *AppUi, model: *const Model) AppUi.Node {
     const st = &model.chat;
     return ui.column(.{ .gap = 10 }, .{
-        ui.text(.{ .size = .lg }, i18n.t("Chat", "チャット")),
+        ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, i18n.t("CONNECTION", "接続")),
         panel(ui, ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
             ui.column(.{ .grow = 1 }, .{
-                ui.text(.{}, i18n.t("Talk to your pet", "ペットと話す")),
-                muted(ui, i18n.t("Click the pet to chat; double-click for a catch-up on your agents", "クリックでチャット、ダブルクリックでエージェントの様子を聞けます")),
+                ui.text(.{}, i18n.t("Reply with", "返事に使うサービス")),
+                muted(ui, i18n.t("Choose the service for this conversation", "会話に使うサービスを選びます")),
             }),
             ui.row(.{ .gap = 6 }, .{
                 ui.button(.{
@@ -460,6 +508,8 @@ pub fn settingsSection(ui: *AppUi, model: *const Model) AppUi.Node {
             .codex => chatgptPanel(ui, st),
             .openai_compat => localPanel(ui, st),
         },
+        ui.el(.stack, .{ .height = 8 }, .{}),
+        ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, i18n.t("CONVERSATION", "会話")),
         panel(ui, ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
             ui.column(.{ .grow = 1 }, .{
                 ui.text(.{}, i18n.t("Messages on screen", "画面に残すメッセージ")),
@@ -631,6 +681,63 @@ test "the chat bubble stacks as many exchanges as the setting allows" {
     try std.testing.expectEqual(@as(f32, 0), speechTop(&model));
 }
 
+test "standalone pet messages respect every display limit immediately" {
+    var model: Model = .{};
+    // Keep screen fitting from concealing a broken exchange count.
+    model.pet_screen = .{ .x = 0, .y = 0, .w = 1920, .h = 4000 };
+    const tr = &model.chat.session.transcript;
+    tr.append(.user, "hello");
+    tr.append(.assistant, "hello back");
+    // Small talk, nudges and timer notices have no preceding user turn.
+    for (0..8) |_| tr.append(.assistant, "a pet announcement");
+    var limit: usize = chat_shell.max_stack;
+    while (limit > 0) : (limit -= 1) {
+        model.chat.stack = @intCast(limit);
+        const range = stacked(&model);
+        try std.testing.expectEqual(tr.len() - limit, range.from);
+        try std.testing.expectEqual(tr.len() - 1, range.to);
+    }
+    // The setting changes only what is visible, not the saved conversation.
+    try std.testing.expectEqual(@as(usize, 10), tr.len());
+}
+
+test "display limits count pairs and standalone turns as separate exchanges" {
+    var model: Model = .{};
+    model.pet_screen = .{ .x = 0, .y = 0, .w = 1920, .h = 4000 };
+    const tr = &model.chat.session.transcript;
+    tr.append(.assistant, "welcome");
+    tr.append(.user, "question");
+    tr.append(.assistant, "answer");
+    tr.append(.assistant, "small talk");
+    tr.append(.user, "unanswered question");
+    tr.append(.user, "another question");
+    tr.append(.assistant, "another answer");
+    tr.append(.assistant, "timer finished");
+    for ([_]usize{ 7, 5, 4, 3, 1, 0 }, 1..) |first, limit| {
+        model.chat.stack = @intCast(limit);
+        const range = stacked(&model);
+        try std.testing.expectEqual(first, range.from);
+        try std.testing.expectEqual(@as(usize, 7), range.to);
+    }
+}
+
+test "a new pet turn keeps the display limit while thinking and streaming" {
+    var model: Model = .{};
+    model.chat.stack = 1;
+    const s = &model.chat.session;
+    s.transcript.append(.user, "hello");
+    s.transcript.append(.assistant, "hello back");
+    s.transcript.append(.assistant, "an earlier announcement");
+    try std.testing.expectEqual(chat.session.Action.request, s.brief(.briefing, false, 0));
+    try std.testing.expectEqual(stacked(&model).to, stacked(&model).from);
+    var scratch: [4096]u8 = undefined;
+    s.onLine(.openai_compat, s.streamKey(), "data: {\"choices\":[{\"delta\":{\"content\":\"a new briefing\"}}]}", false, false, &scratch);
+    try std.testing.expectEqual(stacked(&model).to, stacked(&model).from);
+    try std.testing.expectEqual(chat.session.Action.done, s.onResponse(.openai_compat, s.streamKey(), 200, null));
+    try std.testing.expectEqual(stacked(&model).to, stacked(&model).from);
+    try std.testing.expectEqualStrings("a new briefing", s.currentReply().?);
+}
+
 test "a stack of long messages drops its oldest to stay on screen" {
     var model: Model = .{};
     model.chat.local_url.set("http://localhost:1234/v1");
@@ -641,8 +748,41 @@ test "a stack of long messages drops its oldest to stay on screen" {
         tr.append(.assistant, "and more " ** 80);
     }
     const top = speechTop(&model);
-    try std.testing.expect(top <= max_stack_h);
-    try std.testing.expect(top > max_stack_h / 2);
+    try std.testing.expect(top <= replyBudget(&model) - cardHeight(&model));
+    try std.testing.expect(top > 0);
+    try std.testing.expect(windowHeight(&model) <= if (bubble) contentBudget(&model) else titled_h);
+}
+
+test "timer and composer fit a small display with settings and history open" {
+    var model: Model = .{};
+    model.pet_screen = .{ .x = 0, .y = 0, .w = 1024, .h = 600 };
+    model.timer.options_open = true;
+    model.chat.history = true;
+    try std.testing.expect(windowHeight(&model) <= 568);
+    try std.testing.expect(cardHeight(&model) >= min_card_h);
+    model.chat.history = false;
+    for (0..8) |_| {
+        model.chat.session.transcript.append(.user, "A long draft " ** 100);
+        model.chat.session.transcript.append(.assistant, "A long reply " ** 100);
+    }
+    try std.testing.expect(windowHeight(&model) <= 568);
+}
+
+test "hiding the timer reclaims its card and gap for chat" {
+    for ([_]bool{ false, true }) |options_open| {
+        var model: Model = .{};
+        model.chat.open = true;
+        model.chat.local_url.set("http://localhost:1234/v1");
+        model.timer.options_open = options_open;
+        const shown_h = windowHeight(&model);
+        const shown_budget = replyBudget(&model);
+        const freed_h = timer_view.height(&model) + row_gap;
+        model.timer.clock.config.visible = false;
+        try std.testing.expectEqual(shown_budget + freed_h, replyBudget(&model));
+        if (bubble) try std.testing.expectEqual(shown_h - freed_h, windowHeight(&model));
+        model.timer.clock.config.visible = true;
+        try std.testing.expectEqual(shown_h, windowHeight(&model));
+    }
 }
 
 test "stacked bubbles cut long text at their line cap" {
@@ -667,7 +807,7 @@ test "the reply card thinks until the first words, a briefing included" {
     try std.testing.expectEqualStrings("hey", speech(st, &buf).text);
     // A briefing adds no user turn: the old reply joins the stack and
     // the card thinks.
-    try std.testing.expectEqual(chat.session.Action.request, s.brief(.briefing, false));
+    try std.testing.expectEqual(chat.session.Action.request, s.brief(.briefing, false, 0));
     try std.testing.expectEqualStrings(st.thinkingText(), speech(st, &buf).text);
     try std.testing.expectEqual(@as(usize, 2), stacked(&model).to);
     // The first words replace the thinking line; the old reply stays stacked.
@@ -681,12 +821,12 @@ test "the reply card thinks until the first words, a briefing included" {
     try std.testing.expectEqualStrings(st.thinkingText(), speech(st, &buf).text);
 }
 
-test "an unconfigured chat bubble points at Settings" {
+test "an unconfigured chat bubble opens its connection options" {
     var model: Model = .{};
     var buf: [speech_buf_len]u8 = undefined;
     const sp = speech(&model.chat, &buf);
-    try std.testing.expect(sp.action.? == .open_settings);
-    // The Open Settings button adds to the card.
+    try std.testing.expect(sp.action.? == .open_chat_options);
+    // The connection button adds to the card.
     const unconfigured = cardHeight(&model);
     model.chat.local_url.set("http://localhost:1234/v1");
     try std.testing.expect(cardHeight(&model) < unconfigured);
