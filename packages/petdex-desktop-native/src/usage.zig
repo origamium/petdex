@@ -2,12 +2,13 @@
 //! beside the pet: one row per agent at its tightest window, and, for the
 //! row clicked open, every window with its reset.
 //!
-//! Claude Code and Codex report their limits themselves, through the
-//! statusline relay and the Stop hook (hook_runner.zig); both land as small
-//! files under ~/.petdex/runtime/usage/ (writeWindows). Junie's credits sit
-//! in the JetBrains IDEs' quota file, a pool Junie shares with AI Assistant.
-//! Copilot and Cursor are fetched by main.zig and parsed here. No token is
-//! ever refreshed: redeeming an agent's refresh token signs that agent out.
+//! Claude Code still reports through its statusline relay. Codex limits are
+//! written by the MCP `petdex_report_usage` tool or the legacy Stop hook, and
+//! when neither has left a file the newest ~/.codex/sessions rollout is
+//! scanned. Junie's credits sit in the JetBrains IDEs' quota file, a pool
+//! Junie shares with AI Assistant. Copilot and Cursor are fetched by
+//! main.zig and parsed here. No token is ever refreshed: redeeming an
+//! agent's refresh token signs that agent out.
 
 const std = @import("std");
 const plat = @import("plat.zig");
@@ -384,8 +385,57 @@ const Newest = struct {
 pub fn readFiles(state: *State, home: []const u8, now_ms: i64) void {
     state.now_s = @divFloor(now_ms, 1000);
     state.set(.@"claude-code", windowsFromFile(home, .@"claude-code"));
-    state.set(.codex, windowsFromFile(home, .codex));
+    // Prefer a freshly reported file (MCP tool or Stop hook). Fall back to
+    // scanning the newest Codex rollout so MCP-only installs still fill the
+    // usage column without shell hooks.
+    state.set(.codex, windowsFromFile(home, .codex) orelse windowsFromCodexSessions(home));
     state.set(.junie, windowsFromJetBrains(home));
+}
+
+/// Walk ~/.codex/sessions for the newest rollout-*.jsonl and read its last
+/// rate_limits line. Bounded: dated dirs are shallow (YYYY/MM/DD).
+fn windowsFromCodexSessions(home: []const u8) ?Windows {
+    var root_buf: [512]u8 = undefined;
+    const root = std.fmt.bufPrint(&root_buf, "{s}/.codex/sessions", .{home}) catch return null;
+    var best_buf: [768]u8 = undefined;
+    var best_len: usize = 0;
+    findNewestRollout(root, &best_buf, &best_len, 0);
+    if (best_len == 0) return null;
+    var scan_buf: [64 * 1024]u8 = undefined;
+    const line = plat.lastLineMatching(best_buf[0..best_len], &scan_buf, carriesCodexLimits) orelse return null;
+    return windowsFromCodexLine(line);
+}
+
+fn findNewestRollout(dir_path: []const u8, best_buf: *[768]u8, best_len: *usize, depth: usize) void {
+    if (depth > 4) return;
+    const Ctx = struct {
+        parent: []const u8,
+        best_buf: *[768]u8,
+        best_len: *usize,
+        depth: usize,
+
+        fn visit(self: *@This(), name: []const u8) void {
+            if (name.len == 0 or name[0] == '.') return;
+            var child_buf: [768]u8 = undefined;
+            const child = std.fmt.bufPrint(&child_buf, "{s}/{s}", .{ self.parent, name }) catch return;
+            if (plat.dirExists(child)) {
+                findNewestRollout(child, self.best_buf, self.best_len, self.depth + 1);
+                return;
+            }
+            if (!std.mem.startsWith(u8, name, "rollout-") or !std.mem.endsWith(u8, name, ".jsonl")) return;
+            if (self.best_len.* == 0 or std.mem.order(u8, child, self.best_buf.*[0..self.best_len.*]) == .gt) {
+                @memcpy(self.best_buf.*[0..child.len], child);
+                self.best_len.* = child.len;
+            }
+        }
+    };
+    var ctx: Ctx = .{
+        .parent = dir_path,
+        .best_buf = best_buf,
+        .best_len = best_len,
+        .depth = depth,
+    };
+    plat.forEachEntry(dir_path, &ctx, Ctx.visit);
 }
 
 // ------------------------------------------------------------ copilot

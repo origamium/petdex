@@ -180,15 +180,19 @@ resets; click it again to close them.
 - **Claude Code** hands its limits to its statusline. Turning the column on
   wraps the `statusLine` command in `~/.claude/settings.json`; the wrapper
   keeps the numbers and runs your command as before. Turning the column off,
-  or removing Petdex's Claude Code hooks, puts yours back. The row needs those
-  hooks.
-- **Codex** writes them into its session log, read by the Stop hook at the end
-  of each turn.
+  or removing Petdex's Claude Code connection, puts yours back. Connections
+  installs Petdex as an MCP server (`npx -y petdex mcp-server`).
+- **Codex** is connected the same way (MCP in `~/.codex/config.toml`). Usage
+  comes from `petdex_report_usage`, or from the newest session rollout under
+  `~/.codex/sessions` when that file is missing.
 - **Junie** spends JetBrains AI credits, read from the quota file the JetBrains
-  IDEs keep, as of an IDE's last check.
-- **Copilot** and **Cursor** are asked every five minutes, with the sign-ins
-  their own apps keep (`~/.config/github-copilot/apps.json`, Cursor's settings
-  database).
+  IDEs keep, as of an IDE's last check. Connections also writes
+  `~/.junie/mcp/mcp.json` so Junie can drive the pet over MCP.
+- **Cursor** and **Antigravity** install the same MCP server into their
+  config files (`~/.cursor/mcp.json`, `~/.gemini/config/mcp_config.json`).
+- **Copilot** and **Cursor** usage are asked every five minutes, with the
+  sign-ins their own apps keep (`~/.config/github-copilot/apps.json`, Cursor's
+  settings database).
 
 An agent with nothing to report has no row. Petdex never refreshes an agent's
 sign-in.

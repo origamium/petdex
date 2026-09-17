@@ -14,6 +14,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const plat = @import("plat.zig");
 const dsh_integration = @import("dsh_integration.zig");
+const agent_mcp = @import("agent_mcp.zig");
 
 pub const AgentKind = enum(u8) {
     claude_code,
@@ -34,6 +35,11 @@ pub const AgentKind = enum(u8) {
     // DSH Web is macOS-only in the first integration slice. Appended so the
     // existing icon atlas indices remain stable.
     dsh,
+    // MCP-first agents (no shell-hook installer of their own). Appended so
+    // prior AgentKind indices stay stable.
+    cursor,
+    junie,
+    antigravity,
 
     pub fn displayName(self: AgentKind) []const u8 {
         return switch (self) {
@@ -47,6 +53,9 @@ pub const AgentKind = enum(u8) {
             .omp => "OMP",
             .hermes => "Hermes",
             .dsh => "DeepSeek Harness",
+            .cursor => "Cursor",
+            .junie => "Junie",
+            .antigravity => "Antigravity",
         };
     }
 
@@ -62,6 +71,28 @@ pub const AgentKind = enum(u8) {
             .omp => "omp",
             .hermes => "hermes",
             .dsh => "dsh",
+            .cursor => "cursor",
+            .junie => "junie",
+            .antigravity => "antigravity",
+        };
+    }
+
+    pub fn prefersMcp(self: AgentKind) bool {
+        return switch (self) {
+            .claude_code, .codex, .gemini, .cursor, .junie, .antigravity => true,
+            else => false,
+        };
+    }
+
+    pub fn mcpKind(self: AgentKind) ?agent_mcp.McpAgent {
+        return switch (self) {
+            .claude_code => .claude_code,
+            .codex => .codex,
+            .gemini => .gemini,
+            .cursor => .cursor,
+            .junie => .junie,
+            .antigravity => .antigravity,
+            else => null,
         };
     }
 };
@@ -82,7 +113,7 @@ pub const AgentInfo = struct {
     status: HookStatus = .absent,
 };
 
-pub const agent_count = 10;
+pub const agent_count = 13;
 
 /// Claude Code keeps everything under ~/.claude unless CLAUDE_CONFIG_DIR
 /// points elsewhere — that env var is how people run several fully
@@ -519,6 +550,9 @@ pub fn scan(allocator: std.mem.Allocator, home: []const u8) [agent_count]AgentIn
         .{ .kind = .omp },
         .{ .kind = .hermes },
         .{ .kind = .dsh },
+        .{ .kind = .cursor },
+        .{ .kind = .junie },
+        .{ .kind = .antigravity },
     };
     // Several roots behind one row: cannot ride the single-dir/single-config
     // shape below, so it is resolved up front. The arms `continue` rather than
@@ -537,7 +571,28 @@ pub fn scan(allocator: std.mem.Allocator, home: []const u8) [agent_count]AgentIn
             };
             continue;
         }
+        // MCP-first agents: presence + petdex MCP entry, no shell hooks.
+        if (info.kind.mcpKind()) |mcp| {
+            const mcp_status = agent_mcp.scanOne(allocator, home, mcp);
+            if (mcp_status == .absent) {
+                // Claude / Codex / Gemini may still show via their hook config
+                // roots below when MCP is absent.
+                if (info.kind == .cursor or info.kind == .junie or info.kind == .antigravity) {
+                    info.status = .absent;
+                    continue;
+                }
+            } else if (mcp_status == .current) {
+                info.status = .current;
+                continue;
+            } else if (info.kind == .cursor or info.kind == .junie or info.kind == .antigravity) {
+                info.status = .none;
+                continue;
+            }
+            // claude/codex/gemini with MCP absent/none fall through to hook scan;
+            // leftover hooks count as outdated so Update migrates to MCP.
+        }
         if (info.kind == .hermes and builtin.os.tag == .windows) continue;
+        if (info.kind == .cursor or info.kind == .junie or info.kind == .antigravity) continue;
         const dir = switch (info.kind) {
             .claude_code => claudeConfigDir(&path, home) orelse continue,
             .codex => std.fmt.bufPrint(&path, "{s}/.codex", .{home}) catch continue,
@@ -548,7 +603,7 @@ pub fn scan(allocator: std.mem.Allocator, home: []const u8) [agent_count]AgentIn
             .codebuddy => std.fmt.bufPrint(&path, "{s}/.codebuddy", .{home}) catch continue,
             .omp => ompAgentDir(&path, home) orelse continue,
             .hermes => hermesHome(&path, home) orelse continue,
-            .dsh => unreachable,
+            .dsh, .cursor, .junie, .antigravity => unreachable,
         };
         if (!dirExists(dir)) continue;
         info.status = .none;
@@ -562,7 +617,7 @@ pub fn scan(allocator: std.mem.Allocator, home: []const u8) [agent_count]AgentIn
             .codebuddy => std.fmt.bufPrint(&path, "{s}/.codebuddy/settings.json", .{home}) catch continue,
             .omp => ompExtensionPath(&path, home) orelse continue,
             .hermes => hermesConfigPath(&path, home) orelse continue,
-            .dsh => unreachable,
+            .dsh, .cursor, .junie, .antigravity => unreachable,
         };
         if (readFileAlloc(allocator, cfg, 512 * 1024)) |content| {
             defer allocator.free(content);
@@ -610,6 +665,11 @@ pub fn scan(allocator: std.mem.Allocator, home: []const u8) [agent_count]AgentIn
                 defer allocator.free(installed);
                 if (!std.mem.eql(u8, std.mem.trim(u8, installed, " \n"), std.mem.trim(u8, hermes_desktop_plugin_init, " \n"))) continue;
                 info.status = .current;
+            } else if (info.kind.prefersMcp()) {
+                // Hooks still present after the MCP migration: treat as
+                // outdated so Connections → Update writes MCP and clears them.
+                const hooks_status = classifyConfig(allocator, content);
+                info.status = if (hooks_status == .none) .none else .node;
             } else {
                 info.status = classifyConfig(allocator, content);
             }
@@ -630,9 +690,19 @@ fn emptyObject(a: std.mem.Allocator) std.json.Value {
 const HookEvent = struct { event: []const u8, phase: []const u8 };
 
 pub fn installClaude(allocator: std.mem.Allocator, home: []const u8) bool {
+    // Presence detection looks for ~/.claude; ensure it exists even when the
+    // user only keeps settings under CLAUDE_CONFIG_DIR.
+    var claude_dir_buf: [512]u8 = undefined;
+    if (std.fmt.bufPrint(&claude_dir_buf, "{s}/.claude", .{home})) |dir| {
+        plat.makeDir(dir);
+    } else |_| {}
+    if (!agent_mcp.install(allocator, home, .claude_code)) return false;
+    // Drop shell hooks so activity is not double-posted once MCP is live.
     var path_buf: [512]u8 = undefined;
-    const path = claudeSettingsPath(&path_buf, home) orelse return false;
-    return installJsonHooks(allocator, path, &claude_events, "claude-code", 2, false);
+    if (claudeSettingsPath(&path_buf, home)) |path| {
+        if (fileExists(path)) _ = uninstallJsonHooks(allocator, path);
+    }
+    return true;
 }
 
 /// Claude Code's statusline, wrapped for the usage column: the relay
@@ -760,9 +830,11 @@ const gemini_events = [_]HookEvent{
 };
 
 pub fn installGemini(allocator: std.mem.Allocator, home: []const u8) bool {
+    if (!agent_mcp.install(allocator, home, .gemini)) return false;
     var path_buf: [512]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{s}/.gemini/settings.json", .{home}) catch return false;
-    return installJsonHooks(allocator, path, &gemini_events, "gemini", 2000, true);
+    const path = std.fmt.bufPrint(&path_buf, "{s}/.gemini/settings.json", .{home}) catch return true;
+    if (fileExists(path)) _ = uninstallJsonHooks(allocator, path);
+    return true;
 }
 
 // ------------------------------------------------------------------ omp
@@ -1966,27 +2038,14 @@ fn removeManagedHooks(hooks_obj: *std.json.ObjectMap) void {
     }
 }
 
-/// Install/refresh Codex hooks, preserving non-Petdex hooks in hooks.json
-/// and enabling the required feature flag in config.toml.
+/// Install/refresh Codex via MCP. Legacy hooks.json entries are stripped so
+/// activity is not double-posted; the features.hooks flag is left alone.
 pub fn installCodex(allocator: std.mem.Allocator, home: []const u8) bool {
+    if (!agent_mcp.install(allocator, home, .codex)) return false;
     var hooks_path_buf: [512]u8 = undefined;
-    const hooks_path = std.fmt.bufPrint(&hooks_path_buf, "{s}/.codex/hooks.json", .{home}) catch return false;
-    var toml_path_buf: [512]u8 = undefined;
-    const toml_path = std.fmt.bufPrint(&toml_path_buf, "{s}/.codex/config.toml", .{home}) catch return false;
-    const toml = readFileAlloc(allocator, toml_path, 1024 * 1024);
-    defer if (toml) |tm| allocator.free(tm);
-    if (toml) |content| {
-        if (inspectFeatureHooks(content).state == .unsafe) return false;
-    } else if (fileExists(toml_path)) return false;
-
-    // Validate both files before changing either one. Write hooks first so a
-    // later config.toml failure can only leave the new runner disabled, never
-    // keep an enabled legacy runner on the hook hot path.
-    if (!canInstallJsonHooks(allocator, hooks_path, &codex_events)) return false;
-    if (!installJsonHooks(allocator, hooks_path, &codex_events, "codex", 2, false)) return false;
-
-    if (toml) |content| return ensureFeatureHooks(allocator, toml_path, content);
-    return writeFile(toml_path, "[features]\nhooks = true\n");
+    const hooks_path = std.fmt.bufPrint(&hooks_path_buf, "{s}/.codex/hooks.json", .{home}) catch return true;
+    if (fileExists(hooks_path)) _ = uninstallJsonHooks(allocator, hooks_path);
+    return true;
 }
 
 const FeatureHooksState = enum {
@@ -2191,6 +2250,9 @@ pub fn migrateLegacyHooks(allocator: std.mem.Allocator, home: []const u8) Legacy
             .omp => installOmp(allocator, home),
             .hermes => continue,
             .dsh => continue,
+            // MCP-first agents: Install already writes MCP; boot migration
+            // only repairs legacy hook runners.
+            .cursor, .junie, .antigravity => continue,
         };
         if (migrated) result.migrated += 1 else result.failed += 1;
     }
@@ -2203,17 +2265,25 @@ pub fn uninstall(allocator: std.mem.Allocator, home: []const u8, kind: AgentKind
         .claude_code => {
             const path = claudeSettingsPath(&path_buf, home) orelse return false;
             // Leaving Claude Code takes the usage relay along.
-            return uninstallClaudeStatusline(allocator, home) and uninstallJsonHooks(allocator, path);
+            const hooks_ok = uninstallClaudeStatusline(allocator, home) and uninstallJsonHooks(allocator, path);
+            const mcp_ok = agent_mcp.uninstall(allocator, home, .claude_code);
+            return hooks_ok and mcp_ok;
         },
         .gemini => {
             const path = std.fmt.bufPrint(&path_buf, "{s}/.gemini/settings.json", .{home}) catch return false;
-            return uninstallJsonHooks(allocator, path);
+            const hooks_ok = uninstallJsonHooks(allocator, path);
+            const mcp_ok = agent_mcp.uninstall(allocator, home, .gemini);
+            return hooks_ok and mcp_ok;
         },
         .codex => {
-            // The config.toml feature flag stays harmless without the file.
             const p = std.fmt.bufPrint(&path_buf, "{s}/.codex/hooks.json", .{home}) catch return false;
-            return uninstallJsonHooks(allocator, p);
+            const hooks_ok = uninstallJsonHooks(allocator, p);
+            const mcp_ok = agent_mcp.uninstall(allocator, home, .codex);
+            return hooks_ok and mcp_ok;
         },
+        .cursor => return agent_mcp.uninstall(allocator, home, .cursor),
+        .junie => return agent_mcp.uninstall(allocator, home, .junie),
+        .antigravity => return agent_mcp.uninstall(allocator, home, .antigravity),
         .opencode => {
             const p = std.fmt.bufPrint(&path_buf, "{s}/.config/opencode/plugins/petdex.js", .{home}) catch return false;
             plat.deleteFile(p);
@@ -2292,7 +2362,7 @@ test "claude merge preserves foreign keys and hooks, replaces petdex entries" {
     try t.expect(entryIsPetdex(arr.items[1]));
 }
 
-test "installClaude merges into a real fixture home non-destructively" {
+test "installClaude writes MCP and strips legacy petdex hooks" {
     const home = ".zig-cache/petdex-agenthooks-fixture";
     plat.makeDir(home ++ "/.claude");
     const fixture =
@@ -2304,27 +2374,22 @@ test "installClaude merges into a real fixture home non-destructively" {
     var pb: [512]u8 = undefined;
     const cfg = std.fmt.bufPrint(&pb, "{s}/.claude/settings.json", .{home}) catch unreachable;
     try t.expect(writeFile(cfg, fixture));
+    plat.deleteFile(home ++ "/.claude.json");
     try t.expect(installClaude(t.allocator, home));
     const merged = readFileAlloc(t.allocator, cfg, 1024 * 1024).?;
     defer t.allocator.free(merged);
-    // Foreign keys and the user's own hook survive.
+    // Foreign keys and the user's own hook survive; petdex hooks are gone.
     try t.expect(std.mem.indexOf(u8, merged, "\"model\"") != null);
     try t.expect(std.mem.indexOf(u8, merged, "statusLine") != null);
     try t.expect(std.mem.indexOf(u8, merged, "my-own-thing") != null);
-    // The node entry is gone, the canonical one is in, every event.
-    try t.expect(std.mem.indexOf(u8, merged, "petdex.js") == null);
-    try t.expect(std.mem.indexOf(u8, merged, "petdex-hook") != null);
-    try t.expect(std.mem.indexOf(u8, merged, "StopFailure") != null);
-    try t.expect(std.mem.indexOf(u8, merged, "UserPromptSubmit") != null);
-    try t.expect(std.mem.indexOf(u8, merged, "Stop") != null);
-    // Idempotent: run again, still exactly one petdex entry per event.
-    try t.expect(installClaude(t.allocator, home));
-    const merged2 = readFileAlloc(t.allocator, cfg, 1024 * 1024).?;
-    defer t.allocator.free(merged2);
-    try t.expectEqual(expectedCanonicalHookTextOccurrences(), std.mem.count(u8, merged2, "bubble pre claude-code"));
-    // Backup exists.
-    const bak = std.fmt.bufPrint(&pb, "{s}/.claude/settings.json.pre-petdex-backup", .{home}) catch unreachable;
-    try t.expect(fileExists(bak));
+    try t.expect(std.mem.indexOf(u8, merged, "petdex") == null);
+    var mcp_pb: [512]u8 = undefined;
+    const mcp_cfg = std.fmt.bufPrint(&mcp_pb, "{s}/.claude.json", .{home}) catch unreachable;
+    const mcp = readFileAlloc(t.allocator, mcp_cfg, 1024 * 1024).?;
+    defer t.allocator.free(mcp);
+    try t.expect(std.mem.indexOf(u8, mcp, "mcpServers") != null);
+    try t.expect(std.mem.indexOf(u8, mcp, "PETDEX_MCP_AGENT") != null);
+    try t.expectEqual(HookStatus.current, scan(t.allocator, home)[0].status);
 }
 
 test "the statusline relay wraps Claude Code's own and gives it back" {
@@ -2373,7 +2438,7 @@ test "no Claude Code, no statusline relay" {
     try t.expect(!fileExists(std.fmt.bufPrint(&pb, "{s}/.claude/settings.json", .{home}) catch unreachable));
 }
 
-test "installCodex migrates legacy hooks without dropping a foreign hook" {
+test "installCodex writes MCP and strips legacy petdex hooks" {
     const home = ".zig-cache/petdex-agenthooks-codex-fixture";
     plat.makeDir(home ++ "/.codex");
     var pb: [512]u8 = undefined;
@@ -2391,19 +2456,18 @@ test "installCodex migrates legacy hooks without dropping a foreign hook" {
     try t.expect(installCodex(t.allocator, home));
     const hooks = readFileAlloc(t.allocator, hooks_path, 64 * 1024).?;
     defer t.allocator.free(hooks);
-    try t.expect(std.mem.indexOf(u8, hooks, "bubble stop codex") != null);
-    try t.expect(std.mem.indexOf(u8, hooks, "PermissionRequest") != null);
-    try t.expect(std.mem.indexOf(u8, hooks, "\"timeout\": 2") != null);
     try t.expect(std.mem.indexOf(u8, hooks, "my-own-hook") != null);
-    try t.expect(std.mem.indexOf(u8, hooks, "petdex.js") == null);
+    try t.expect(std.mem.indexOf(u8, hooks, "petdex") == null);
     const toml_after = readFileAlloc(t.allocator, toml, 64 * 1024).?;
     defer t.allocator.free(toml_after);
-    try t.expect(std.mem.indexOf(u8, toml_after, "hooks = true") != null);
+    try t.expect(std.mem.indexOf(u8, toml_after, "[mcp_servers.petdex]") != null);
+    try t.expect(std.mem.indexOf(u8, toml_after, "PETDEX_MCP_AGENT") != null);
     try t.expect(std.mem.indexOf(u8, toml_after, "memories = true") != null);
     try t.expect(std.mem.indexOf(u8, toml_after, "model = \"gpt\"") != null);
+    try t.expectEqual(HookStatus.current, scan(t.allocator, home)[@intFromEnum(AgentKind.codex)].status);
 }
 
-test "CLAUDE_CONFIG_DIR redirects install, scan and uninstall" {
+test "CLAUDE_CONFIG_DIR redirects statusline settings; MCP stays user-scoped" {
     const saved = env_claude_config_dir;
     defer env_claude_config_dir = saved;
 
@@ -2416,36 +2480,30 @@ test "CLAUDE_CONFIG_DIR redirects install, scan and uninstall" {
     var pb: [512]u8 = undefined;
     const alt_cfg = std.fmt.bufPrint(&pb, "{s}/settings.json", .{alt}) catch unreachable;
     plat.deleteFile(alt_cfg);
+    var mcp_pb: [512]u8 = undefined;
+    const mcp_cfg = std.fmt.bufPrint(&mcp_pb, "{s}/.claude.json", .{home}) catch unreachable;
+    plat.deleteFile(mcp_cfg);
 
     env_claude_config_dir = alt;
     try t.expect(installClaude(t.allocator, home));
-    const written = readFileAlloc(t.allocator, alt_cfg, 1024 * 1024).?;
-    defer t.allocator.free(written);
-    try t.expect(std.mem.indexOf(u8, written, "petdex-hook") != null);
-    // Nothing leaked into the default location.
-    var def_pb: [512]u8 = undefined;
-    const default_cfg = std.fmt.bufPrint(&def_pb, "{s}/.claude/settings.json", .{home}) catch unreachable;
-    try t.expect(!fileExists(default_cfg));
+    const mcp = readFileAlloc(t.allocator, mcp_cfg, 1024 * 1024).?;
+    defer t.allocator.free(mcp);
+    try t.expect(std.mem.indexOf(u8, mcp, "mcpServers") != null);
+    try t.expect(std.mem.indexOf(u8, mcp, "petdex") != null);
+    // Nothing leaked into the override settings as hooks.
+    if (fileExists(alt_cfg)) {
+        const alt_bytes = readFileAlloc(t.allocator, alt_cfg, 64 * 1024).?;
+        defer t.allocator.free(alt_bytes);
+        try t.expect(std.mem.indexOf(u8, alt_bytes, "petdex-hook") == null);
+    }
 
-    // Detection reads the same override: connected there, even though
-    // ~/.claude does not exist.
     const agents = scan(t.allocator, home);
     try t.expectEqual(HookStatus.current, agents[0].status);
 
-    // Uninstall clears the override config, not ~/.claude.
     try t.expect(uninstall(t.allocator, home, .claude_code));
-    const cleared = readFileAlloc(t.allocator, alt_cfg, 1024 * 1024).?;
+    const cleared = readFileAlloc(t.allocator, mcp_cfg, 1024 * 1024).?;
     defer t.allocator.free(cleared);
-    try t.expect(std.mem.indexOf(u8, cleared, "petdex-hook") == null);
-
-    // Unset (and empty, the "set but blank" shell case) falls back to
-    // ~/.claude: without the dir the agent scans as absent.
-    env_claude_config_dir = null;
-    const fallback = scan(t.allocator, home);
-    try t.expectEqual(HookStatus.absent, fallback[0].status);
-    env_claude_config_dir = "";
-    const blank = scan(t.allocator, home);
-    try t.expectEqual(HookStatus.absent, blank[0].status);
+    try t.expect(std.mem.indexOf(u8, cleared, "\"petdex\"") == null);
 }
 
 test "installQoder writes six events and stays out of the rest of the config" {
@@ -2765,12 +2823,17 @@ test "installClaude removes only its command from a mixed hook group" {
         \\]}]}}
     ;
     try t.expect(writeFile(config, mixed));
+    plat.deleteFile(home ++ "/.claude.json");
     try t.expect(installClaude(t.allocator, home));
     const after = readFileAlloc(t.allocator, config, 64 * 1024).?;
     defer t.allocator.free(after);
     try t.expect(std.mem.indexOf(u8, after, "my-own-hook") != null);
-    try t.expect(std.mem.indexOf(u8, after, "petdex.js") == null);
-    try t.expect(std.mem.indexOf(u8, after, "petdex-hook") != null);
+    try t.expect(std.mem.indexOf(u8, after, "petdex") == null);
+    var mcp_pb: [512]u8 = undefined;
+    const mcp_cfg = std.fmt.bufPrint(&mcp_pb, "{s}/.claude.json", .{home}) catch unreachable;
+    const mcp = readFileAlloc(t.allocator, mcp_cfg, 64 * 1024).?;
+    defer t.allocator.free(mcp);
+    try t.expect(std.mem.indexOf(u8, mcp, "petdex") != null);
 }
 
 test "migration ignores similarly named user scripts" {
@@ -2795,6 +2858,9 @@ test "migrateLegacyHooks rewrites recognized legacy configs at startup" {
     plat.makeDir(home ++ "/.claude");
     plat.makeDir(home ++ "/.codex");
     plat.makeDir(home ++ "/.gemini");
+    plat.deleteFile(home ++ "/.claude.json");
+    plat.deleteFile(home ++ "/.codex/config.toml");
+    plat.deleteFile(home ++ "/.gemini/settings.json");
     var claude_path_buf: [512]u8 = undefined;
     const claude = std.fmt.bufPrint(&claude_path_buf, "{s}/.claude/settings.json", .{home}) catch unreachable;
     const legacy_claude =
@@ -2820,30 +2886,47 @@ test "migrateLegacyHooks rewrites recognized legacy configs at startup" {
 
     const claude_after = readFileAlloc(t.allocator, claude, 64 * 1024).?;
     defer t.allocator.free(claude_after);
-    try t.expect(std.mem.indexOf(u8, claude_after, "petdex.js") == null);
-    try t.expect(std.mem.indexOf(u8, claude_after, "petdex-hook") != null);
+    try t.expect(std.mem.indexOf(u8, claude_after, "petdex") == null);
+    var claude_mcp_buf: [512]u8 = undefined;
+    const claude_mcp = std.fmt.bufPrint(&claude_mcp_buf, "{s}/.claude.json", .{home}) catch unreachable;
+    const claude_mcp_bytes = readFileAlloc(t.allocator, claude_mcp, 64 * 1024).?;
+    defer t.allocator.free(claude_mcp_bytes);
+    try t.expect(std.mem.indexOf(u8, claude_mcp_bytes, "mcpServers") != null);
+
     const codex_after = readFileAlloc(t.allocator, codex, 64 * 1024).?;
     defer t.allocator.free(codex_after);
-    try t.expect(std.mem.indexOf(u8, codex_after, "petdex-hook-state") == null);
-    try t.expect(std.mem.indexOf(u8, codex_after, "update-token") == null);
-    try t.expect(std.mem.indexOf(u8, codex_after, "petdex-hook") != null);
+    try t.expect(std.mem.indexOf(u8, codex_after, "petdex") == null);
+    var codex_toml_buf: [512]u8 = undefined;
+    const codex_toml = std.fmt.bufPrint(&codex_toml_buf, "{s}/.codex/config.toml", .{home}) catch unreachable;
+    const codex_toml_bytes = readFileAlloc(t.allocator, codex_toml, 64 * 1024).?;
+    defer t.allocator.free(codex_toml_bytes);
+    try t.expect(std.mem.indexOf(u8, codex_toml_bytes, "[mcp_servers.petdex]") != null);
+
     const gemini_after = readFileAlloc(t.allocator, gemini, 64 * 1024).?;
     defer t.allocator.free(gemini_after);
-    try t.expect(std.mem.indexOf(u8, gemini_after, "petdex.js") == null);
-    try t.expect(std.mem.indexOf(u8, gemini_after, "petdex-hook") != null);
+    // Gemini settings.json may still hold foreign keys; petdex hooks are gone,
+    // and mcpServers.petdex is present.
+    try t.expect(std.mem.indexOf(u8, gemini_after, "petdex-hook") == null);
+    try t.expect(std.mem.indexOf(u8, gemini_after, "mcpServers") != null);
 }
 
-test "installJsonHooks refuses malformed configs without overwriting them" {
+test "installClaude still writes MCP when settings json is malformed" {
     const home = ".zig-cache/petdex-agenthooks-invalid-json";
     plat.makeDir(home ++ "/.claude");
     var path_buf: [512]u8 = undefined;
     const config = std.fmt.bufPrint(&path_buf, "{s}/.claude/settings.json", .{home}) catch unreachable;
     const invalid = "{ invalid json";
     try t.expect(writeFile(config, invalid));
-    try t.expect(!installClaude(t.allocator, home));
+    plat.deleteFile(home ++ "/.claude.json");
+    try t.expect(installClaude(t.allocator, home));
     const after = readFileAlloc(t.allocator, config, 64 * 1024).?;
     defer t.allocator.free(after);
     try t.expectEqualStrings(invalid, after);
+    var mcp_pb: [512]u8 = undefined;
+    const mcp_cfg = std.fmt.bufPrint(&mcp_pb, "{s}/.claude.json", .{home}) catch unreachable;
+    const mcp = readFileAlloc(t.allocator, mcp_cfg, 64 * 1024).?;
+    defer t.allocator.free(mcp);
+    try t.expect(std.mem.indexOf(u8, mcp, "petdex") != null);
 }
 
 test "canonical commands match the host shell contract" {
@@ -2862,7 +2945,7 @@ test "canonical commands match the host shell contract" {
     try t.expect(std.mem.indexOf(u8, windows, "exec ") == null);
 }
 
-test "installGemini enables hooks and uses a millisecond timeout" {
+test "installGemini writes MCP into settings and keeps foreign keys" {
     const home = ".zig-cache/petdex-agenthooks-gemini-fixture";
     plat.makeDir(home ++ "/.gemini");
     var path_buf: [512]u8 = undefined;
@@ -2871,8 +2954,8 @@ test "installGemini enables hooks and uses a millisecond timeout" {
     try t.expect(installGemini(t.allocator, home));
     const written = readFileAlloc(t.allocator, config, 64 * 1024).?;
     defer t.allocator.free(written);
-    try t.expect(std.mem.indexOf(u8, written, "\"timeout\": 2000") != null);
-    try t.expect(std.mem.indexOf(u8, written, "\"enabled\": true") != null);
+    try t.expect(std.mem.indexOf(u8, written, "mcpServers") != null);
+    try t.expect(std.mem.indexOf(u8, written, "PETDEX_MCP_AGENT") != null);
     try t.expect(std.mem.indexOf(u8, written, "\"keep\": true") != null);
 }
 
@@ -2948,7 +3031,7 @@ test "codex feature inspection is section-aware and conservative" {
     try t.expectEqual(FeatureHooksState.unsafe, inspectFeatureHooks("features = { hooks = true }\n").state);
 }
 
-test "installCodex replaces a false feature flag without duplicating it" {
+test "installCodex appends MCP even when features.hooks is false" {
     const home = ".zig-cache/petdex-agenthooks-codex-false-feature";
     plat.makeDir(home ++ "/.codex");
     var path_buf: [512]u8 = undefined;
@@ -2957,11 +3040,11 @@ test "installCodex replaces a false feature flag without duplicating it" {
     try t.expect(installCodex(t.allocator, home));
     const after = readFileAlloc(t.allocator, toml, 64 * 1024).?;
     defer t.allocator.free(after);
-    try t.expectEqual(@as(usize, 1), std.mem.count(u8, after, "hooks ="));
-    try t.expect(std.mem.indexOf(u8, after, "hooks = true # previous value") != null);
+    try t.expect(std.mem.indexOf(u8, after, "hooks = false # previous value") != null);
+    try t.expect(std.mem.indexOf(u8, after, "[mcp_servers.petdex]") != null);
 }
 
-test "installCodex does not update hooks when its feature config is unsafe" {
+test "installCodex still writes MCP when features.hooks is unsafe" {
     const home = ".zig-cache/petdex-agenthooks-codex-unsafe-feature";
     plat.makeDir(home ++ "/.codex");
     var path_buf: [512]u8 = undefined;
@@ -2971,13 +3054,13 @@ test "installCodex does not update hooks when its feature config is unsafe" {
     const hooks = std.fmt.bufPrint(&hooks_path_buf, "{s}/.codex/hooks.json", .{home}) catch unreachable;
     const legacy = "{\"hooks\":{\"PreToolUse\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"node $HOME/.petdex/bin/petdex.js bubble pre codex\"}]}]}}";
     try t.expect(writeFile(hooks, legacy));
-    try t.expect(!installCodex(t.allocator, home));
-    const after = readFileAlloc(t.allocator, hooks, 64 * 1024).?;
+    try t.expect(installCodex(t.allocator, home));
+    const after = readFileAlloc(t.allocator, toml, 64 * 1024).?;
     defer t.allocator.free(after);
-    try t.expectEqualStrings(legacy, after);
+    try t.expect(std.mem.indexOf(u8, after, "[mcp_servers.petdex]") != null);
 }
 
-test "installCodex does not update its feature config when hooks json is malformed" {
+test "installCodex writes MCP even when hooks json is malformed" {
     const home = ".zig-cache/petdex-agenthooks-codex-invalid-hooks";
     plat.makeDir(home ++ "/.codex");
     var path_buf: [512]u8 = undefined;
@@ -2987,10 +3070,10 @@ test "installCodex does not update its feature config when hooks json is malform
     var hooks_path_buf: [512]u8 = undefined;
     const hooks = std.fmt.bufPrint(&hooks_path_buf, "{s}/.codex/hooks.json", .{home}) catch unreachable;
     try t.expect(writeFile(hooks, "{ invalid json"));
-    try t.expect(!installCodex(t.allocator, home));
+    try t.expect(installCodex(t.allocator, home));
     const after = readFileAlloc(t.allocator, toml, 64 * 1024).?;
     defer t.allocator.free(after);
-    try t.expectEqualStrings(toml_before, after);
+    try t.expect(std.mem.indexOf(u8, after, "[mcp_servers.petdex]") != null);
 }
 
 test "uninstallCodex preserves foreign hooks in a mixed config" {

@@ -20,6 +20,7 @@ const native_sdk = @import("native_sdk");
 const hook_server = @import("hook_server.zig");
 const hook_runner = @import("hook_runner.zig");
 const agent_hooks = @import("agent_hooks.zig");
+const agent_mcp = @import("agent_mcp.zig");
 const dsh_integration = @import("dsh_integration.zig");
 const plat = @import("plat.zig");
 const installer = @import("installer.zig");
@@ -392,6 +393,9 @@ pub const Model = struct {
         .{ .kind = .omp },
         .{ .kind = .hermes },
         .{ .kind = .dsh },
+        .{ .kind = .cursor },
+        .{ .kind = .junie },
+        .{ .kind = .antigravity },
     },
     dsh_busy: bool = false,
     dsh_error: bool = false,
@@ -1702,21 +1706,21 @@ const installable_art = [agent_hooks.agent_count + 2]AgentArt{
     .{ .light = @embedFile("assets/agents/hermes.png"), .dark = @embedFile("assets/agents/hermes.png") },
     // DSH has no bundled brand asset in this clean-room slice.
     .{ .light = @embedFile("assets/agents/fallback.png"), .dark = @embedFile("assets/agents/fallback.png") },
+    .{ .light = @embedFile("assets/agents/cursor.png"), .dark = @embedFile("assets/agents/cursor.png") },
+    .{ .light = @embedFile("assets/agents/junie.png"), .dark = @embedFile("assets/agents/junie.png") },
+    .{ .light = @embedFile("assets/agents/antigravity.png"), .dark = @embedFile("assets/agents/antigravity.png") },
     .{ .light = @embedFile("assets/agents/herdr.png"), .dark = @embedFile("assets/agents/herdr.png") },
     .{ .light = @embedFile("assets/agents/fallback.png"), .dark = @embedFile("assets/agents/fallback.png") },
 };
 pub const herdr_icon_index = agent_hooks.agent_count;
 const agent_fallback_index = agent_hooks.agent_count + 1;
 
-/// Agents with no hook installer of their own, which reach the pet
+/// Agents with no Connections installer of their own, which reach the pet
 /// through Herdr: the names they arrive under (Herdr's, normalized), the
 /// name a card shows, and their logo. Their cells follow the fallback's
 /// in the strip, in this order, so append rather than insert.
 const ExtraAgent = struct { names: []const []const u8, display: []const u8, art: []const u8 };
 const extra_agents = [_]ExtraAgent{
-    .{ .names = &.{"antigravity"}, .display = "Antigravity", .art = @embedFile("assets/agents/antigravity.png") },
-    .{ .names = &.{ "cursor", "cursor-agent" }, .display = "Cursor", .art = @embedFile("assets/agents/cursor.png") },
-    .{ .names = &.{"junie"}, .display = "Junie", .art = @embedFile("assets/agents/junie.png") },
     .{ .names = &.{"devin"}, .display = "Devin", .art = @embedFile("assets/agents/devin.png") },
     .{ .names = &.{"droid"}, .display = "Droid", .art = @embedFile("assets/agents/droid.png") },
     .{ .names = &.{ "kilo", "kilocode", "kilo-code" }, .display = "Kilo Code", .art = @embedFile("assets/agents/kilo.png") },
@@ -1880,6 +1884,7 @@ fn agentKindForName(agent: []const u8) ?agent_hooks.AgentKind {
     if (std.mem.eql(u8, agent, "open-code")) return .opencode;
     if (std.mem.eql(u8, agent, "qodercli")) return .qoder;
     if (std.mem.eql(u8, agent, "kimi")) return .kimi_code;
+    if (std.mem.eql(u8, agent, "cursor-agent")) return .cursor;
     return null;
 }
 
@@ -2662,6 +2667,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 .codebuddy => agent_hooks.installCodeBuddy(boot_allocator, home),
                 .omp => agent_hooks.installOmp(boot_allocator, home),
                 .hermes => agent_hooks.installHermes(boot_allocator, home),
+                .cursor => agent_mcp.install(boot_allocator, home, .cursor),
+                .junie => agent_mcp.install(boot_allocator, home, .junie),
+                .antigravity => agent_mcp.install(boot_allocator, home, .antigravity),
                 .dsh => unreachable,
             };
             if (ok and kind == .codex) model.codex_trust_note = true;
@@ -5931,9 +5939,10 @@ test "one image slot covers every agent" {
 }
 
 test "agents Herdr relays get their own logo and name" {
-    try std.testing.expectEqual(extra_icon_base + 1, agentIconIndex("cursor"));
+    try std.testing.expectEqual(@as(usize, @intFromEnum(agent_hooks.AgentKind.cursor)), agentIconIndex("cursor"));
     try std.testing.expectEqual(agentIconIndex("cursor"), agentIconIndex("cursor-agent"));
-    try std.testing.expectEqual(extra_icon_base, agentIconIndex("antigravity"));
+    try std.testing.expectEqual(@as(usize, @intFromEnum(agent_hooks.AgentKind.antigravity)), agentIconIndex("antigravity"));
+    try std.testing.expectEqual(@as(usize, @intFromEnum(agent_hooks.AgentKind.junie)), agentIconIndex("junie"));
     try std.testing.expectEqual(agent_fallback_index, agentIconIndex("windsurf"));
     // The usage column's Copilot row has its logo too.
     try std.testing.expectEqual(extra_icon_base + extra_agents.len - 1, agentIconIndex("copilot"));
@@ -6863,6 +6872,7 @@ test "an error wears a badge, and waiting on the user glows, still or not" {
 }
 
 test "an open card offers the agent's Warp pane or Terminal tab" {
+    if (builtin.target.os.tag != .macos) return;
     var model: Model = .{};
     testPushBubble(&model, "alpha", "reading", true, -1);
     try std.testing.expectEqual(Destination.none, bubbleDestination(&model.bubbles[0]));
@@ -6886,6 +6896,7 @@ test "an open card offers the agent's Warp pane or Terminal tab" {
 }
 
 test "a press on the open card's button belongs to the button" {
+    if (builtin.target.os.tag != .macos) return;
     var model: Model = .{};
     testPushBubble(&model, "alpha", "reading", true, -1);
     const url = "warp://session/0123456789abcdef0123456789abcdef";

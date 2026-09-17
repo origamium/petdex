@@ -1,19 +1,17 @@
 /**
- * Petdex MCP Server — stdio-based Model Context Protocol server for Antigravity.
+ * Petdex MCP Server — stdio Model Context Protocol server for coding agents.
  *
- * Antigravity connects to this via its MCP Servers panel. The agent calls
- * tools like `petdex_set_state` during its work, which POST to the Petdex
- * desktop hook server for the mascot to display.
+ * Any MCP-capable agent (Codex, Claude Code, Cursor, Gemini, Junie,
+ * Antigravity, …) can connect and drive the desktop mascot by calling tools.
+ * Set `PETDEX_MCP_AGENT` (or pass `agent` on each tool call) so bubbles and
+ * usage land under the right logo.
  *
- * Protocol: JSON-RPC 2.0 over stdin/stdout (standard MCP transport).
- * No external MCP SDK dependency — the surface is small enough to inline.
+ * Protocol: JSON-RPC 2.0 over stdin/stdout (framed Content-Length or JSONL).
+ * No external MCP SDK — the surface is small enough to inline.
  *
- * IMPORTANT: We MUST NOT write anything to stdout until the client sends
- * an `initialize` request. The MCP lifecycle requires the client to be the
- * first speaker. Any unsolicited stdout output (startup message, telemetry
- * notice, etc.) breaks the handshake.
+ * IMPORTANT: Do not write to stdout until the client sends `initialize`.
  */
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 
@@ -27,7 +25,35 @@ const KILLSWITCH_PATH = path.join(
   "runtime",
   "hooks-disabled",
 );
-const VERSION = "0.1.0";
+const USAGE_DIR = path.join(homedir(), ".petdex", "runtime", "usage");
+const VERSION = "0.2.0";
+
+const KNOWN_AGENTS = new Set([
+  "claude-code",
+  "codex",
+  "gemini",
+  "opencode",
+  "qoder",
+  "kimi-code",
+  "codebuddy",
+  "omp",
+  "hermes",
+  "dsh",
+  "antigravity",
+  "cursor",
+  "cursor-agent",
+  "junie",
+  "copilot",
+  "devin",
+  "droid",
+  "kilo",
+  "kilocode",
+  "kilo-code",
+  "grok",
+  "mastracode",
+  "mastra",
+]);
+
 type TransportMode = "framed" | "jsonl";
 let transportMode: TransportMode = "framed";
 
@@ -43,6 +69,34 @@ interface JsonRpcResponse {
   id: string | number | null;
   result?: unknown;
   error?: { code: number; message: string; data?: unknown };
+}
+
+function defaultAgent(): string {
+  const fromEnv = process.env.PETDEX_MCP_AGENT?.trim();
+  if (fromEnv && fromEnv.length > 0) return fromEnv;
+  return "mcp";
+}
+
+function resolveAgent(args: Record<string, unknown>): string {
+  const raw = typeof args.agent === "string" ? args.agent.trim() : "";
+  if (raw.length > 0) return raw;
+  return defaultAgent();
+}
+
+function normalizeUsageAgent(agent: string): string | null {
+  const key = agent.trim().toLowerCase();
+  if (key === "claude" || key === "claude_code") return "claude-code";
+  if (key === "cursor-agent") return "cursor";
+  if (key === "kimi" || key === "kimi_code") return "kimi-code";
+  if (KNOWN_AGENTS.has(key)) {
+    if (key === "claude-code" || key === "codex" || key === "junie" || key === "cursor" || key === "copilot") {
+      return key;
+    }
+  }
+  if (key === "claude-code" || key === "codex" || key === "junie" || key === "cursor" || key === "copilot") {
+    return key;
+  }
+  return null;
 }
 
 async function readToken(): Promise<string | null> {
@@ -84,11 +138,35 @@ async function postJson(
   }
 }
 
+async function writeUsageWindows(
+  agent: string,
+  windows: Array<[number, number, number?]>,
+): Promise<boolean> {
+  const usageAgent = normalizeUsageAgent(agent);
+  if (!usageAgent) return false;
+  try {
+    await mkdir(USAGE_DIR, { recursive: true });
+    const payload = {
+      windows: windows.map(([used, resetsAt, minutes]) =>
+        minutes === undefined ? [used, resetsAt] : [used, resetsAt, minutes],
+      ),
+    };
+    await writeFile(
+      path.join(USAGE_DIR, `${usageAgent}.json`),
+      JSON.stringify(payload),
+      "utf8",
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 const TOOLS = [
   {
     name: "petdex_set_state",
     description:
-      "Set the pet's animation state. Call this before/after tool use to reflect agent activity.",
+      "Set the pet's animation state. Call this before and after every tool use so the desktop mascot reflects agent activity. Prefer this over doing nothing.",
     inputSchema: {
       type: "object",
       properties: {
@@ -112,6 +190,11 @@ const TOOLS = [
           type: "number",
           description: "Optional duration in ms to hold this state",
         },
+        agent: {
+          type: "string",
+          description:
+            "Agent id for the pet logo (codex, claude-code, junie, cursor, …). Defaults to PETDEX_MCP_AGENT.",
+        },
       },
       required: ["state"],
     },
@@ -119,7 +202,7 @@ const TOOLS = [
   {
     name: "petdex_show_bubble",
     description:
-      "Show a speech bubble above the pet with the given text. Use to display what the agent is currently doing.",
+      "Show a speech bubble above the pet with the given text. Call whenever the agent starts or finishes a meaningful step.",
     inputSchema: {
       type: "object",
       properties: {
@@ -127,8 +210,52 @@ const TOOLS = [
           type: "string",
           description: "The bubble text to display (e.g. 'Reading server.ts')",
         },
+        title: {
+          type: "string",
+          description: "Optional conversation/session title",
+        },
+        session_id: {
+          type: "string",
+          description: "Optional conversation id so multiple sessions keep separate bubbles",
+        },
+        busy: {
+          type: "boolean",
+          description: "True while the agent is still working (default true)",
+        },
+        agent: {
+          type: "string",
+          description:
+            "Agent id for the pet logo. Defaults to PETDEX_MCP_AGENT.",
+        },
       },
       required: ["text"],
+    },
+  },
+  {
+    name: "petdex_report_usage",
+    description:
+      "Report this agent's plan usage limits to the Petdex usage column. Call when rate-limit or quota information is available (percent used and reset time).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        windows: {
+          type: "array",
+          description:
+            "Usage windows as [used_percent, resets_at_epoch_seconds, window_minutes?]. used_percent is 0–100.",
+          items: {
+            type: "array",
+            items: { type: "number" },
+            minItems: 2,
+            maxItems: 3,
+          },
+        },
+        agent: {
+          type: "string",
+          description:
+            "Usage row agent: claude-code, codex, junie, cursor, or copilot. Defaults to PETDEX_MCP_AGENT.",
+        },
+      },
+      required: ["windows"],
     },
   },
   {
@@ -149,7 +276,6 @@ function sendMessage(msg: JsonRpcResponse): void {
     return;
   }
   const encoded = new TextEncoder().encode(body);
-  // MCP stdio framing: Content-Length header + empty line + JSON body
   const header = `Content-Length: ${encoded.length}\r\n\r\n`;
   process.stdout.write(header);
   process.stdout.write(body);
@@ -163,15 +289,21 @@ function errorResponse(
   return { jsonrpc: "2.0", id, error: { code, message } };
 }
 
+function textResult(id: string | number | null, text: string): JsonRpcResponse {
+  return {
+    jsonrpc: "2.0",
+    id,
+    result: {
+      content: [{ type: "text", text }],
+    },
+  };
+}
+
 async function handleRequest(req: JsonRpcRequest): Promise<void> {
   const { id, method, params } = req;
 
   switch (method) {
     case "initialize": {
-      // MCP protocol version negotiation: return the version the client
-      // requested (or a reasonable default). Per the MCP spec, protocol
-      // versions are date-based (e.g. "2025-03-26"). The serverInfo
-      // version is separate — it's our own package version.
       const clientVersion =
         (params?.protocolVersion as string | undefined) ?? "2025-03-26";
       sendMessage({
@@ -207,18 +339,12 @@ async function handleRequest(req: JsonRpcRequest): Promise<void> {
       const args = (params?.arguments ?? {}) as Record<string, unknown>;
 
       if (await killswitchActive()) {
-        sendMessage({
-          jsonrpc: "2.0",
-          id,
-          result: {
-            content: [
-              {
-                type: "text",
-                text: "Petdex hooks are disabled. Run /petdex in your agent or `petdex hooks on` to re-enable.",
-              },
-            ],
-          },
-        });
+        sendMessage(
+          textResult(
+            id,
+            "Petdex hooks are disabled. Run /petdex in your agent or `petdex hooks on` to re-enable.",
+          ),
+        );
         return;
       }
 
@@ -231,28 +357,23 @@ async function handleRequest(req: JsonRpcRequest): Promise<void> {
             );
             return;
           }
+          const agent = resolveAgent(args);
           const body: Record<string, unknown> = {
             state,
-            agent_source: "antigravity",
+            agent_source: agent,
           };
           if (typeof args.duration === "number") {
             body.duration = args.duration;
           }
           const result = await postJson(STATE_URL, body);
-          sendMessage({
-            jsonrpc: "2.0",
-            id,
-            result: {
-              content: [
-                {
-                  type: "text",
-                  text: result.ok
-                    ? `Pet state set to "${state}"`
-                    : "Desktop hook server unreachable; is Petdex Desktop running?",
-                },
-              ],
-            },
-          });
+          sendMessage(
+            textResult(
+              id,
+              result.ok
+                ? `Pet state set to "${state}" (${agent})`
+                : "Desktop hook server unreachable; is Petdex Desktop running?",
+            ),
+          );
           return;
         }
 
@@ -264,32 +385,72 @@ async function handleRequest(req: JsonRpcRequest): Promise<void> {
             );
             return;
           }
-          const result = await postJson(BUBBLE_URL, {
+          const agent = resolveAgent(args);
+          const body: Record<string, unknown> = {
             text,
-            agent_source: "antigravity",
-          });
-          sendMessage({
-            jsonrpc: "2.0",
-            id,
-            result: {
-              content: [
-                {
-                  type: "text",
-                  text: result.ok
-                    ? `Bubble shown: "${text}"`
-                    : "Desktop hook server unreachable; is Petdex Desktop running?",
-                },
-              ],
-            },
-          });
+            busy: args.busy !== false,
+            agent_source: agent,
+          };
+          if (typeof args.title === "string" && args.title.length > 0) {
+            body.title = args.title;
+          }
+          if (typeof args.session_id === "string" && args.session_id.length > 0) {
+            body.session_id = args.session_id;
+          }
+          const result = await postJson(BUBBLE_URL, body);
+          sendMessage(
+            textResult(
+              id,
+              result.ok
+                ? `Bubble shown: "${text}" (${agent})`
+                : "Desktop hook server unreachable; is Petdex Desktop running?",
+            ),
+          );
+          return;
+        }
+
+        case "petdex_report_usage": {
+          const windowsRaw = args.windows;
+          if (!Array.isArray(windowsRaw) || windowsRaw.length === 0) {
+            sendMessage(
+              errorResponse(id, -32602, "Missing required argument: windows"),
+            );
+            return;
+          }
+          const agent = resolveAgent(args);
+          const windows: Array<[number, number, number?]> = [];
+          for (const entry of windowsRaw) {
+            if (!Array.isArray(entry) || entry.length < 2) continue;
+            const used = Number(entry[0]);
+            const resets = Number(entry[1]);
+            if (!Number.isFinite(used) || !Number.isFinite(resets)) continue;
+            const minutes =
+              entry.length > 2 && Number.isFinite(Number(entry[2]))
+                ? Number(entry[2])
+                : undefined;
+            windows.push(
+              minutes === undefined ? [used, resets] : [used, resets, minutes],
+            );
+          }
+          if (windows.length === 0) {
+            sendMessage(
+              errorResponse(id, -32602, "windows must contain numeric triples"),
+            );
+            return;
+          }
+          const ok = await writeUsageWindows(agent, windows);
+          sendMessage(
+            textResult(
+              id,
+              ok
+                ? `Usage reported for ${normalizeUsageAgent(agent) ?? agent}`
+                : `Cannot report usage for agent "${agent}" (use claude-code, codex, junie, cursor, or copilot)`,
+            ),
+          );
           return;
         }
 
         case "petdex_status": {
-          // Probe the live hook server health endpoint instead of just checking
-          // token presence — the token file persists across restarts and is
-          // not removed on shutdown, so token presence alone is not a reliable
-          // indicator of whether the desktop is currently running.
           let reachable = false;
           try {
             const res = await fetch(`${HOOK_SERVER_URL}/health`, {
@@ -299,20 +460,14 @@ async function handleRequest(req: JsonRpcRequest): Promise<void> {
           } catch {
             reachable = false;
           }
-          sendMessage({
-            jsonrpc: "2.0",
-            id,
-            result: {
-              content: [
-                {
-                  type: "text",
-                  text: reachable
-                    ? "Petdex desktop is reachable."
-                    : "Petdex desktop not detected. Start it with `petdex up`.",
-                },
-              ],
-            },
-          });
+          sendMessage(
+            textResult(
+              id,
+              reachable
+                ? `Petdex desktop is reachable (agent=${defaultAgent()}).`
+                : "Petdex desktop not detected. Start it with `petdex up`.",
+            ),
+          );
           return;
         }
 
@@ -346,7 +501,6 @@ export async function runMcpServer(): Promise<void> {
   process.stdin.on("data", (chunk: Uint8Array | string) => {
     const raw =
       typeof chunk === "string" ? new TextEncoder().encode(chunk) : chunk;
-    // Append to buffer
     const newBuf = new Uint8Array(buffer.length + raw.length);
     newBuf.set(buffer);
     newBuf.set(raw, buffer.length);
@@ -397,8 +551,6 @@ export async function runMcpServer(): Promise<void> {
     setTimeout(() => process.exit(0), 3000).unref();
   });
 
-  // Do NOT write anything to stdout here.
-
   function dispatchRequest(bodyStr: string) {
     try {
       const req = JSON.parse(bodyStr) as JsonRpcRequest;
@@ -430,10 +582,6 @@ export async function runMcpServer(): Promise<void> {
   }
 }
 
-/**
- * Find the first occurrence of needle (a Uint8Array) in haystack.
- * Returns the starting index, or -1 if not found.
- */
 function findSequence(haystack: Uint8Array, needle: Uint8Array): number {
   outer: for (let i = 0; i <= haystack.length - needle.length; i++) {
     for (let j = 0; j < needle.length; j++) {

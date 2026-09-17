@@ -86,7 +86,7 @@ describe("Petdex MCP server stdio", () => {
         result: {
           protocolVersion: "2025-03-26",
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: "petdex-mcp-server", version: "0.1.0" },
+          serverInfo: { name: "petdex-mcp-server", version: "0.2.0" },
         },
       },
     ]);
@@ -117,6 +117,7 @@ describe("Petdex MCP server stdio", () => {
         tools: [
           { name: "petdex_set_state" },
           { name: "petdex_show_bubble" },
+          { name: "petdex_report_usage" },
           { name: "petdex_status" },
         ],
       },
@@ -195,7 +196,7 @@ describe("Petdex MCP server stdio", () => {
         result: {
           protocolVersion: "2025-11-25",
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: "petdex-mcp-server", version: "0.1.0" },
+          serverInfo: { name: "petdex-mcp-server", version: "0.2.0" },
         },
       },
     ]);

@@ -92,7 +92,9 @@ pub fn remotePath(
 /// sh script must be pushed alongside its files.
 fn needsHookScript(kind: AgentKind) bool {
     return switch (kind) {
-        .codex, .hermes => true,
+        .hermes => true,
+        // Codex drives the pet over MCP now; the remote watcher still posts
+        // session titles through the reverse tunnel without a shell hook.
         else => false,
     };
 }
@@ -228,12 +230,24 @@ pub fn collectOutputs(
             out[0] = stagedOutput(allocator, kind, fake_home, opencode_files[0], hermes_profile, hermes_home) orelse return null;
         },
         .codex => {
-            out[0] = embeddedOutput(allocator, ".petdex/bin/petdex-hook", remote_ssh.remote_hook_script, hook_script) orelse return null;
-            out[1] = embeddedOutput(allocator, ".petdex/bin/petdex-codex-watch", remote_ssh.remote_codex_watcher, codex_watcher_script) orelse return null;
-            // hooks.json is inert until config.toml enables hooks, so the
-            // feature flag is the final activation write.
-            out[2] = stagedOutput(allocator, kind, fake_home, codex_files[0], hermes_profile, hermes_home) orelse return null;
-            out[3] = stagedOutput(allocator, kind, fake_home, codex_files[1], hermes_profile, hermes_home) orelse return null;
+            var i: usize = 0;
+            if (needsHookScript(kind)) {
+                out[i] = embeddedOutput(allocator, ".petdex/bin/petdex-hook", remote_ssh.remote_hook_script, hook_script) orelse return null;
+                i += 1;
+            }
+            if (needsCodexWatcher(kind)) {
+                out[i] = embeddedOutput(allocator, ".petdex/bin/petdex-codex-watch", remote_ssh.remote_codex_watcher, codex_watcher_script) orelse return null;
+                i += 1;
+            }
+            // hooks.json is optional under MCP: only push it when the
+            // installer left one (foreign hooks preserved).
+            if (stagedOutput(allocator, kind, fake_home, codex_files[0], hermes_profile, hermes_home)) |hooks_out| {
+                out[i] = hooks_out;
+                i += 1;
+            }
+            out[i] = stagedOutput(allocator, kind, fake_home, codex_files[1], hermes_profile, hermes_home) orelse return null;
+            i += 1;
+            return out[0..i];
         },
         .hermes => {
             out[0] = embeddedOutput(allocator, ".petdex/bin/petdex-hook", remote_ssh.remote_hook_script, hook_script) orelse return null;
@@ -253,7 +267,7 @@ pub fn collectOutputs(
 
 const t = std.testing;
 
-test "codex writeback merges a fetched remote hooks.json" {
+test "codex writeback merges a fetched remote config with MCP" {
     if (@import("builtin").os.tag == .windows) return;
     const fake = ".zig-cache/petdex-wb-codex";
     plat.makeDir(fake);
@@ -270,24 +284,18 @@ test "codex writeback merges a fetched remote hooks.json" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const outs = collectOutputs(arena.allocator(), .codex, fake, "", "~/.hermes").?;
-    try t.expectEqual(@as(usize, 4), outs.len);
-    // Dependencies first, hooks.json next, enabling config.toml last.
-    try t.expectEqualStrings(remote_ssh.remote_hook_script, outs[0].remote);
+    try t.expectEqual(@as(usize, 3), outs.len);
+    // Watcher first, then hooks.json (foreign hooks kept, petdex stripped),
+    // then config.toml with MCP.
+    try t.expectEqualStrings(remote_ssh.remote_codex_watcher, outs[0].remote);
     try t.expect(outs[0].executable);
-    try t.expect(std.mem.indexOf(u8, outs[0].bytes, "petdex-update-token") != null);
-    try t.expectEqualStrings(remote_ssh.remote_codex_watcher, outs[1].remote);
-    try t.expect(outs[1].executable);
-    try t.expect(std.mem.indexOf(u8, outs[1].bytes, "request_user_input") != null);
-    try t.expect(std.mem.indexOf(u8, outs[1].bytes, "recent_rollouts(catalog)") != null);
-    try t.expect(std.mem.indexOf(u8, outs[1].bytes, "title or state[\"fallback_title\"]") != null);
-    try t.expect(std.mem.indexOf(u8, outs[1].bytes, "initial_publishable(event, path)") != null);
-    try t.expect(std.mem.indexOf(u8, outs[1].bytes, "INITIAL_RUNNING_MAX_AGE_SECONDS") != null);
-    try t.expectEqualStrings(".codex/hooks.json", outs[2].rel);
-    try t.expectEqualStrings("~/.codex/hooks.json", outs[2].remote);
-    try t.expect(std.mem.indexOf(u8, outs[2].bytes, "my-own") != null);
-    try t.expect(std.mem.indexOf(u8, outs[2].bytes, "petdex-hook") != null);
-    try t.expectEqualStrings(".codex/config.toml", outs[3].rel);
-    try t.expect(std.mem.indexOf(u8, outs[3].bytes, "hooks = true") != null);
+    try t.expect(std.mem.indexOf(u8, outs[0].bytes, "request_user_input") != null);
+    try t.expectEqualStrings(".codex/hooks.json", outs[1].rel);
+    try t.expectEqualStrings("~/.codex/hooks.json", outs[1].remote);
+    try t.expect(std.mem.indexOf(u8, outs[1].bytes, "my-own") != null);
+    try t.expect(std.mem.indexOf(u8, outs[1].bytes, "petdex") == null);
+    try t.expectEqualStrings(".codex/config.toml", outs[2].rel);
+    try t.expect(std.mem.indexOf(u8, outs[2].bytes, "[mcp_servers.petdex]") != null);
 }
 
 test "remote hook script accepts the shared desktop bubble CLI" {
