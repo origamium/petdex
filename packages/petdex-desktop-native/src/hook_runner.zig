@@ -8,8 +8,8 @@
 //!
 //! A line-for-line port of the CLI's bubble-runner.ts + templates
 //! (kept in parity by the tests at the bottom, which mirror the TS
-//! suite's expectations). Extraction uses the hook server's flat JSON scan:
-//! hook payloads never repeat our keys across nesting levels.
+//! suite's expectations). Host metadata is read only from the envelope;
+//! tool input can legitimately repeat session/model/path field names.
 
 const std = @import("std");
 const hook_server = @import("hook_server.zig");
@@ -18,6 +18,70 @@ const usage = @import("usage.zig");
 const agent_hooks = @import("agent_hooks.zig");
 
 const jsonString = hook_server.jsonStringPub;
+
+/// Borrow a JSON-escaped string from the host envelope, skipping nested tool
+/// input and quoted prose. Keeping escapes intact lets bubbleBody forward
+/// human text without decoding and re-encoding it. In particular, a tool that
+/// edits a session JSON must not move this event to that file's session id.
+fn envelopeString(body: []const u8, key: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < body.len and std.ascii.isWhitespace(body[i])) i += 1;
+    if (i == body.len or body[i] != '{') return null;
+    var depth: usize = 0;
+    var previous: u8 = 0;
+    while (i < body.len) {
+        const ch = body[i];
+        if (ch == '"') {
+            const end = jsonStringEnd(body, i) orelse return null;
+            if (depth == 1 and (previous == '{' or previous == ',') and std.mem.eql(u8, body[i + 1 .. end], key)) {
+                var value = end + 1;
+                while (value < body.len and std.ascii.isWhitespace(body[value])) value += 1;
+                if (value == body.len or body[value] != ':') return null;
+                value += 1;
+                while (value < body.len and std.ascii.isWhitespace(body[value])) value += 1;
+                if (value == body.len or body[value] != '"') return null;
+                const value_end = jsonStringEnd(body, value) orelse return null;
+                return body[value + 1 .. value_end];
+            }
+            i = end + 1;
+            previous = '"';
+            continue;
+        }
+        switch (ch) {
+            '{', '[' => depth += 1,
+            '}', ']' => {
+                if (depth == 0) return null;
+                depth -= 1;
+                if (depth == 0) return null;
+            },
+            else => {},
+        }
+        if (!std.ascii.isWhitespace(ch)) previous = ch;
+        i += 1;
+    }
+    return null;
+}
+
+fn jsonStringEnd(body: []const u8, start: usize) ?usize {
+    var i = start + 1;
+    while (i < body.len) : (i += 1) {
+        if (body[i] == '"') return i;
+        if (body[i] < 0x20) return null;
+        if (body[i] != '\\') continue;
+        i += 1;
+        if (i == body.len) return null;
+        switch (body[i]) {
+            '"', '\\', '/', 'b', 'f', 'n', 'r', 't' => {},
+            'u' => {
+                if (i + 4 >= body.len) return null;
+                for (body[i + 1 .. i + 5]) |digit| if (!std.ascii.isHex(digit)) return null;
+                i += 4;
+            },
+            else => return null,
+        }
+    }
+    return null;
+}
 
 const stdin_cap = 64 * 1024;
 const title_max = 60;
@@ -37,17 +101,19 @@ const post_poll_ms: u64 = 5;
 
 /// argv tail after "bubble": [phase, agent?]. Reads stdin, formats,
 /// POSTs bubble + state to the in-process hook server. Never fails outward.
-pub fn run(phase: []const u8, arg_agent: ?[]const u8, origin_app: plat.OriginApplication, source_cwd_raw: ?[]const u8, herdr_pane_raw: ?[]const u8, warp_focus_raw: ?[]const u8, home: []const u8) void {
-    // Always finish consuming the host's payload before any early return.
-    // The host may still be writing after the useful 64 KiB prefix, and
-    // closing the read end early propagates EPIPE/Broken pipe to the agent.
+pub fn run(raw_phase: []const u8, arg_agent: ?[]const u8, origin_app: plat.OriginApplication, source_cwd_raw: ?[]const u8, herdr_pane_raw: ?[]const u8, warp_focus_raw: ?[]const u8, home: []const u8) void {
+    // Consume input with a deadline before any early return. Drain beyond the
+    // useful 64 KiB prefix to avoid EPIPE during normal host writes, but do
+    // not require EOF from a host that leaves its pipe open.
     var stdin_buf: [stdin_cap]u8 = undefined;
     const payload = readStdin(&stdin_buf);
+    const phase = eventPhase(raw_phase, payload);
+    if (std.mem.eql(u8, phase, "ignore")) return;
 
     var path_buf: [512]u8 = undefined;
     var probe: [1]u8 = undefined;
 
-    // Killswitch remains a cheap no-op after the mandatory stdin drain.
+    // Killswitch remains a cheap no-op after bounded stdin consumption.
     if (std.fmt.bufPrint(&path_buf, "{s}/.petdex/runtime/hooks-disabled", .{home})) |ks| {
         if (cReadFile(ks, &probe) != null) return;
     } else |_| {}
@@ -70,21 +136,23 @@ pub fn run(phase: []const u8, arg_agent: ?[]const u8, origin_app: plat.OriginApp
     const source_app = origin_app.wireName();
     var tty_buf: [64]u8 = undefined;
     const source_tty = if (origin_app == .terminal) (plat.controllingTty(&tty_buf) orelse "") else "";
-    const source_cwd = plat.safeSourceCwd(source_cwd_raw) orelse "";
+    const source_cwd = plat.safeSourceCwd(envelopeString(payload, "cwd")) orelse plat.safeSourceCwd(source_cwd_raw) orelse "";
     const herdr_pane = plat.safeHerdrPaneId(herdr_pane_raw) orelse "";
     var session_hash_buf: [64]u8 = undefined;
     const session_id = payloadSessionId(payload, &session_hash_buf);
+    var title_key_buf: [64]u8 = undefined;
+    const title_key = if (session_id) |sid| hook_server.qualifiedSessionKey(agent, sid, &title_key_buf) else null;
 
     // Session title: user-prompt seeds it, every event attaches it.
     var sessions_buf: [512]u8 = undefined;
     const sessions_dir = std.fmt.bufPrint(&sessions_buf, "{s}/.petdex/runtime/sessions", .{home}) catch return;
-    if (session_id) |sid| {
+    if (title_key) |sid| {
         if (isPromptPhase(phase)) {
-            if (jsonString(payload, "prompt") orelse jsonString(payload, "user_message")) |prompt| rememberTitle(sessions_dir, sid, prompt);
+            if (jsonString(payload, "prompt") orelse jsonString(payload, "user_message") orelse jsonString(payload, "user_prompt")) |prompt| rememberTitle(sessions_dir, sid, prompt);
         }
     }
     var title_buf: [256]u8 = undefined;
-    const title: []const u8 = jsonString(payload, "petdex_session_title") orelse if (session_id) |sid| (readTitle(sessions_dir, sid, &title_buf) orelse "") else "";
+    const title: []const u8 = envelopeString(payload, "petdex_session_title") orelse if (title_key) |sid| (readTitle(sessions_dir, sid, &title_buf) orelse "") else "";
 
     // The model and effort change with a new prompt and are settled at a
     // turn's end, so they are read there and never on a tool call; the
@@ -105,7 +173,7 @@ pub fn run(phase: []const u8, arg_agent: ?[]const u8, origin_app: plat.OriginApp
     var focus_buf: [64]u8 = undefined;
     const hosted = std.mem.eql(u8, agent, "codex");
     settings.focus_url = plat.safeWarpFocusUrl(warp_focus_raw) orelse
-        (if (hosted) plat.warpFocusUrlOf("codex", jsonString(payload, "cwd") orelse "", &focus_buf) else null) orelse "";
+        (if (hosted) plat.warpFocusUrlOf("codex", envelopeString(payload, "cwd") orelse "", &focus_buf) else null) orelse "";
     // The account's limits ride Codex's rollout, current at a turn's end;
     // the usage column reads what this leaves. The settings above were
     // copied out of scan_buf, so it is free again.
@@ -120,12 +188,12 @@ pub fn run(phase: []const u8, arg_agent: ?[]const u8, origin_app: plat.OriginApp
         // Close-of-turn preview: Codex ships last_assistant_message in
         // the payload; Claude Code needs the bounded transcript tail.
         const written: ?[]const u8 = if (isAssistantPhase(phase))
-            jsonString(payload, "assistant_response")
+            envelopeString(payload, "assistant_response")
         else if (isSubagentStopPhase(phase))
-            jsonString(payload, "child_summary")
+            envelopeString(payload, "child_summary")
         else
-            jsonString(payload, "last_assistant_message") orelse blk: {
-                const tp = jsonString(payload, "transcript_path") orelse break :blk null;
+            envelopeString(payload, "last_assistant_message") orelse blk: {
+                const tp = (envelopeString(payload, "transcript_path") orelse envelopeString(payload, "transcriptPath")) orelse break :blk null;
                 const tail = cReadTail(tp, &tail_buf) orelse break :blk null;
                 break :blk lastAssistantFromTail(tail);
             };
@@ -142,7 +210,7 @@ pub fn run(phase: []const u8, arg_agent: ?[]const u8, origin_app: plat.OriginApp
     const busy = isPromptPhase(phase) or std.mem.eql(u8, phase, "pre") or
         std.mem.eql(u8, phase, "post") or isToolFailurePhase(phase) or
         std.mem.eql(u8, phase, "approval-response") or std.mem.eql(u8, phase, "subagent-start");
-    const state = stateForEvent(phase, jsonString(payload, "tool_name"));
+    const state = stateForEvent(phase, toolName(payload));
 
     var posts: [2]PostJob = undefined;
     var post_count: usize = 0;
@@ -172,7 +240,7 @@ pub fn run(phase: []const u8, arg_agent: ?[]const u8, origin_app: plat.OriginApp
 /// ponytail: the 64 KiB tail only. A turn ends with a token_count line, so
 /// it is near the end; when it isn't, the last value stands.
 fn captureCodexLimits(payload: []const u8, scan_buf: []u8, home: []const u8) void {
-    const path = jsonString(payload, "transcript_path") orelse return;
+    const path = (envelopeString(payload, "transcript_path") orelse envelopeString(payload, "transcriptPath")) orelse return;
     const line = plat.lastLineMatching(path, scan_buf, usage.carriesCodexLimits) orelse return;
     usage.writeWindows(home, .codex, usage.windowsFromCodexLine(line) orelse return);
 }
@@ -219,7 +287,7 @@ fn resolveAgent(payload: []const u8, arg_agent: ?[]const u8) []const u8 {
     if (arg_agent) |agent| {
         if (agent.len > 0) return agent;
     }
-    return jsonString(payload, "agent_source") orelse "";
+    return envelopeString(payload, "agent_source") orelse "";
 }
 
 /// Review prompts Hermes' `agent/background_review.py` feeds its post-turn
@@ -247,15 +315,15 @@ const background_review_prompts = [_][]const u8{
 /// approvals) that carry no prompt at all, and the first still catches a fork
 /// that Hermes someday gives a session id of its own.
 pub fn isBackgroundReview(payload: []const u8) bool {
-    if (jsonString(payload, "user_message") orelse jsonString(payload, "prompt")) |message| {
+    if (envelopeString(payload, "user_message") orelse envelopeString(payload, "prompt")) |message| {
         const trimmed = std.mem.trimStart(u8, message, " \t\r\n");
         for (background_review_prompts) |prompt| {
             if (std.mem.startsWith(u8, trimmed, prompt)) return true;
         }
     }
-    const session = jsonString(payload, "session_id") orelse return false;
+    const session = envelopeString(payload, "session_id") orelse return false;
     if (session.len == 0) return false;
-    const parent = jsonString(payload, "parent_session_id") orelse return false;
+    const parent = envelopeString(payload, "parent_session_id") orelse return false;
     return std.mem.eql(u8, session, parent);
 }
 
@@ -276,7 +344,7 @@ fn isSubagentStopPhase(phase: []const u8) bool {
 }
 
 fn isToolFailurePhase(phase: []const u8) bool {
-    return std.mem.eql(u8, phase, "tool-failure");
+    return std.mem.eql(u8, phase, "tool-failure") or std.mem.eql(u8, phase, "agent-error");
 }
 
 /// A turn that ended on an error (Claude Code's StopFailure: an API error,
@@ -372,8 +440,8 @@ pub fn bubbleBodyFull(out: []u8, text: []const u8, title: []const u8, busy: bool
 /// would overflow Windows' default 1 MiB), and the values copied out
 /// before it is freed.
 fn modelSettings(payload: []const u8, scan_buf: []u8, model_out: *[48]u8, effort_out: *[16]u8) Settings {
-    const from_payload: Settings = .{ .model = safeToken(jsonString(payload, "model"), 48) orelse "" };
-    const path = jsonString(payload, "transcript_path") orelse return from_payload;
+    const from_payload: Settings = .{ .model = safeToken((envelopeString(payload, "modelName") orelse envelopeString(payload, "model_name") orelse envelopeString(payload, "model_id") orelse envelopeString(payload, "model")), 48) orelse "" };
+    const path = (envelopeString(payload, "transcript_path") orelse envelopeString(payload, "transcriptPath")) orelse return from_payload;
     if (plat.lastLineMatching(path, scan_buf, carriesSettings)) |line| {
         return copySettings(settingsFromLine(line, from_payload), model_out, effort_out);
     }
@@ -447,6 +515,9 @@ pub const failed_duration_ms: u32 = 1220;
 
 /// Port of stateForEvent: phase + tool → sprite state.
 pub fn stateForEvent(phase: []const u8, tool_name: ?[]const u8) ?[]const u8 {
+    if (std.mem.eql(u8, phase, "ended")) return "idle";
+    if (std.mem.eql(u8, phase, "idle")) return "idle";
+    if (std.mem.eql(u8, phase, "cancelled")) return "idle";
     if (std.mem.eql(u8, phase, "pre")) {
         if (tool_name) |name| {
             if (asciiEqlLower(name, "read") or asciiEqlLower(name, "grep") or asciiEqlLower(name, "glob")) return "review";
@@ -470,6 +541,10 @@ pub fn stateForEvent(phase: []const u8, tool_name: ?[]const u8) ?[]const u8 {
 /// (raw JSON-escaped content passes through untouched so it can be
 /// re-embedded into the POST body).
 pub fn formatBubble(phase: []const u8, payload: []const u8, out: []u8) ?[]const u8 {
+    if (std.mem.eql(u8, phase, "agent-error")) return "Agent reported an error";
+    if (std.mem.eql(u8, phase, "ended")) return "Session ended.";
+    if (std.mem.eql(u8, phase, "idle")) return "Ready.";
+    if (std.mem.eql(u8, phase, "cancelled")) return "Cancelled.";
     if (isPromptPhase(phase)) return "Thinking…";
     if (isStopPhase(phase)) return "Done.";
     if (isAssistantPhase(phase)) return "Done.";
@@ -483,7 +558,7 @@ pub fn formatBubble(phase: []const u8, payload: []const u8, out: []u8) ?[]const 
     // the first `"` or `\` and decodes neither, and error text routinely carries
     // both; tool_name is a controlled identifier from the agent's own registry.
     if (isToolFailurePhase(phase)) {
-        const failed_tool = jsonString(payload, "tool_name") orelse return "Tool failed";
+        const failed_tool = toolName(payload) orelse return "Tool failed";
         return fmt2(out, clipRaw(failed_tool, 28), " failed");
     }
 
@@ -491,24 +566,24 @@ pub fn formatBubble(phase: []const u8, payload: []const u8, out: []u8) ?[]const 
     const done = std.mem.eql(u8, phase, "post");
     if (!running and !done) return null;
 
-    const tool = jsonString(payload, "tool_name") orelse "tool";
+    const tool = toolName(payload) orelse "tool";
 
-    if (asciiEqlLower(tool, "read")) {
+    if (asciiEqlLower(tool, "read") or asciiEqlLower(tool, "view")) {
         if (pathField(payload)) |p| return fmt2(out, if (done) "Read " else "Reading ", clipBase(p, 40));
         return if (done) "Read file" else "Reading file";
     }
-    if (asciiEqlLower(tool, "edit") or asciiEqlLower(tool, "multiedit") or asciiEqlLower(tool, "write")) {
+    if (asciiEqlLower(tool, "edit") or asciiEqlLower(tool, "multiedit") or asciiEqlLower(tool, "write") or asciiEqlLower(tool, "create") or asciiEqlLower(tool, "apply_patch")) {
         if (pathField(payload)) |p| return fmt2(out, if (done) "Edited " else "Editing ", clipBase(p, 40));
         return if (done) "Edited file" else "Editing file";
     }
-    if (asciiEqlLower(tool, "bash") or asciiEqlLower(tool, "shell")) {
+    if (asciiEqlLower(tool, "bash") or asciiEqlLower(tool, "shell") or asciiEqlLower(tool, "execute") or asciiEqlLower(tool, "powershell")) {
         if (jsonString(payload, "description")) |d| {
             var clip_buf: [200]u8 = undefined;
             if (clipEscaped(d, 40, &clip_buf)) |c| {
                 if (c.len > 0) return fmt2(out, "", c);
             }
         }
-        if (jsonString(payload, "command")) |cmd| {
+        if (jsonString(payload, "command") orelse jsonString(payload, "command_line")) |cmd| {
             const head = firstWord(cmd, 24);
             if (head.len > 0) return fmt2(out, if (done) "Ran " else "Running ", head);
         }
@@ -683,6 +758,71 @@ fn asciiEqlLower(text: []const u8, lower: []const u8) bool {
     return true;
 }
 
+fn toolName(payload: []const u8) ?[]const u8 {
+    if (envelopeString(payload, "tool_name") orelse envelopeString(payload, "toolName")) |name| return name;
+    const action = envelopeString(payload, "agent_action_name") orelse return null;
+    if (std.mem.endsWith(u8, action, "_read_code")) return "Read";
+    if (std.mem.endsWith(u8, action, "_write_code")) return "Write";
+    if (std.mem.endsWith(u8, action, "_run_command")) return "Bash";
+    if (std.mem.endsWith(u8, action, "_mcp_tool_use")) return "MCP";
+    return null;
+}
+
+/// Host-specific completion/error fields must not turn failures into success.
+fn eventPhase(phase: []const u8, payload: []const u8) []const u8 {
+    // Read host envelope fields, never similarly named tool input or prose.
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, payload, .{}) catch return phase;
+    defer parsed.deinit();
+    if (parsed.value != .object) return phase;
+    const fields = parsed.value.object;
+    if (std.mem.eql(u8, phase, "session-end")) {
+        if (fields.get("reason")) |reason| {
+            if (reason == .string and (std.mem.eql(u8, reason.string, "error") or std.mem.eql(u8, reason.string, "timeout"))) return "stop-failure";
+        }
+        return "ended";
+    }
+    if (std.mem.eql(u8, phase, "notification")) {
+        if (fields.get("notification_type")) |kind| {
+            if (kind == .string) {
+                if (std.mem.eql(u8, kind.string, "idle_prompt")) return "idle";
+                if (!std.mem.eql(u8, kind.string, "permission_prompt") and !std.mem.eql(u8, kind.string, "elicitation_dialog")) return "ignore";
+            }
+        }
+    }
+    if (std.mem.eql(u8, phase, "stop")) {
+        if (fields.get("terminationReason") orelse fields.get("status") orelse fields.get("stopReason")) |value| {
+            if (value == .string) {
+                if (std.mem.eql(u8, value.string, "error") or std.mem.eql(u8, value.string, "failed")) return "stop-failure";
+                for ([_][]const u8{ "cancelled", "canceled", "aborted", "interrupted" }) |reason| {
+                    if (std.mem.eql(u8, value.string, reason)) return "cancelled";
+                }
+            }
+        }
+        if (fields.get("fullyIdle")) |idle| {
+            if (idle == .bool and !idle.bool) return "post";
+        }
+    }
+    if (std.mem.eql(u8, phase, "post")) {
+        if (fields.get("toolResult")) |response| {
+            if (response == .object) if (response.object.get("resultType")) |result| {
+                if (result == .string and std.mem.eql(u8, result.string, "failure")) return "tool-failure";
+            };
+        }
+        if (fields.get("tool_response") orelse fields.get("toolResponse")) |response| {
+            if (response == .object) if (response.object.get("success")) |success| {
+                if (success == .bool and !success.bool) return "tool-failure";
+            };
+        }
+    }
+    if (std.mem.eql(u8, phase, "pre")) {
+        const name = toolName(payload) orelse return phase;
+        for ([_][]const u8{ "ask_permission", "ask_question", "ask_user", "vscode/askQuestions", "AskUserQuestion", "request_user_input", "request_scope" }) |waiting| {
+            if (std.mem.eql(u8, name, waiting)) return "notification";
+        }
+    }
+    return phase;
+}
+
 // ------------------------------------------------------ session titles
 
 fn safeSessionId(raw: ?[]const u8) ?[]const u8 {
@@ -705,10 +845,12 @@ fn normalizedConversationKey(raw: ?[]const u8, hash_buf: *[64]u8) ?[]const u8 {
 }
 
 fn payloadSessionId(payload: []const u8, hash_buf: *[64]u8) ?[]const u8 {
-    if (jsonString(payload, "petdex_conversation_key")) |key| return normalizedConversationKey(key, hash_buf);
-    if (safeSessionId(jsonString(payload, "session_id"))) |session| return session;
-    if (jsonString(payload, "session_key")) |key| return normalizedConversationKey(key, hash_buf);
-    return safeSessionId(jsonString(payload, "parent_session_id"));
+    if (envelopeString(payload, "petdex_conversation_key")) |key| return normalizedConversationKey(key, hash_buf);
+    for ([_][]const u8{ "conversation_id", "conversationId", "session_id", "sessionId", "trajectory_id" }) |key| {
+        if (envelopeString(payload, key)) |sid| return normalizedConversationKey(sid, hash_buf);
+    }
+    if (envelopeString(payload, "session_key")) |key| return normalizedConversationKey(key, hash_buf);
+    return safeSessionId(envelopeString(payload, "parent_session_id"));
 }
 
 fn rememberTitle(dir: []const u8, session_id: []const u8, prompt: []const u8) void {
@@ -1301,4 +1443,68 @@ test "real sessions and subagents are not taken for a background review" {
     try t.expect(!isBackgroundReview("{\"session_id\":\"s1\",\"user_message\":\"ship the fix\"}"));
     try t.expect(!isBackgroundReview("{\"parent_session_id\":\"parent-1\"}"));
     try t.expect(!isBackgroundReview("{}"));
+}
+
+test "Cursor and Antigravity keep host conversations and failure states" {
+    var hash: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("cursor-1", payloadSessionId("{\"conversation_id\":\"cursor-1\",\"generation_id\":\"turn-2\"}", &hash).?);
+    try std.testing.expectEqualStrings("agy-1", payloadSessionId("{\"conversationId\":\"agy-1\"}", &hash).?);
+    try std.testing.expectEqualStrings("stop-failure", eventPhase("stop", "{\"terminationReason\":\"error\"}"));
+    try std.testing.expectEqualStrings("post", eventPhase("stop", "{\"fullyIdle\":false}"));
+    try std.testing.expectEqualStrings("notification", eventPhase("pre", "{\"toolName\":\"ask_permission\"}"));
+    try std.testing.expectEqualStrings("tool-failure", eventPhase("post", "{\"tool_response\":{\"success\":false}}"));
+    try std.testing.expectEqualStrings("tool-failure", eventPhase("post", "{\"tool_response\":{\"success\":\n false}}"));
+    try std.testing.expectEqualStrings("post", eventPhase("post", "{\"tool_input\":{\"success\":false},\"tool_response\":{\"success\":true}}"));
+    try std.testing.expectEqualStrings("cancelled", eventPhase("stop", "{\"status\":\"aborted\"}"));
+    try std.testing.expectEqualStrings("idle", stateForEvent("cancelled", null).?);
+    var text_buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("Cancelled.", formatBubble("cancelled", "{}", &text_buf).?);
+}
+test "Cascade and Copilot payloads normalize display metadata and notifications" {
+    var hash: [64]u8 = undefined;
+    const cascade = "{\"trajectory_id\":\"cascade-1\",\"execution_id\":\"turn-2\",\"model_name\":\"claude-sonnet\",\"agent_action_name\":\"pre_run_command\",\"tool_info\":{\"command_line\":\"bun test\"}}";
+    try std.testing.expectEqualStrings("cascade-1", payloadSessionId(cascade, &hash).?);
+    var output: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("Running bun", formatBubble("pre", cascade, &output).?);
+    var scan: [512]u8 = undefined;
+    var model: [48]u8 = undefined;
+    var effort: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("claude-sonnet", modelSettings(cascade, &scan, &model, &effort).model);
+    try std.testing.expectEqualStrings("notification", eventPhase("pre", "{\"toolName\":\"ask_user\"}"));
+    try std.testing.expectEqualStrings("tool-failure", eventPhase("post", "{\"toolResult\":{\"resultType\":\"failure\"}}"));
+    try std.testing.expectEqualStrings("ignore", eventPhase("notification", "{\"notification_type\":\"auth_success\"}"));
+    try std.testing.expectEqualStrings("idle", eventPhase("notification", "{\"notification_type\":\"idle_prompt\"}"));
+    try std.testing.expectEqualStrings("notification", eventPhase("notification", "{\"notification_type\":\"permission_prompt\"}"));
+    try std.testing.expectEqualStrings("post", eventPhase("post", "{\"tool_input\":{\"toolResult\":{\"resultType\":\"failure\"}}}"));
+}
+
+test "nested tool data cannot replace the host conversation or model" {
+    const payload =
+        \\{"tool_input":{"conversation_id":"wrong","session_id":"wrong","tool_name":"AskUserQuestion","agent_source":"codex","model":"wrong","transcript_path":"/not-a-host-transcript","cwd":"/wrong"},
+        \\ "session_id":
+        \\ "host-session", "tool_name":"Read", "model":"host-model", "cwd":"/project"}
+    ;
+    var hash: [64]u8 = undefined;
+    try t.expectEqualStrings("host-session", payloadSessionId(payload, &hash).?);
+    try t.expectEqualStrings("Read", toolName(payload).?);
+    try t.expectEqualStrings("pre", eventPhase("pre", payload));
+    try t.expectEqualStrings("", resolveAgent(payload, null));
+    try t.expectEqualStrings("/project", envelopeString(payload, "cwd").?);
+    try t.expect(envelopeString(payload, "transcript_path") == null);
+    var scan: [128]u8 = undefined;
+    var model: [48]u8 = undefined;
+    var effort: [16]u8 = undefined;
+    try t.expectEqualStrings("host-model", modelSettings(payload, &scan, &model, &effort).model);
+    try t.expect(!isBackgroundReview("{\"session_id\":\"main\",\"tool_input\":{\"parent_session_id\":\"main\",\"user_message\":\"Review the conversation above and update two things\"}}"));
+}
+
+test "envelope strings skip nested arrays and escaped prose" {
+    const payload =
+        \\{"items":[{"session_id":"nested"}],"text":"quoted \\\"session_id\\\":\\\"fake\\\" braces } [", "session_id" : "actual", "prompt":"line one\nline two"}
+    ;
+    try t.expectEqualStrings("actual", envelopeString(payload, "session_id").?);
+    try t.expectEqualStrings("line one\\nline two", envelopeString(payload, "prompt").?);
+    try t.expect(envelopeString("{\"session_id\":false}", "session_id") == null);
+    try t.expect(envelopeString("{\"session_id\":\"unterminated}", "session_id") == null);
+    try t.expect(envelopeString("{\"session_id\":\"bad\\x\"}", "session_id") == null);
 }

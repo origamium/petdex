@@ -38,7 +38,7 @@ pub const Output = struct {
 /// and writes (for pushback), as fake-home-relative paths. The remote
 /// path is always "~/" ++ rel, which is what keeps this table the
 /// single place that mapping can drift.
-const opencode_files = [_][]const u8{".config/opencode/opencode.json"};
+const opencode_files = [_][]const u8{".config/opencode/plugins/petdex.js"};
 const codex_files = [_][]const u8{ ".codex/hooks.json", ".codex/config.toml" };
 const hermes_files = [_][]const u8{
     ".hermes/config.yaml",
@@ -92,9 +92,8 @@ pub fn remotePath(
 /// sh script must be pushed alongside its files.
 fn needsHookScript(kind: AgentKind) bool {
     return switch (kind) {
-        .hermes => true,
-        // Codex drives the pet over MCP now; the remote watcher still posts
-        // session titles through the reverse tunnel without a shell hook.
+        .codex, .hermes => true,
+        // OpenCode posts from its plugin runtime.
         else => false,
     };
 }
@@ -159,8 +158,11 @@ pub fn runInstaller(allocator: std.mem.Allocator, kind: AgentKind, fake_home: []
         plat.makeDir(dir);
     }
     return switch (kind) {
-        .opencode => agent_hooks.installOpencode(allocator, fake_home),
-        .codex => agent_hooks.installCodex(allocator, fake_home),
+        .opencode, .codex => blk: {
+            var root_buf: [512]u8 = undefined;
+            const root = std.fmt.bufPrint(&root_buf, "{s}/{s}", .{ fake_home, if (kind == .codex) @as([]const u8, ".codex") else ".config/opencode" }) catch break :blk false;
+            break :blk if (kind == .codex) agent_hooks.installCodexAt(allocator, root) else agent_hooks.installOpencodeAt(allocator, root);
+        },
         .hermes => blk: {
             var hermes_buf: [512]u8 = undefined;
             const hermes_dir = std.fmt.bufPrint(&hermes_buf, "{s}/.hermes", .{fake_home}) catch break :blk false;
@@ -239,12 +241,8 @@ pub fn collectOutputs(
                 out[i] = embeddedOutput(allocator, ".petdex/bin/petdex-codex-watch", remote_ssh.remote_codex_watcher, codex_watcher_script) orelse return null;
                 i += 1;
             }
-            // hooks.json is optional under MCP: only push it when the
-            // installer left one (foreign hooks preserved).
-            if (stagedOutput(allocator, kind, fake_home, codex_files[0], hermes_profile, hermes_home)) |hooks_out| {
-                out[i] = hooks_out;
-                i += 1;
-            }
+            out[i] = stagedOutput(allocator, kind, fake_home, codex_files[0], hermes_profile, hermes_home) orelse return null;
+            i += 1;
             out[i] = stagedOutput(allocator, kind, fake_home, codex_files[1], hermes_profile, hermes_home) orelse return null;
             i += 1;
             return out[0..i];
@@ -267,7 +265,7 @@ pub fn collectOutputs(
 
 const t = std.testing;
 
-test "codex writeback merges a fetched remote config with MCP" {
+test "codex writeback merges a fetched remote hooks.json" {
     if (@import("builtin").os.tag == .windows) return;
     const fake = ".zig-cache/petdex-wb-codex";
     plat.makeDir(fake);
@@ -284,18 +282,24 @@ test "codex writeback merges a fetched remote config with MCP" {
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const outs = collectOutputs(arena.allocator(), .codex, fake, "", "~/.hermes").?;
-    try t.expectEqual(@as(usize, 3), outs.len);
-    // Watcher first, then hooks.json (foreign hooks kept, petdex stripped),
-    // then config.toml with MCP.
-    try t.expectEqualStrings(remote_ssh.remote_codex_watcher, outs[0].remote);
+    try t.expectEqual(@as(usize, 4), outs.len);
+    // Dependencies first, hooks.json next, enabling config.toml last.
+    try t.expectEqualStrings(remote_ssh.remote_hook_script, outs[0].remote);
     try t.expect(outs[0].executable);
-    try t.expect(std.mem.indexOf(u8, outs[0].bytes, "request_user_input") != null);
-    try t.expectEqualStrings(".codex/hooks.json", outs[1].rel);
-    try t.expectEqualStrings("~/.codex/hooks.json", outs[1].remote);
-    try t.expect(std.mem.indexOf(u8, outs[1].bytes, "my-own") != null);
-    try t.expect(std.mem.indexOf(u8, outs[1].bytes, "petdex") == null);
-    try t.expectEqualStrings(".codex/config.toml", outs[2].rel);
-    try t.expect(std.mem.indexOf(u8, outs[2].bytes, "[mcp_servers.petdex]") != null);
+    try t.expect(std.mem.indexOf(u8, outs[0].bytes, "petdex-update-token") != null);
+    try t.expectEqualStrings(remote_ssh.remote_codex_watcher, outs[1].remote);
+    try t.expect(outs[1].executable);
+    try t.expect(std.mem.indexOf(u8, outs[1].bytes, "request_user_input") != null);
+    try t.expect(std.mem.indexOf(u8, outs[1].bytes, "recent_rollouts(catalog)") != null);
+    try t.expect(std.mem.indexOf(u8, outs[1].bytes, "title or state[\"fallback_title\"]") != null);
+    try t.expect(std.mem.indexOf(u8, outs[1].bytes, "initial_publishable(event, path)") != null);
+    try t.expect(std.mem.indexOf(u8, outs[1].bytes, "INITIAL_RUNNING_MAX_AGE_SECONDS") != null);
+    try t.expectEqualStrings(".codex/hooks.json", outs[2].rel);
+    try t.expectEqualStrings("~/.codex/hooks.json", outs[2].remote);
+    try t.expect(std.mem.indexOf(u8, outs[2].bytes, "my-own") != null);
+    try t.expect(std.mem.indexOf(u8, outs[2].bytes, "petdex-hook") != null);
+    try t.expectEqualStrings(".codex/config.toml", outs[3].rel);
+    try t.expect(std.mem.indexOf(u8, outs[3].bytes, "hooks = true") != null);
 }
 
 test "remote hook script accepts the shared desktop bubble CLI" {
@@ -460,7 +464,7 @@ test "staging rejects paths that escape the private fake home" {
     try t.expect(!stageFetched(".zig-cache/petdex-wb-safe", "/absolute", "x"));
 }
 
-test "opencode writeback is the MCP config, no hook script" {
+test "opencode writeback is the plugin alone, no hook script" {
     if (@import("builtin").os.tag == .windows) return;
     const fake = ".zig-cache/petdex-wb-opencode";
     plat.makeDir(fake);
@@ -471,9 +475,8 @@ test "opencode writeback is the MCP config, no hook script" {
     defer arena.deinit();
     const outs = collectOutputs(arena.allocator(), .opencode, fake, "", "~/.hermes").?;
     try t.expectEqual(@as(usize, 1), outs.len);
-    try t.expectEqualStrings("~/.config/opencode/opencode.json", outs[0].remote);
-    try t.expect(std.mem.indexOf(u8, outs[0].bytes, "PETDEX_MCP_AGENT") != null);
-    try t.expect(std.mem.indexOf(u8, outs[0].bytes, "mcp-server") != null);
+    try t.expectEqualStrings("~/.config/opencode/plugins/petdex.js", outs[0].remote);
+    try t.expect(std.mem.indexOf(u8, outs[0].bytes, "HOOK_SERVER_URL") != null);
     try t.expect(!outs[0].executable);
 }
 
@@ -498,4 +501,28 @@ test "non-remote-capable kinds stage nothing" {
     try t.expect(!needsHookScript(.opencode));
     try t.expect(!needsHermesWatcher(.opencode));
     try t.expect(!runInstaller(t.allocator, .claude_code, ".zig-cache/petdex-wb-none"));
+}
+
+test "remote staging cannot write through desktop config overrides" {
+    const mcp = @import("agent_mcp.zig");
+    const saved_codex = mcp.env_codex_home;
+    const saved_xdg = mcp.env_xdg_config_home;
+    defer {
+        mcp.env_codex_home = saved_codex;
+        mcp.env_xdg_config_home = saved_xdg;
+    }
+    const home = ".zig-cache/petdex-remote-isolation";
+    _ = plat.deleteTree(home);
+    defer _ = plat.deleteTree(home);
+    mcp.env_codex_home = home ++ "/local-codex";
+    mcp.env_xdg_config_home = home ++ "/local-xdg";
+    try t.expect(plat.writeFile(home ++ "/local-codex/config.toml", "model = \"untouched\"\n"));
+    try t.expect(plat.writeFile(home ++ "/local-xdg/opencode/plugins/petdex.js", "user content"));
+    try t.expect(runInstaller(t.allocator, .codex, home ++ "/stage"));
+    try t.expect(runInstaller(t.allocator, .opencode, home ++ "/stage"));
+    var buf: [256]u8 = undefined;
+    try t.expectEqualStrings("model = \"untouched\"\n", plat.readFile(home ++ "/local-codex/config.toml", &buf).?);
+    try t.expectEqualStrings("user content", plat.readFile(home ++ "/local-xdg/opencode/plugins/petdex.js", &buf).?);
+    try t.expect(plat.fileExists(home ++ "/stage/.codex/hooks.json"));
+    try t.expect(plat.fileExists(home ++ "/stage/.config/opencode/plugins/petdex.js"));
 }

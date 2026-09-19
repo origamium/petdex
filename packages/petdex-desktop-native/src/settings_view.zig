@@ -27,6 +27,7 @@ const catalog = &catalog_mod.catalog;
 const catalog_len = &catalog_mod.catalog_len;
 const max_catalog = catalog_mod.max_catalog;
 const agent_hooks = @import("agent_hooks.zig");
+const usage = @import("usage.zig");
 const remote_runtime = @import("remote_runtime.zig");
 const i18n = @import("i18n.zig");
 const settingsBackground = app.settingsBackground;
@@ -71,6 +72,7 @@ fn mutedParagraph(ui: *AppUi, content: []const u8) AppUi.Node {
 }
 
 fn agentStatusCaption(info: agent_hooks.AgentInfo, codex_note: bool, dsh_busy: bool, dsh_error: bool) []const u8 {
+    if (info.status == .current and info.needsMcpSetup()) return i18n.t("Automatic notifications configured; optional MCP tools not enabled", "自動通知設定済み。追加のMCPツールは未設定または無効です");
     if (info.kind == .dsh) {
         if (dsh_busy) return i18n.t("Running the DSH plugin command", "DSHプラグインのコマンドを実行中");
         if (dsh_error) return i18n.t("Plugin command failed - check npx and network", "プラグインのコマンドが失敗しました。npxとネットワークを確認してください");
@@ -81,20 +83,19 @@ fn agentStatusCaption(info: agent_hooks.AgentInfo, codex_note: bool, dsh_busy: b
             .current => i18n.t("Connected", "接続済み"),
         };
     }
-    if (info.kind == .codex and codex_note) return i18n.t("Installed - restart Codex to load Petdex MCP", "インストール済み。Codexを再起動してPetdex MCPを読み込んでください");
-    if (info.kind.prefersMcp()) {
-        return switch (info.status) {
-            .absent => i18n.t("Not detected", "見つかりません"),
-            .none => i18n.t("MCP not installed", "MCP未インストール"),
-            .node => i18n.t("Hooks outdated — update to MCP", "フックが古いためMCPへ更新してください"),
-            .current => i18n.t("Connected (MCP)", "接続済み（MCP）"),
-        };
-    }
+    if (info.kind == .codex and (codex_note or info.status == .current)) return i18n.t("Configured - restart Codex, then review new hooks in /hooks", "設定済み。Codexを再起動し、/hooksで新しいフックを確認してください");
+    if (info.status == .current) switch (info.kind) {
+        .amp => return i18n.t("Turn and tool-result notifications configured; reload Amp plugins", "開始・終了・ツール結果を通知。Ampのプラグイン再読込で反映"),
+        .windsurf => return i18n.t("Cascade activity configured; permission dialogs are not exposed", "Cascadeの動作通知を設定済み。承認ダイアログの通知は非対応"),
+        .copilot => return i18n.t("Notifications configured; restart Copilot CLI to load hooks", "通知設定済み。Copilot CLIの再起動で反映"),
+        else => {},
+    };
+
     return switch (info.status) {
         .absent => i18n.t("Not detected", "見つかりません"),
         .none => i18n.t("Hooks not installed", "フック未インストール"),
-        .node => i18n.t("Hooks outdated (CLI runner)", "フックが古くなっています（CLIランナー）"),
-        .current => i18n.t("Connected", "接続済み"),
+        .node => i18n.t("Hooks incomplete or outdated", "フックの更新が必要です"),
+        .current => if (info.kind == .junie) i18n.t("Hooks configured (Junie CLI EAP)", "フック設定済み（Junie CLI EAP）") else i18n.t("Automatic notifications configured", "自動通知設定済み"),
     };
 }
 
@@ -166,6 +167,11 @@ fn agentsSection(ui: *AppUi, model: *const Model, icons: IconAtlas) AppUi.Node {
             ui.button(.{ .size = .sm, .variant = .secondary, .disabled = true }, i18n.t("Working", "処理中"))
         else if (info.kind == .dsh and info.status == .node)
             ui.button(.{ .size = .sm, .variant = .secondary, .disabled = true }, i18n.t("Restart DSH", "DSHを再起動"))
+        else if (info.status == .current and info.needsMcpSetup())
+            ui.row(.{ .gap = 8 }, .{
+                ui.button(.{ .size = .sm, .variant = .primary, .on_press = Msg{ .install_agent = @intCast(i) } }, i18n.t("Set up MCP", "MCPを設定")),
+                ui.button(.{ .size = .sm, .variant = .secondary, .on_press = Msg{ .uninstall_agent = @intCast(i) } }, i18n.t("Disconnect", "接続解除")),
+            })
         else if (info.status == .current)
             ui.button(.{
                 .size = .sm,
@@ -727,7 +733,11 @@ fn petsPage(ui: *AppUi, model: *const Model, thumbs: ThumbAtlas, cloud_images: C
 fn notificationsPage(ui: *AppUi, model: *const Model) AppUi.Node {
     const bubble_text_fraction: f32 = (model.bubble_text_px - bubble_text_min_px) / (bubble_text_max_px - bubble_text_min_px);
     return ui.column(.{ .gap = 12 }, .{
-        mutedParagraph(ui, i18n.t("Show or hide notifications, usage limits and Flock from the pet’s menu or the menu bar.", "通知・利用上限・フロックの表示は、ペットの右クリックかメニューバーから切り替えられます。")),
+        ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
+            ui.text(.{ .grow = 1 }, i18n.t("Agent notifications", "エージェントの通知")),
+            ui.el(.switch_control, .{ .selected = model.bubbles_enabled, .on_toggle = .toggle_bubbles, .semantics = .{ .label = i18n.t("Agent notifications", "エージェントの通知") } }, .{}),
+        }),
+        usageSection(ui, model),
         ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
                 ui.column(.{ .grow = 1 }, .{
@@ -765,6 +775,64 @@ fn notificationsPage(ui: *AppUi, model: *const Model) AppUi.Node {
                 ui.el(.slider, .{ .width = 150, .value = bubble_text_fraction, .on_value = AppUi.valueMsg(.set_bubble_text_size), .semantics = .{ .label = i18n.t("Bubble text size", "吹き出しの文字サイズ") } }, .{}),
             }),
         }),
+    });
+}
+
+/// The same observations as the floating column, with room for names and
+/// resets. Missing observations stay explicit rather than looking like 0%.
+fn usageSection(ui: *AppUi, model: *const Model) AppUi.Node {
+    if (builtin.os.tag != .macos) return mutedParagraph(ui, i18n.t("Usage limits are available on macOS.", "使用量の表示はmacOSに対応しています。"));
+    var rows: [usage.agent_count + 2]AppUi.Node = undefined;
+    rows[0] = ui.row(.{ .cross = .center, .gap = 12 }, .{
+        ui.text(.{ .grow = 1 }, i18n.t("Usage limits", "使用量")),
+        ui.button(.{ .size = .sm, .variant = .secondary, .disabled = !model.usage_limits, .on_press = .usage_refresh }, i18n.t("Refresh", "更新")),
+        ui.el(.switch_control, .{ .selected = model.usage_limits, .on_toggle = .toggle_usage_limits, .semantics = .{ .label = i18n.t("Usage limits", "使用量") } }, .{}),
+    });
+    rows[1] = mutedParagraph(ui, if (model.usage_limits)
+        i18n.t("Recent plan usage. Updates independently of notifications.", "最近のプラン使用量です。通知とは独立して更新されます。")
+    else
+        i18n.t("Enable to show plan usage beside the pet and here.", "オンにするとペットの横とここにプラン使用量を表示します。"));
+    var count: usize = 2;
+    if (model.usage_limits) for (std.enums.values(usage.Agent)) |agent| {
+        const windows = model.usage.snapshot(agent);
+        var detected = windows != null;
+        for (model.agents) |info| {
+            if (info.status != .absent and std.mem.eql(u8, info.kind.hookAgentName(), @tagName(agent))) detected = true;
+        }
+        if (!detected) continue;
+        var lines: [usage.max_windows + 3]AppUi.Node = undefined;
+        lines[0] = ui.row(.{ .cross = .center, .gap = 12 }, .{
+            ui.text(.{ .grow = 1 }, usage.displayName(agent)),
+            ui.text(.{}, app.usageReading(ui, &model.usage, agent)),
+        });
+        var line_count: usize = 1;
+        if (windows) |observation| {
+            for (observation.slice()) |window| {
+                const name = if (window.label_len > 0) window.label() else if (window.minutes == usage.week_minutes) i18n.t("Week", "週") else if (window.minutes == usage.five_hour_minutes) i18n.t("5 hours", "5時間") else if (window.minutes == usage.month_minutes) i18n.t("Month", "月") else i18n.t("Limit", "上限");
+                lines[line_count] = mutedParagraph(ui, ui.fmt("{s}: {d}%  {s}", .{ name, usage.percent(window.used), app.usageResetText(ui, window.resets_at, model.usage.now_s) }));
+                line_count += 1;
+            }
+            if (observation.credits_used) |credits| {
+                lines[line_count] = mutedParagraph(ui, i18n.fmt(ui, "{d:.1} credits used · Percentage unavailable", "{d:.1} クレジット使用・使用率は不明", .{credits}));
+                line_count += 1;
+                if (observation.credits_resets_at > 0) {
+                    lines[line_count] = mutedParagraph(ui, app.usageResetText(ui, observation.credits_resets_at, model.usage.now_s));
+                    line_count += 1;
+                }
+            }
+        } else {
+            lines[line_count] = mutedParagraph(ui, i18n.t("Awaiting a recent usage report", "新しい使用量データを待っています"));
+            line_count += 1;
+        }
+        rows[count] = ui.column(.{ .gap = 4 }, @as([]const AppUi.Node, lines[0..line_count]));
+        count += 1;
+    };
+    if (model.usage_limits and count == 2) {
+        rows[count] = mutedParagraph(ui, i18n.t("No recent usage data. Open a connected agent to update its usage.", "最近の使用量データがありません。接続済みエージェントを開いて更新してください。"));
+        count += 1;
+    }
+    return ui.el(.panel, .{ .padding = 12, .style_tokens = .{ .background = .surface, .radius = .md } }, .{
+        ui.column(.{ .gap = 12 }, @as([]const AppUi.Node, rows[0..count])),
     });
 }
 

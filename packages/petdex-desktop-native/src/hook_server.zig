@@ -20,6 +20,7 @@ const builtin = @import("builtin");
 const plat = @import("plat.zig");
 const i18n = @import("i18n.zig");
 const dsh_integration = @import("dsh_integration.zig");
+const usage = @import("usage.zig");
 
 /// One connection, plus the Io that owns it. Everything downstream of
 /// accept() needs both, and passing them as a pair keeps the response
@@ -114,6 +115,7 @@ pub const Bubble = struct {
     focus_url: [64]u8 = @splat(0),
     focus_url_len: usize = 0,
     counter: u64 = 0,
+    received_at: i64 = 0,
 
     pub fn focusUrlSlice(self: *const Bubble) []const u8 {
         return self.focus_url[0..self.focus_url_len];
@@ -216,6 +218,41 @@ pub const Mailbox = struct {
     /// its LRU stamp: the smallest one is the least recently updated.
     bubble_counter: u64 = 0,
     state_counter: u64 = 0,
+    usage_refresh_pending: bool = false,
+    usage_snapshot: UsageSnapshot = .{},
+
+    pub const UsageSnapshot = struct {
+        enabled: bool = false,
+        checked_at: i64 = 0,
+        windows: [usage.agent_count]?usage.Windows = @splat(null),
+    };
+
+    pub fn publishUsage(self: *Mailbox, enabled: bool, state: *const usage.State) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.usage_snapshot = .{ .enabled = enabled, .checked_at = state.now_s, .windows = state.windows };
+    }
+
+    pub fn snapshotUsage(self: *Mailbox) UsageSnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.usage_snapshot;
+    }
+
+    pub fn requestUsageRefresh(self: *Mailbox) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.usage_refresh_pending = true;
+        return self.usage_snapshot.enabled;
+    }
+
+    pub fn takeUsageRefresh(self: *Mailbox) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const pending = self.usage_refresh_pending;
+        self.usage_refresh_pending = false;
+        return pending;
+    }
 
     pub const EnqueueResult = struct {
         queued: bool,
@@ -294,6 +331,7 @@ pub const Mailbox = struct {
 
         // The model and effort come on some events only; the same
         // conversation keeps them across the updates in between.
+        const previous = slot.*;
         const model = slot.model;
         const model_len = slot.model_len;
         const effort = slot.effort;
@@ -336,7 +374,29 @@ pub const Mailbox = struct {
         const pane_n = @min(herdr_pane.len, slot.herdr_pane.len);
         @memcpy(slot.herdr_pane[0..pane_n], herdr_pane[0..pane_n]);
         slot.herdr_pane_len = pane_n;
+        // Supplemental MCP messages may omit host metadata. Keep it for the
+        // same conversation; eviction or a different agent must start clean.
+        if (reused and same_agent) {
+            if (tn == 0) {
+                slot.title = previous.title;
+                slot.title_len = previous.title_len;
+            }
+            if (origin_app == .none) slot.origin_app = previous.origin_app;
+            if (tty_n == 0) {
+                slot.source_tty = previous.source_tty;
+                slot.source_tty_len = previous.source_tty_len;
+            }
+            if (cwd_n == 0) {
+                slot.source_cwd = previous.source_cwd;
+                slot.source_cwd_len = previous.source_cwd_len;
+            }
+            if (pane_n == 0) {
+                slot.herdr_pane = previous.herdr_pane;
+                slot.herdr_pane_len = previous.herdr_pane_len;
+            }
+        }
         slot.busy = busy;
+        slot.received_at = plat.nowSeconds();
 
         self.bubble_counter += 1;
         slot.counter = self.bubble_counter;
@@ -411,6 +471,14 @@ pub const Mailbox = struct {
         if (!self.bubbles_dirty) return null;
         @memcpy(out[0..self.bubbles_len], self.bubbles[0..self.bubbles_len]);
         self.bubbles_dirty = false;
+        return self.bubbles_len;
+    }
+
+    /// Readback must not consume the UI's pending notification.
+    pub fn snapshotBubbles(self: *Mailbox, out: *[max_bubbles]Bubble) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        @memcpy(out[0..self.bubbles_len], self.bubbles[0..self.bubbles_len]);
         return self.bubbles_len;
     }
 
@@ -887,6 +955,112 @@ fn windowsRelativeTimeoutFromNanoseconds(nanoseconds: i96) std.os.windows.LARGE_
     return -@as(std.os.windows.LARGE_INTEGER, @intCast(bounded));
 }
 
+/// Namespace normalized host ids so unrelated providers cannot replace each
+/// other's cards (including providers with no session id).
+pub fn qualifiedSessionKey(agent: []const u8, session: []const u8, out: *[64]u8) []const u8 {
+    if (agent.len == 0) return session;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(agent);
+    hash.update("\x00");
+    hash.update(session);
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    out.* = std.fmt.bytesToHex(digest, .lower);
+    return out;
+}
+
+fn bubbleBusy(body: []const u8) bool {
+    const Payload = struct { busy: bool = false };
+    var parsed = std.json.parseFromSlice(Payload, std.heap.page_allocator, body, .{ .ignore_unknown_fields = true }) catch return false;
+    defer parsed.deinit();
+    return parsed.value.busy;
+}
+
+fn decodedMetadata(a: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    const quoted = try std.fmt.allocPrint(a, "\"{s}\"", .{raw});
+    return std.json.parseFromSliceLeaky([]const u8, a, quoted, .{}) catch raw;
+}
+
+/// Allocations belong to the caller's per-request arena. No transcript or
+/// credential is read; only configuration status and current bubble metadata.
+fn integrationSnapshot(a: std.mem.Allocator, home: []const u8, mb: *Mailbox) ![]const u8 {
+    const hooks = @import("agent_hooks.zig");
+    const Integration = struct { agent: []const u8, hooks: []const u8, mcp: ?[]const u8 };
+    var integrations: [hooks.agent_count]Integration = undefined;
+    const detected = hooks.scan(a, home);
+    for (detected, 0..) |info, i| integrations[i] = .{
+        .agent = info.kind.hookAgentName(),
+        .hooks = @tagName(info.status),
+        .mcp = if (info.mcp_status) |status| @tagName(status) else null,
+    };
+    const Session = struct {
+        session_key: []const u8,
+        agent: []const u8,
+        title: []const u8,
+        text: []const u8,
+        state: []const u8,
+        busy: bool,
+        model: []const u8,
+        effort: []const u8,
+        cwd: []const u8,
+        received_at: i64,
+    };
+    var bubbles: [max_bubbles]Bubble = @splat(.{});
+    const count = mb.snapshotBubbles(&bubbles);
+    var sessions: [max_bubbles]Session = undefined;
+    for (bubbles[0..count], 0..) |*b, i| sessions[i] = .{
+        .session_key = b.sessionSlice(),
+        .agent = b.agent[0..b.agent_len],
+        .title = try decodedMetadata(a, b.title[0..b.title_len]),
+        .text = try decodedMetadata(a, b.text[0..b.text_len]),
+        .state = b.agentStateSlice(),
+        .busy = b.busy,
+        .model = try decodedMetadata(a, b.modelSlice()),
+        .effort = try decodedMetadata(a, b.effortSlice()),
+        .cwd = try decodedMetadata(a, b.cwdSlice()),
+        .received_at = b.received_at,
+    };
+    var path_buf: [512]u8 = undefined;
+    const disabled_path = try std.fmt.bufPrint(&path_buf, "{s}/.petdex/runtime/hooks-disabled", .{home});
+    const usage_snapshot = mb.snapshotUsage();
+    const usage_state: usage.State = .{ .now_s = plat.nowSeconds(), .windows = usage_snapshot.windows };
+    const UsageWindow = struct { used: f64, resets_at: i64, minutes: u32, label: []const u8 };
+    const UsageRow = struct { agent: []const u8, percent: ?u8, credits_used: ?f64, credits_resets_at: i64, observed_at: i64, windows: []const UsageWindow };
+    var usage_rows: [usage.agent_count]UsageRow = undefined;
+    var usage_windows: [usage.agent_count][usage.max_windows]UsageWindow = undefined;
+    var observations: [usage.agent_count]?usage.Windows = @splat(null);
+    var usage_count: usize = 0;
+    for (std.enums.values(usage.Agent)) |agent| {
+        observations[usage_count] = usage_state.snapshot(agent) orelse continue;
+        const windows = &observations[usage_count].?;
+        for (windows.slice(), 0..) |*window, i| usage_windows[usage_count][i] = .{
+            .used = window.used,
+            .resets_at = window.resets_at,
+            .minutes = window.minutes,
+            .label = window.label(),
+        };
+        usage_rows[usage_count] = .{
+            .agent = @tagName(agent),
+            .percent = usage_state.used(agent),
+            .credits_used = windows.credits_used,
+            .credits_resets_at = windows.credits_resets_at,
+            .observed_at = windows.observed_at,
+            .windows = usage_windows[usage_count][0..windows.len],
+        };
+        usage_count += 1;
+    }
+    return std.json.Stringify.valueAlloc(a, .{
+        .ok = true,
+        .protocol_version = @as(u32, 1),
+        .notifications_enabled = !plat.fileExists(disabled_path),
+        .usage_enabled = usage_snapshot.enabled,
+        .usage_checked_at = usage_snapshot.checked_at,
+        .usage = usage_rows[0..usage_count],
+        .integrations = integrations,
+        .sessions = sessions[0..count],
+    }, .{});
+}
+
 fn route(server: *Server, conn: *Conn, method: []const u8, target: []const u8, path: []const u8, head: []const u8, body: []const u8) void {
     const get = std.mem.eql(u8, method, "GET");
     const post = std.mem.eql(u8, method, "POST");
@@ -904,6 +1078,22 @@ fn route(server: *Server, conn: *Conn, method: []const u8, target: []const u8, p
 
     if (get and std.mem.eql(u8, path, "/health")) {
         return respond(conn, 200, "{\"ok\":true,\"port\":7777}");
+    }
+    if (post and std.mem.eql(u8, path, "/usage/refresh")) {
+        if (!tokenOk(server, head)) return respond(conn, 401, "{\"ok\":false,\"error\":\"unauthorized\"}");
+        if (!server.rateLimitOk()) return respond(conn, 429, "{\"ok\":false,\"error\":\"rate_limited\"}");
+        const enabled = mailbox.requestUsageRefresh();
+        return respond(conn, 200, if (enabled) "{\"ok\":true,\"queued\":true,\"usage_enabled\":true}" else "{\"ok\":true,\"queued\":true,\"usage_enabled\":false}");
+    }
+    if (get and std.mem.eql(u8, path, "/integrations")) {
+        if (!tokenOk(server, head)) return respond(conn, 401, "{\"ok\":false,\"error\":\"unauthorized\"}");
+        if (!server.rateLimitOk()) return respond(conn, 429, "{\"ok\":false,\"error\":\"rate_limited\"}");
+        const petdex_dir = std.fs.path.dirname(server.runtime_dir) orelse return respond(conn, 500, "{}");
+        const home = std.fs.path.dirname(petdex_dir) orelse return respond(conn, 500, "{}");
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const output = integrationSnapshot(arena.allocator(), home, &mailbox) catch return respond(conn, 500, "{}");
+        return respond(conn, 200, output);
     }
     if (get and std.mem.eql(u8, path, "/whoami")) {
         const out = std.fmt.bufPrint(&scratch, "{{\"ok\":true,\"pid\":{d},\"parentPid\":null,\"inProcess\":true}}", .{server.pid}) catch return;
@@ -974,12 +1164,14 @@ fn route(server: *Server, conn: *Conn, method: []const u8, target: []const u8, p
         const source_tty = plat.safeSourceTty(jsonString(body, "source_tty")) orelse "";
         const source_cwd = plat.safeSourceCwd(jsonString(body, "source_cwd")) orelse "";
         const herdr_pane = plat.safeHerdrPaneId(jsonString(body, "herdr_pane_id")) orelse "";
-        const busy = std.mem.indexOf(u8, body, "\"busy\":true") != null;
+        const busy = bubbleBusy(body);
         // Canonical conversation metadata wins over raw continuation/session
         // ids. Arbitrary provider keys are normalized to the mailbox's fixed
         // 64-byte key instead of being truncated into possible collisions.
         var session_hash: [64]u8 = undefined;
-        const session = bubbleSessionKey(body, &session_hash);
+        const raw_session = bubbleSessionKey(body, &session_hash);
+        var agent_session: [64]u8 = undefined;
+        const session = qualifiedSessionKey(agent, raw_session, &agent_session);
         if (isDshHandshakeBubble(body)) {
             writeRuntimeFile(
                 server,
@@ -988,7 +1180,7 @@ fn route(server: *Server, conn: *Conn, method: []const u8, target: []const u8, p
                 0o600,
             ) catch {};
         }
-        const counter = mailbox.setBubbleWithMetadata(session, capped, agent[0..@min(agent.len, 24)], title[0..@min(title.len, 96)], origin_app, source_tty, source_cwd, herdr_pane, busy);
+        const counter = mailbox.setBubbleWithMetadata(session, capped, agent[0..escapedCut(agent, 24)], title[0..escapedCut(title, 96)], origin_app, source_tty, source_cwd, herdr_pane, busy);
         // Optional: a sender that can tell blocked from working says so
         // here. Older senders omit it and keep the busy-only behaviour.
         if (jsonString(body, "agent_state")) |state| {
@@ -1607,4 +1799,83 @@ fn mirrorBubble(server: *Server, text: []const u8, counter: u64, title: []const 
     const json = try std.fmt.bufPrint(&buf, "{{\"text\":\"{s}\",\"title\":\"{s}\",\"agent_source\":\"{s}\",\"busy\":{},\"counter\":{d},\"at\":{d}}}", .{ text, title, agent, busy, counter, nowMs() });
     try writeRuntimeFile(server, "bubble.json", json, 0o644);
     server.last_bubble_mirror = counter;
+}
+test "supplemental messages preserve host metadata and readback does not drain" {
+    var mb: Mailbox = .{};
+    _ = mb.setBubbleWithMetadata("session", "Reading", "codex", "Fix auth", .terminal, "/dev/ttys001", "/repo", "w1:p1", true);
+    _ = mb.setBubble("session", "MCP update", "codex", "", false);
+    var bubbles: [max_bubbles]Bubble = @splat(.{});
+    try std.testing.expectEqual(@as(usize, 1), mb.snapshotBubbles(&bubbles));
+    try std.testing.expectEqualStrings("Fix auth", bubbles[0].title[0..bubbles[0].title_len]);
+    try std.testing.expectEqualStrings("/repo", bubbles[0].cwdSlice());
+    try std.testing.expectEqualStrings("w1:p1", bubbles[0].herdrPaneSlice());
+    try std.testing.expectEqual(plat.OriginApplication.terminal, bubbles[0].origin_app);
+    try std.testing.expect(bubbles[0].received_at > 0);
+    try std.testing.expectEqual(@as(?usize, 1), mb.takeBubbles(&bubbles));
+    try std.testing.expect(mb.takeBubbles(&bubbles) == null);
+    _ = mb.setBubble("session", "New agent", "amp", "", true);
+    _ = mb.snapshotBubbles(&bubbles);
+    try std.testing.expectEqualStrings("", bubbles[0].cwdSlice());
+}
+
+test "provider session keys isolate identical and absent host ids" {
+    var one: [64]u8 = undefined;
+    var two: [64]u8 = undefined;
+    try std.testing.expect(!std.mem.eql(u8, qualifiedSessionKey("amp", "same", &one), qualifiedSessionKey("codex", "same", &two)));
+    try std.testing.expect(!std.mem.eql(u8, qualifiedSessionKey("amp", "", &one), qualifiedSessionKey("codex", "", &two)));
+    try std.testing.expectEqualStrings(qualifiedSessionKey("amp", "same", &one), qualifiedSessionKey("amp", "same", &two));
+    try std.testing.expect(bubbleBusy("{\"busy\": true}"));
+    try std.testing.expect(!bubbleBusy("{\"tool_input\":{\"busy\":true}}"));
+}
+
+test "integration diagnostics return configuration and decoded session metadata" {
+    const home = ".zig-cache/petdex-diagnostics";
+    _ = plat.deleteTree(home);
+    defer _ = plat.deleteTree(home);
+    plat.makeDir(home ++ "/.petdex/runtime");
+    var mb: Mailbox = .{};
+    _ = mb.setBubble("session", "line\\nnext", "amp", "Title", true);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const data = try integrationSnapshot(a, home, &mb);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, data, .{});
+    try std.testing.expect(parsed.object.get("notifications_enabled").?.bool);
+    try std.testing.expectEqual(@as(usize, 19), parsed.object.get("integrations").?.array.items.len);
+    try std.testing.expectEqualStrings("line\nnext", parsed.object.get("sessions").?.array.items[0].object.get("text").?.string);
+    try std.testing.expect(plat.writeFile(home ++ "/.petdex/runtime/hooks-disabled", "1"));
+    const disabled = try std.json.parseFromSliceLeaky(std.json.Value, a, try integrationSnapshot(a, home, &mb), .{});
+    try std.testing.expect(!disabled.object.get("notifications_enabled").?.bool);
+}
+
+test "usage diagnostics distinguish credits and percent and refresh independently of bubbles" {
+    const home = ".zig-cache/petdex-usage-diagnostics";
+    _ = plat.deleteTree(home);
+    defer _ = plat.deleteTree(home);
+    try std.testing.expect(plat.writeFile(home ++ "/.petdex/runtime/hooks-disabled", "1"));
+    var mb: Mailbox = .{};
+    var state: usage.State = .{ .now_s = plat.nowSeconds() };
+    state.set(.codex, usage.Windows.one(57, state.now_s + 1000, usage.week_minutes));
+    state.set(.copilot, .{ .credits_used = 42.5, .credits_resets_at = state.now_s + 2000 });
+    mb.publishUsage(true, &state);
+    try std.testing.expect(mb.requestUsageRefresh());
+    try std.testing.expect(mb.takeUsageRefresh());
+    try std.testing.expect(!mb.takeUsageRefresh());
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const result = try std.json.parseFromSliceLeaky(std.json.Value, a, try integrationSnapshot(a, home, &mb), .{});
+    try std.testing.expect(result.object.get("usage_enabled").?.bool);
+    try std.testing.expect(!result.object.get("notifications_enabled").?.bool);
+    const rows = result.object.get("usage").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual(@as(i64, 57), rows[0].object.get("percent").?.integer);
+    try std.testing.expect(rows[1].object.get("percent").? == .null);
+    try std.testing.expectEqual(@as(f64, 42.5), rows[1].object.get("credits_used").?.float);
+    state.now_s -= usage.observation_ttl_s + 1;
+    state.windows[@intFromEnum(usage.Agent.codex)].?.observed_at = state.now_s;
+    mb.publishUsage(false, &state);
+    try std.testing.expect(!mb.requestUsageRefresh());
+    const stale = try std.json.parseFromSliceLeaky(std.json.Value, a, try integrationSnapshot(a, home, &mb), .{});
+    try std.testing.expectEqual(@as(usize, 1), stale.object.get("usage").?.array.items.len);
 }

@@ -826,7 +826,7 @@ test "driver gates feed until tunnel-ready patch pass completes" {
     try t.expect(!slot.sync_complete);
     act = onSpawnExit(&slot, idx, .profile, 0, "", home);
     try t.expect(act == .spawn and act.spawn.op == .fetch);
-    try t.expectEqualStrings("~/.config/opencode/opencode.json", act.spawn.path);
+    try t.expectEqualStrings("~/.config/opencode/plugins/petdex.js", act.spawn.path);
 
     // A verified fetch miss stages nothing; opencode's last file moves
     // straight into push (installer runs inside the driver).
@@ -834,7 +834,7 @@ test "driver gates feed until tunnel-ready patch pass completes" {
     try t.expect(act == .spawn and act.spawn.op == .push);
     try t.expect(act.spawn.first_chunk);
 
-    // Walk however many bounded chunks the generated MCP config currently needs;
+    // Walk however many bounded chunks the generated plugin currently needs;
     // metadata fields may grow it without changing the state-machine contract.
     var plugin_guard: usize = 0;
     while (act == .spawn and act.spawn.op == .push and plugin_guard < 16) {
