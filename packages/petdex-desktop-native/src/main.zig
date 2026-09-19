@@ -20,6 +20,7 @@ const native_sdk = @import("native_sdk");
 const hook_server = @import("hook_server.zig");
 const hook_runner = @import("hook_runner.zig");
 const agent_hooks = @import("agent_hooks.zig");
+const agent_mcp = @import("agent_mcp.zig");
 const dsh_integration = @import("dsh_integration.zig");
 const plat = @import("plat.zig");
 const installer = @import("installer.zig");
@@ -122,8 +123,14 @@ pub const Msg = union(enum) {
     toggle_waiting_sound,
     toggle_usage_limits,
     usage_select: u32,
+    usage_scrolled: canvas.ScrollState,
+    usage_refresh,
     usage_copilot_response: native_sdk.EffectResponse,
     usage_cursor_response: native_sdk.EffectResponse,
+    usage_grok_response: native_sdk.EffectResponse,
+    usage_antigravity_response: native_sdk.EffectResponse,
+    usage_gemini_project_response: native_sdk.EffectResponse,
+    usage_gemini_quota_response: native_sdk.EffectResponse,
     chime_done: native_sdk.EffectExit,
     set_bubble_text_size: f32,
     bubble_lifetime_input: canvas.TextInputEvent,
@@ -223,7 +230,7 @@ pub const Msg = union(enum) {
     hook_press,
     noop,
 
-    pub const view_unbound = .{ "frame_tick", "poll_tick", "bubble_tick", "frame_clock", "cycle_state", "native_drag_watchdog", "chime_done", "quit_app", "toggle_focus_mode", "shuffle_pet", "dsh_install_done", "dsh_remove_done", "remote_line", "remote_done", "remote_backoff", "update_boot_check", "update_response", "homebrew_done", "homebrew_timeout", "brew_command_copied", "auth_token_response", "auth_avatar_response", "auth_preview_response", "auth_library_done", "chat_line", "chat_response", "chat_models_response", "chatgpt_token_response", "usage_copilot_response", "usage_cursor_response" };
+    pub const view_unbound = .{ "frame_tick", "poll_tick", "bubble_tick", "frame_clock", "cycle_state", "native_drag_watchdog", "chime_done", "quit_app", "toggle_focus_mode", "shuffle_pet", "dsh_install_done", "dsh_remove_done", "remote_line", "remote_done", "remote_backoff", "update_boot_check", "update_response", "homebrew_done", "homebrew_timeout", "brew_command_copied", "auth_token_response", "auth_avatar_response", "auth_preview_response", "auth_library_done", "chat_line", "chat_response", "chat_models_response", "chatgpt_token_response", "usage_copilot_response", "usage_cursor_response", "usage_grok_response", "usage_antigravity_response", "usage_gemini_project_response", "usage_gemini_quota_response" };
 };
 
 pub const Model = struct {
@@ -336,6 +343,8 @@ pub const Model = struct {
     /// turning it on wraps Claude Code's statusline.
     usage_limits: bool = false,
     usage: usage_mod.State = .{},
+    usage_scroll: canvas.ScrollState = .{},
+    usage_net_backoff: [usage_mod.agent_count]i64 = @splat(0),
     /// The usage window has been moved beside the pet since it opened;
     /// until then it stays invisible.
     usage_placed: bool = false,
@@ -392,6 +401,15 @@ pub const Model = struct {
         .{ .kind = .omp },
         .{ .kind = .hermes },
         .{ .kind = .dsh },
+        .{ .kind = .cursor },
+        .{ .kind = .junie },
+        .{ .kind = .antigravity },
+        .{ .kind = .devin },
+        .{ .kind = .grok },
+        .{ .kind = .copilot },
+        .{ .kind = .windsurf },
+        .{ .kind = .amp },
+        .{ .kind = .droid },
     },
     dsh_busy: bool = false,
     dsh_error: bool = false,
@@ -1702,28 +1720,29 @@ const installable_art = [agent_hooks.agent_count + 2]AgentArt{
     .{ .light = @embedFile("assets/agents/hermes.png"), .dark = @embedFile("assets/agents/hermes.png") },
     // DSH has no bundled brand asset in this clean-room slice.
     .{ .light = @embedFile("assets/agents/fallback.png"), .dark = @embedFile("assets/agents/fallback.png") },
+    .{ .light = @embedFile("assets/agents/cursor.png"), .dark = @embedFile("assets/agents/cursor.png") },
+    .{ .light = @embedFile("assets/agents/junie.png"), .dark = @embedFile("assets/agents/junie.png") },
+    .{ .light = @embedFile("assets/agents/antigravity.png"), .dark = @embedFile("assets/agents/antigravity.png") },
+    .{ .light = @embedFile("assets/agents/devin.png"), .dark = @embedFile("assets/agents/devin.png") },
+    .{ .light = @embedFile("assets/agents/grok.png"), .dark = @embedFile("assets/agents/grok.png") },
+    .{ .light = @embedFile("assets/agents/copilot.png"), .dark = @embedFile("assets/agents/copilot.png") },
+    .{ .light = @embedFile("assets/agents/fallback.png"), .dark = @embedFile("assets/agents/fallback.png") },
+    .{ .light = @embedFile("assets/agents/fallback.png"), .dark = @embedFile("assets/agents/fallback.png") },
+    .{ .light = @embedFile("assets/agents/droid.png"), .dark = @embedFile("assets/agents/droid.png") },
     .{ .light = @embedFile("assets/agents/herdr.png"), .dark = @embedFile("assets/agents/herdr.png") },
     .{ .light = @embedFile("assets/agents/fallback.png"), .dark = @embedFile("assets/agents/fallback.png") },
 };
 pub const herdr_icon_index = agent_hooks.agent_count;
 const agent_fallback_index = agent_hooks.agent_count + 1;
 
-/// Agents with no hook installer of their own, which reach the pet
+/// Agents with no Connections installer of their own, which reach the pet
 /// through Herdr: the names they arrive under (Herdr's, normalized), the
 /// name a card shows, and their logo. Their cells follow the fallback's
 /// in the strip, in this order, so append rather than insert.
 const ExtraAgent = struct { names: []const []const u8, display: []const u8, art: []const u8 };
 const extra_agents = [_]ExtraAgent{
-    .{ .names = &.{"antigravity"}, .display = "Antigravity", .art = @embedFile("assets/agents/antigravity.png") },
-    .{ .names = &.{ "cursor", "cursor-agent" }, .display = "Cursor", .art = @embedFile("assets/agents/cursor.png") },
-    .{ .names = &.{"junie"}, .display = "Junie", .art = @embedFile("assets/agents/junie.png") },
-    .{ .names = &.{"devin"}, .display = "Devin", .art = @embedFile("assets/agents/devin.png") },
-    .{ .names = &.{"droid"}, .display = "Droid", .art = @embedFile("assets/agents/droid.png") },
     .{ .names = &.{ "kilo", "kilocode", "kilo-code" }, .display = "Kilo Code", .art = @embedFile("assets/agents/kilo.png") },
-    .{ .names = &.{"grok"}, .display = "Grok", .art = @embedFile("assets/agents/grok.png") },
     .{ .names = &.{ "mastracode", "mastra" }, .display = "Mastra Code", .art = @embedFile("assets/agents/mastracode.png") },
-    // The usage column's; Octicons' copilot mark (MIT) on a tile.
-    .{ .names = &.{"copilot"}, .display = "Copilot", .art = @embedFile("assets/agents/copilot.png") },
 };
 const extra_icon_base = agent_fallback_index + 1;
 
@@ -1880,6 +1899,7 @@ fn agentKindForName(agent: []const u8) ?agent_hooks.AgentKind {
     if (std.mem.eql(u8, agent, "open-code")) return .opencode;
     if (std.mem.eql(u8, agent, "qodercli")) return .qoder;
     if (std.mem.eql(u8, agent, "kimi")) return .kimi_code;
+    if (std.mem.eql(u8, agent, "cursor-agent")) return .cursor;
     return null;
 }
 
@@ -2299,6 +2319,9 @@ fn startRemotes(model: *Model, fx: *Effects) void {
 
 pub fn boot(model: *Model, fx: *Effects) void {
     if (env_home) |home| {
+        if (!agent_mcp.refreshServer(home)) {
+            std.debug.print("petdex: bundled MCP server could not be refreshed\n", .{});
+        }
         // Upgrade old CLI-written hooks before any agent starts another
         // session. The migration recognizes only Petdex-owned legacy
         // commands and leaves malformed or foreign configs untouched.
@@ -2357,6 +2380,7 @@ pub fn boot(model: *Model, fx: *Effects) void {
         model.herdr_status = herdr_status.detect(boot_allocator, home);
     }
     model.usage_limits = initial_usage_limits and usage_supported;
+    hook_server.mailbox.publishUsage(model.usage_limits, &model.usage);
     // Wrapped again if something replaced it since (a plugin update).
     syncClaudeStatusline(model);
     loadAgentsAtlas(model.dark, fx);
@@ -2662,7 +2686,16 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 .codebuddy => agent_hooks.installCodeBuddy(boot_allocator, home),
                 .omp => agent_hooks.installOmp(boot_allocator, home),
                 .hermes => agent_hooks.installHermes(boot_allocator, home),
+                .cursor => agent_hooks.installLifecycle(boot_allocator, home, .cursor),
+                .junie => agent_hooks.installLifecycle(boot_allocator, home, .junie),
+                .antigravity => agent_hooks.installLifecycle(boot_allocator, home, .antigravity),
+                .devin => agent_hooks.installLifecycle(boot_allocator, home, .devin),
+                .grok => agent_hooks.installLifecycle(boot_allocator, home, .grok),
+                .copilot, .windsurf, .amp, .droid => agent_hooks.installLifecycle(boot_allocator, home, kind),
                 .dsh => unreachable,
+            };
+            if (ok) if (kind.mcpKind()) |mcp| {
+                _ = agent_mcp.install(boot_allocator, home, mcp);
             };
             if (ok and kind == .codex) model.codex_trust_note = true;
             model.agents = agent_hooks.scan(boot_allocator, home);
@@ -3024,15 +3057,28 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.usage_limits = !model.usage_limits;
             // Empty until the next poll, which reads everything at once.
             model.usage = .{};
+            model.usage_scroll = .{};
+            hook_server.mailbox.publishUsage(model.usage_limits, &model.usage);
             syncClaudeStatusline(model);
             saveSettings(model);
         },
+        .usage_refresh => {
+            model.usage.next_file_ms = 0;
+            model.usage.next_net_ms = 0;
+            refreshUsage(model, fx, fx.wallMs());
+        },
+        .usage_scrolled => |scroll| model.usage_scroll = scroll,
         .usage_copilot_response => |response| onUsageResponse(model, .copilot, response, usage_mod.windowsFromCopilot, fx),
         .usage_cursor_response => |response| onUsageResponse(model, .cursor, response, usage_mod.windowsFromCursor, fx),
+        .usage_grok_response => |response| onUsageResponse(model, .grok, response, usage_mod.windowsFromGrokCredits, fx),
+        .usage_antigravity_response => |response| onUsageResponse(model, .antigravity, response, usage_mod.windowsFromAntigravityQuota, fx),
+        .usage_gemini_project_response => |response| onGeminiProjectResponse(model, response, fx),
+        .usage_gemini_quota_response => |response| onUsageResponse(model, .gemini, response, usage_mod.windowsFromGeminiQuota, fx),
         .usage_select => |index| {
             if (index >= usage_mod.agent_count) return;
             const agent: usage_mod.Agent = @enumFromInt(index);
             model.usage.selected = if (model.usage.selected == agent) null else agent;
+            model.usage_scroll = .{};
             syncUsageWindow(model, fx);
         },
         .chime_done => {},
@@ -3405,10 +3451,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // wherever it was last seen.
             if (fx.moveWindow("main", 0, 0, false)) |read| notePet(model, read);
             chat_shell.poll(model, fx);
-            if (!model.sheet_loaded) return;
-            if (model.settings_open and thumbs_built < catalog_mod.catalog_len) buildNextThumb(fx);
             const now = fx.wallMs();
             refreshUsage(model, fx, now);
+            if (!model.sheet_loaded) return;
+            if (model.settings_open and thumbs_built < catalog_mod.catalog_len) buildNextThumb(fx);
             var drained: [hook_server.max_bubbles]hook_server.Bubble = undefined;
             if (hook_server.mailbox.takeBubbles(&drained)) |raw_count| {
                 if (model.settings_open) {
@@ -4506,8 +4552,12 @@ const usage_window_label = "usage";
 const usage_canvas_label = "usage-canvas";
 const usage_copilot_key: u64 = 60;
 const usage_cursor_key: u64 = 61;
+const usage_grok_key: u64 = 62;
+const usage_antigravity_key: u64 = 63;
+const usage_gemini_project_key: u64 = 64;
+const usage_gemini_quota_key: u64 = 65;
 /// The column: rows of logo and percent.
-const usage_rows_w: f32 = 60;
+const usage_rows_w: f32 = 84;
 const usage_row_h: f32 = 22;
 const usage_icon_px: f32 = 16;
 const usage_pad: f32 = 8;
@@ -4531,8 +4581,7 @@ fn usageActive(model: *const Model) bool {
 /// The pressed row's windows, while it still has a row.
 fn usageDetail(model: *const Model) ?usage_mod.Windows {
     const agent = model.usage.selected orelse return null;
-    if (model.usage.used(agent) == null) return null;
-    return model.usage.windows[@intFromEnum(agent)];
+    return model.usage.snapshot(agent);
 }
 
 fn usageDetailHeight(windows: usize) f32 {
@@ -4543,11 +4592,15 @@ fn usageDetailHeight(windows: usize) f32 {
 /// The window's size: the column, and the breakdown while a row is open.
 fn usageSize(model: *const Model) [2]f32 {
     const rows_h = @as(f32, @floatFromInt(model.usage.len())) * usage_row_h;
-    const detail = usageDetail(model) orelse return .{ usage_rows_w + usage_pad * 2, rows_h + usage_pad * 2 };
+    const detail = usageDetail(model) orelse return .{ usage_rows_w + usage_pad * 2, @min(rows_h + usage_pad * 2, usageMaxHeight(model)) };
     return .{
         usage_rows_w + usage_detail_gap + usage_detail_w + usage_pad * 2,
-        @max(rows_h, usageDetailHeight(detail.len)) + usage_pad * 2,
+        @min(@max(rows_h, usageDetailHeight(detail.len + @as(usize, if (detail.credits_used != null) 1 else 0)) + @as(f32, if (detail.credits_used != null) 12 else 0)) + usage_pad * 2, usageMaxHeight(model)),
     };
+}
+
+fn usageMaxHeight(model: *const Model) f32 {
+    return if (model.pet_screen) |screen| @floatCast(@max(64, screen.h - 16)) else 600;
 }
 
 /// The column's window origin: left of the pet, or right of it when the
@@ -4594,11 +4647,13 @@ fn syncUsageWindow(model: *Model, fx: *Effects) void {
 /// The column's sources on their own clocks: the local files every
 /// minute, Copilot's and Cursor's endpoints every five.
 fn refreshUsage(model: *Model, fx: *Effects, now: i64) void {
+    if (hook_server.mailbox.takeUsageRefresh()) model.usage.next_file_ms = 0;
     if (!model.usage_limits) return;
     const home = env_home orelse return;
     if (now >= model.usage.next_file_ms) {
         model.usage.next_file_ms = now + usage_mod.file_interval_ms;
         usage_mod.readFiles(&model.usage, home, now);
+        hook_server.mailbox.publishUsage(model.usage_limits, &model.usage);
     }
     if (now >= model.usage.next_net_ms) {
         model.usage.next_net_ms = now + usage_mod.net_interval_ms;
@@ -4606,51 +4661,157 @@ fn refreshUsage(model: *Model, fx: *Effects, now: i64) void {
     }
 }
 
-/// Copilot's and Cursor's endpoints, with the sign-ins their own apps
-/// keep. Without one, that row stays hidden.
+/// The agents' own endpoints, with the sign-ins their own apps keep.
+/// Without one, that row stays hidden. Grok's and Antigravity's tokens
+/// only count while unexpired: refreshing them is the CLIs' job.
 fn fetchUsage(model: *Model, fx: *Effects, home: []const u8) void {
-    var token_buf: [256]u8 = undefined;
-    if (usage_mod.copilotToken(home, &token_buf)) |token| {
-        var auth_buf: [300]u8 = undefined;
-        const headers = [_]std.http.Header{
-            .{ .name = "authorization", .value = std.fmt.bufPrint(&auth_buf, "token {s}", .{token}) catch return },
-            .{ .name = "accept", .value = "application/json" },
-            // What Copilot's own editor plugins send; the endpoint is theirs.
-            .{ .name = "editor-version", .value = "vscode/1.96.2" },
-            .{ .name = "editor-plugin-version", .value = "copilot-chat/0.26.7" },
-            .{ .name = "user-agent", .value = "GitHubCopilotChat/0.26.7" },
-            .{ .name = "x-github-api-version", .value = "2025-04-01" },
-        };
-        fx.fetch(.{ .key = usage_copilot_key, .url = usage_mod.copilot_url, .headers = &headers, .timeout_ms = 15000, .on_response = Effects.responseMsg(.usage_copilot_response) });
-    } else model.usage.set(.copilot, null);
+    if (usageFetchReady(model, .copilot)) {
+        var token_buf: [256]u8 = undefined;
+        if (usage_mod.copilotToken(home, &token_buf)) |token| {
+            var auth_buf: [300]u8 = undefined;
+            const headers = [_]std.http.Header{
+                .{ .name = "authorization", .value = std.fmt.bufPrint(&auth_buf, "token {s}", .{token}) catch return },
+                .{ .name = "accept", .value = "application/json" },
+                // What Copilot's own editor plugins send; the endpoint is theirs.
+                .{ .name = "editor-version", .value = "vscode/1.96.2" },
+                .{ .name = "editor-plugin-version", .value = "copilot-chat/0.26.7" },
+                .{ .name = "user-agent", .value = "GitHubCopilotChat/0.26.7" },
+                .{ .name = "x-github-api-version", .value = "2025-04-01" },
+            };
+            fx.fetch(.{ .key = usage_copilot_key, .url = usage_mod.copilot_url, .headers = &headers, .timeout_ms = 15000, .on_response = Effects.responseMsg(.usage_copilot_response) });
+        } else model.usage.set(.copilot, null);
+    }
 
-    var cursor_buf: [2048]u8 = undefined;
-    var cookie_buf: [2200]u8 = undefined;
-    const cookie = if (usage_mod.cursorToken(home, &cursor_buf)) |token| usage_mod.cursorCookie(token, &cookie_buf) else null;
-    if (cookie) |value| {
-        const headers = [_]std.http.Header{
-            .{ .name = "cookie", .value = value },
-            .{ .name = "accept", .value = "application/json" },
-        };
-        fx.fetch(.{ .key = usage_cursor_key, .url = usage_mod.cursor_url, .headers = &headers, .timeout_ms = 15000, .on_response = Effects.responseMsg(.usage_cursor_response) });
-    } else model.usage.set(.cursor, null);
+    if (usageFetchReady(model, .cursor)) {
+        var cursor_buf: [2048]u8 = undefined;
+        var cookie_buf: [2200]u8 = undefined;
+        const cookie = if (usage_mod.cursorToken(home, &cursor_buf)) |token| usage_mod.cursorCookie(token, &cookie_buf) else null;
+        if (cookie) |value| {
+            const headers = [_]std.http.Header{
+                .{ .name = "cookie", .value = value },
+                .{ .name = "accept", .value = "application/json" },
+            };
+            fx.fetch(.{ .key = usage_cursor_key, .url = usage_mod.cursor_url, .headers = &headers, .timeout_ms = 15000, .on_response = Effects.responseMsg(.usage_cursor_response) });
+        } else model.usage.set(.cursor, null);
+    }
+
+    if (usageFetchReady(model, .grok)) {
+        var grok_dir_buf: [512]u8 = undefined;
+        var grok_tok_buf: [1024]u8 = undefined;
+        var grok_uid_buf: [128]u8 = undefined;
+        const grok_dir = agent_mcp.presenceDir(&grok_dir_buf, home, .grok);
+        const grok_cred = if (grok_dir) |dir| usage_mod.grokCred(dir, &grok_tok_buf, &grok_uid_buf, model.usage.now_s) else null;
+        if (grok_cred) |cred| {
+            var grok_auth_buf: [1100]u8 = undefined;
+            var grok_ver_buf: [32]u8 = undefined;
+            const headers = [_]std.http.Header{
+                .{ .name = "authorization", .value = std.fmt.bufPrint(&grok_auth_buf, "Bearer {s}", .{cred.token}) catch return },
+                .{ .name = "accept", .value = "application/json" },
+                .{ .name = "x-xai-token-auth", .value = "xai-grok-cli" },
+                .{ .name = "x-userid", .value = cred.user_id orelse "" },
+                .{ .name = "x-grok-client-version", .value = usage_mod.grokClientVersion(grok_dir.?, &grok_ver_buf) orelse "0.0.0" },
+                .{ .name = "x-grok-client-surface", .value = "grok-build" },
+            };
+            fx.fetch(.{ .key = usage_grok_key, .url = usage_mod.grok_url, .headers = &headers, .timeout_ms = 15000, .on_response = Effects.responseMsg(.usage_grok_response) });
+        } else model.usage.set(.grok, null);
+    }
+
+    // Each host's own account is authoritative; sharing a Google provider
+    // does not mean the user selected the same account in both products.
+    if (usageFetchReady(model, .antigravity)) {
+        var agy_tok_buf: [2048]u8 = undefined;
+        var agy_auth_buf: [2100]u8 = undefined;
+        if (usage_mod.antigravityToken(&agy_tok_buf, model.usage.now_s)) |token| {
+            const headers = [_]std.http.Header{
+                .{ .name = "authorization", .value = std.fmt.bufPrint(&agy_auth_buf, "Bearer {s}", .{token}) catch return },
+                .{ .name = "content-type", .value = "application/json" },
+                .{ .name = "user-agent", .value = "antigravity" },
+            };
+            fx.fetch(.{ .key = usage_antigravity_key, .url = usage_mod.antigravity_url, .method = .POST, .headers = &headers, .body = "{}", .timeout_ms = 15000, .on_response = Effects.responseMsg(.usage_antigravity_response) });
+        } else model.usage.set(.antigravity, null);
+    }
+    if (usageFetchReady(model, .gemini)) {
+        var gemini_dir_buf: [512]u8 = undefined;
+        var google_tok_buf: [2048]u8 = undefined;
+        var google_auth_buf: [2100]u8 = undefined;
+        const gemini_dir = agent_mcp.presenceDir(&gemini_dir_buf, home, .gemini);
+        const google_token = if (gemini_dir) |dir| usage_mod.googleToken(dir, &google_tok_buf, model.usage.now_s) else null;
+        if (google_token) |token| {
+            const auth = std.fmt.bufPrint(&google_auth_buf, "Bearer {s}", .{token}) catch return;
+            const headers = [_]std.http.Header{
+                .{ .name = "authorization", .value = auth },
+                .{ .name = "content-type", .value = "application/json" },
+                .{ .name = "user-agent", .value = "GeminiCLI/0.0.0" },
+            };
+            fx.fetch(.{ .key = usage_gemini_project_key, .url = usage_mod.gemini_load_url, .method = .POST, .headers = &headers, .body = "{}", .timeout_ms = 15000, .on_response = Effects.responseMsg(.usage_gemini_project_response) });
+        } else {
+            model.usage.set(.gemini, null);
+        }
+    }
+    hook_server.mailbox.publishUsage(model.usage_limits, &model.usage);
+}
+
+fn usageFetchReady(model: *const Model, agent: usage_mod.Agent) bool {
+    return model.usage.now_s * 1000 >= model.usage_net_backoff[@intFromEnum(agent)];
+}
+
+/// loadCodeAssist's answer carries the project retrieveUserQuota wants;
+/// the same token still holds, so the quota fetch goes out right away.
+fn onGeminiProjectResponse(model: *Model, response: native_sdk.EffectResponse, fx: *Effects) void {
+    if (!model.usage_limits) return;
+    if (response.outcome != .ok) return;
+    if (response.status != 200 or response.truncated) {
+        if (response.status == 429) {
+            model.usage_net_backoff[@intFromEnum(usage_mod.Agent.gemini)] = fx.wallMs() + usage_mod.net_backoff_ms;
+            return;
+        }
+        model.usage.set(.gemini, null);
+        hook_server.mailbox.publishUsage(model.usage_limits, &model.usage);
+        return;
+    }
+    const home = env_home orelse return;
+    var dir_buf: [512]u8 = undefined;
+    var tok_buf: [2048]u8 = undefined;
+    var auth_buf: [2100]u8 = undefined;
+    var project_buf: [128]u8 = undefined;
+    var body_buf: [192]u8 = undefined;
+    const dir = agent_mcp.presenceDir(&dir_buf, home, .gemini) orelse return;
+    const token = usage_mod.googleToken(dir, &tok_buf, model.usage.now_s) orelse {
+        model.usage.set(.gemini, null);
+        hook_server.mailbox.publishUsage(model.usage_limits, &model.usage);
+        return;
+    };
+    const project = usage_mod.projectFromCodeAssist(response.body, &project_buf) orelse {
+        model.usage.set(.gemini, null);
+        hook_server.mailbox.publishUsage(model.usage_limits, &model.usage);
+        return;
+    };
+    const headers = [_]std.http.Header{
+        .{ .name = "authorization", .value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{token}) catch return },
+        .{ .name = "content-type", .value = "application/json" },
+        .{ .name = "user-agent", .value = "GeminiCLI/0.0.0" },
+    };
+    const body = std.fmt.bufPrint(&body_buf, "{{\"project\":\"{s}\"}}", .{project}) catch return;
+    fx.fetch(.{ .key = usage_gemini_quota_key, .url = usage_mod.gemini_quota_url, .method = .POST, .headers = &headers, .body = body, .timeout_ms = 15000, .on_response = Effects.responseMsg(.usage_gemini_quota_response) });
 }
 
 /// An endpoint's answer. Unreachable keeps the last number; refused or
 /// unreadable hides the row, the number no longer known; a 429 backs the
 /// fetches off.
 fn onUsageResponse(model: *Model, agent: usage_mod.Agent, response: native_sdk.EffectResponse, parse: *const fn ([]const u8) ?usage_mod.Windows, fx: *Effects) void {
+    if (!model.usage_limits) return;
     // Named in the log: a row that never shows says why nowhere else.
     if (response.outcome != .ok or response.status != 200) {
         std.debug.print("petdex: {s} usage: {s} {d}\n", .{ @tagName(agent), @tagName(response.outcome), response.status });
     }
     if (response.outcome != .ok) return;
     if (response.status == 429) {
-        model.usage.next_net_ms = fx.wallMs() + usage_mod.net_backoff_ms;
+        model.usage_net_backoff[@intFromEnum(agent)] = fx.wallMs() + usage_mod.net_backoff_ms;
         return;
     }
     model.usage.now_s = @divFloor(fx.wallMs(), 1000);
     model.usage.set(agent, if (response.status == 200 and !response.truncated) parse(response.body) else null);
+    hook_server.mailbox.publishUsage(model.usage_limits, &model.usage);
 }
 
 /// The relay goes in with the usage column, and only into a Claude Code
@@ -4674,14 +4835,15 @@ fn usageView(ui: *AppUi, model: *const Model) AppUi.Node {
     var rows: [usage_mod.agent_count]AppUi.Node = undefined;
     var count: usize = 0;
     for (std.enums.values(usage_mod.Agent)) |agent| {
-        const pct = model.usage.used(agent) orelse continue;
-        var label = ui.text(.{ .size = .sm }, ui.fmt("{d}%", .{pct}));
+        if (!model.usage.visible(agent)) continue;
+        const reading = usageReading(ui, &model.usage, agent);
+        var label = ui.text(.{ .size = .sm }, reading);
         label.widget.style.foreground = fg;
         var row = ui.row(.{ .width = usage_rows_w, .height = usage_row_h, .gap = 6, .cross = .center, .on_press = Msg{ .usage_select = @intFromEnum(agent) } }, .{
             agentLogo(ui, agentIconIndex(@tagName(agent)), usage_icon_px),
             label,
         });
-        row.widget.semantics.label = ui.fmt("{s} {d}%", .{ usage_mod.displayName(agent), pct });
+        row.widget.semantics.label = ui.fmt("{s} {s}", .{ usage_mod.displayName(agent), reading });
         rows[count] = row;
         count += 1;
     }
@@ -4693,7 +4855,8 @@ fn usageView(ui: *AppUi, model: *const Model) AppUi.Node {
         else
             ui.row(.{ .grow = 1, .gap = usage_detail_gap, .cross = .start }, .{ detail, column });
     } else column;
-    var card = ui.el(.panel, .{ .grow = 1, .padding = usage_pad }, .{body});
+    const viewport = ui.scroll(.{ .width = usageSize(model)[0] - usage_pad * 2, .height = usageSize(model)[1] - usage_pad * 2, .value = model.usage_scroll.offset, .on_scroll = AppUi.scrollMsg(.usage_scrolled) }, .{body});
+    var card = ui.el(.panel, .{ .grow = 1, .padding = usage_pad }, .{viewport});
     styleSpeechCard(&card, model.dark);
     card.widget.style.radius = 12;
     // Born at the screen's center like the bubbles: hidden until placed.
@@ -4706,13 +4869,13 @@ fn usageView(ui: *AppUi, model: *const Model) AppUi.Node {
 fn usageDetailView(ui: *AppUi, model: *const Model, windows: usage_mod.Windows, fg: canvas.Color) AppUi.Node {
     const muted = if (model.dark) canvas.Color.rgb8(156, 158, 168) else canvas.Color.rgb8(88, 92, 106);
     const track = if (model.dark) canvas.Color.rgba8(255, 255, 255, 38) else canvas.Color.rgba8(0, 0, 0, 20);
-    var parts: [1 + 2]AppUi.Node = undefined;
+    var parts: [2 + usage_mod.max_windows]AppUi.Node = undefined;
     var title = ui.text(.{ .size = .sm }, usage_mod.displayName(model.usage.selected.?));
     title.widget.style.foreground = fg;
     parts[0] = ui.el(.stack, .{ .width = usage_detail_w, .height = usage_title_h }, .{title});
     for (windows.slice(), 0..) |w, i| {
         const pct = usage_mod.percent(usage_mod.current(w, model.usage.now_s));
-        var name = ui.text(.{ .size = .sm }, usageWindowName(ui, w.minutes));
+        var name = ui.text(.{ .size = .sm }, if (w.label_len > 0) w.label() else usageWindowName(ui, w.minutes));
         name.widget.style.foreground = fg;
         var value = ui.text(.{ .size = .sm }, ui.fmt("{d}%", .{pct}));
         value.widget.style.foreground = fg;
@@ -4730,7 +4893,26 @@ fn usageDetailView(ui: *AppUi, model: *const Model, windows: usage_mod.Windows, 
             ui.el(.stack, .{ .width = usage_detail_w, .height = usage_line_h }, .{reset}),
         });
     }
-    return ui.column(.{ .width = usage_detail_w, .gap = usage_block_gap, .cross = .start }, @as([]const AppUi.Node, parts[0 .. 1 + windows.len]));
+    var count = 1 + windows.len;
+    if (windows.credits_used) |credits| {
+        parts[count] = ui.column(.{ .width = usage_detail_w, .height = usage_window_block_h + 12, .gap = 4 }, .{
+            ui.text(.{ .size = .sm }, i18n.fmt(ui, "{d:.1} credits used", "{d:.1} クレジット使用", .{credits})),
+            ui.text(.{ .size = .sm }, i18n.t("Percentage unavailable", "使用率は不明")),
+            ui.text(.{ .size = .sm }, usageResetText(ui, windows.credits_resets_at, model.usage.now_s)),
+        });
+        count += 1;
+    }
+    return ui.column(.{ .width = usage_detail_w, .gap = usage_block_gap, .cross = .start }, @as([]const AppUi.Node, parts[0..count]));
+}
+
+pub fn usageReading(ui: *AppUi, state: *const usage_mod.State, agent: usage_mod.Agent) []const u8 {
+    if (state.used(agent)) |pct| return ui.fmt("{d}%", .{pct});
+    if (state.credits(agent)) |credits| {
+        if (credits >= 1000000) return ui.fmt("{d:.1}M cr", .{credits / 1000000});
+        if (credits >= 1000) return ui.fmt("{d:.1}k cr", .{credits / 1000});
+        return ui.fmt("{d:.1} cr", .{credits});
+    }
+    return i18n.t("Unknown", "不明");
 }
 
 /// A window by its length: the ones the agents use, else in hours.
@@ -4746,7 +4928,7 @@ fn usageWindowName(ui: *AppUi, minutes: u32) []const u8 {
 
 /// How long until a window resets, to the minute: no clock time, so no
 /// time zone to get wrong.
-fn usageResetText(ui: *AppUi, resets_at: i64, now_s: i64) []const u8 {
+pub fn usageResetText(ui: *AppUi, resets_at: i64, now_s: i64) []const u8 {
     if (resets_at == 0) return "";
     const left = resets_at - now_s;
     if (left <= 0) return i18n.t("Reset", "リセット済み");
@@ -4785,7 +4967,8 @@ test "the usage column takes the pet's left, else its right" {
 test "a pressed row opens its breakdown beside the column" {
     var model: Model = .{};
     var claude: usage_mod.Windows = .{};
-    claude.items = .{ .{ .used = 42, .minutes = usage_mod.five_hour_minutes }, .{ .used = 18, .minutes = usage_mod.week_minutes } };
+    claude.items[0] = .{ .used = 42, .minutes = usage_mod.five_hour_minutes };
+    claude.items[1] = .{ .used = 18, .minutes = usage_mod.week_minutes };
     claude.len = 2;
     model.usage.set(.@"claude-code", claude);
     model.usage.set(.codex, usage_mod.Windows.one(15, 0, usage_mod.week_minutes));
@@ -4820,6 +5003,37 @@ test "the usage window exists only with the setting on and a row to show" {
     }
     model.usage.set(.codex, null);
     try std.testing.expectEqual(@as(usize, 0), petdexWindows(&model, &scratch).len);
+}
+
+test "credits-only usage opens a detail and all windows fit a small screen viewport" {
+    var model: Model = .{};
+    model.sheet_loaded = true;
+    model.usage_limits = true;
+    model.pet_screen = .{ .x = 0, .y = 0, .w = 1024, .h = 600 };
+    model.usage.set(.copilot, .{ .credits_used = 42.5 });
+    model.usage.selected = .copilot;
+    try std.testing.expect(usageDetail(&model) != null);
+    try std.testing.expectEqual(@as(?u8, null), model.usage.used(.copilot));
+    try std.testing.expectEqual(@as(usize, 1), model.usage.len());
+    var windows: usage_mod.Windows = .{ .credits_used = 42.5 };
+    windows.len = usage_mod.max_windows;
+    for (windows.items[0..windows.len]) |*window| window.* = .{ .used = 50 };
+    model.usage.set(.copilot, windows);
+    const size = usageSize(&model);
+    try std.testing.expectEqual(@as(f32, 584), size[1]);
+    const spot = usageSpot(&model, model.pet_screen.?, size[0], size[1]);
+    try std.testing.expect(spot.y >= 0 and spot.y + size[1] <= 600);
+}
+
+test "a provider backoff leaves other usage providers eligible" {
+    var model: Model = .{};
+    model.usage.now_s = 1000;
+    model.usage_net_backoff[@intFromEnum(usage_mod.Agent.copilot)] = 1000 * 1000 + usage_mod.net_backoff_ms;
+    try std.testing.expect(!usageFetchReady(&model, .copilot));
+    try std.testing.expect(usageFetchReady(&model, .cursor));
+    try std.testing.expect(usageFetchReady(&model, .gemini));
+    model.usage.now_s += @divExact(usage_mod.net_backoff_ms, 1000);
+    try std.testing.expect(usageFetchReady(&model, .copilot));
 }
 
 /// What the pet window shows before there is a pet to draw.
@@ -5432,7 +5646,7 @@ fn petdexWindows(model: *const Model, scratch: *PetdexApp.WindowsScratch) []cons
         scratch.windows[count] = .{
             .label = usage_window_label,
             .canvas_label = usage_canvas_label,
-            .title = "",
+            .title = i18n.t("Petdex Usage", "Petdex 使用量"),
             .width = usageSize(model)[0],
             .height = usageSize(model)[1],
             .x = @floatCast(model.pet_x - usage_pet_gap - usageSize(model)[0]),
@@ -5701,7 +5915,7 @@ pub fn main(init: std.process.Init) !void {
     // wiring hooks into ~/.claude for those users writes a settings.json
     // their Claude Code never reads, and detection shows them as
     // disconnected after a successful connect (#601).
-    agent_hooks.env_claude_config_dir = init.environ_map.get("CLAUDE_CONFIG_DIR");
+    agent_mcp.env_claude_config_dir = init.environ_map.get("CLAUDE_CONFIG_DIR");
     // Kimi Code relocates its whole config with KIMI_CODE_HOME, so the
     // same blind spot #601 described applies: hooks written to the
     // default dir would land somewhere it never reads.
@@ -5720,6 +5934,20 @@ pub fn main(init: std.process.Init) !void {
     agent_hooks.env_hermes_home = init.environ_map.get("HERMES_HOME");
     dsh_integration.env_dsh_home = init.environ_map.get("DSH_HOME");
     chat_shell.env_codex_home = init.environ_map.get("CODEX_HOME");
+    // The same relocation blind spot applies to the MCP config roots: these
+    // vars move the directory the agent reads, so writing to the default
+    // leaves a "connected" entry the agent never loads.
+    agent_mcp.env_codex_home = init.environ_map.get("CODEX_HOME");
+    agent_mcp.env_gemini_cli_home = init.environ_map.get("GEMINI_CLI_HOME");
+    agent_mcp.env_junie_home = init.environ_map.get("JUNIE_HOME");
+    agent_mcp.env_xdg_config_home = init.environ_map.get("XDG_CONFIG_HOME");
+    agent_mcp.env_appdata = init.environ_map.get("APPDATA");
+    agent_mcp.env_grok_home = init.environ_map.get("GROK_HOME");
+    agent_mcp.env_copilot_home = init.environ_map.get("COPILOT_HOME");
+    // GROK_AUTH_PATH moves the credential file itself, not the root the
+    // column reads it from; the usage fetch honors it separately.
+    usage_mod.env_gemini_force_file_storage = std.mem.eql(u8, init.environ_map.get("GEMINI_FORCE_FILE_STORAGE") orelse "", "true");
+    usage_mod.env_grok_auth_path = init.environ_map.get("GROK_AUTH_PATH");
     // Hook hot path: `<binary> bubble <phase> [agent]` runs the
     // in-binary runner and exits before any UI machinery spins up.
     // initAllocator, not init: on Windows the command line arrives as
@@ -5931,12 +6159,15 @@ test "one image slot covers every agent" {
 }
 
 test "agents Herdr relays get their own logo and name" {
-    try std.testing.expectEqual(extra_icon_base + 1, agentIconIndex("cursor"));
+    try std.testing.expectEqual(@as(usize, @intFromEnum(agent_hooks.AgentKind.cursor)), agentIconIndex("cursor"));
     try std.testing.expectEqual(agentIconIndex("cursor"), agentIconIndex("cursor-agent"));
-    try std.testing.expectEqual(extra_icon_base, agentIconIndex("antigravity"));
-    try std.testing.expectEqual(agent_fallback_index, agentIconIndex("windsurf"));
+    try std.testing.expectEqual(@as(usize, @intFromEnum(agent_hooks.AgentKind.antigravity)), agentIconIndex("antigravity"));
+    try std.testing.expectEqual(@as(usize, @intFromEnum(agent_hooks.AgentKind.junie)), agentIconIndex("junie"));
+    try std.testing.expectEqual(@as(usize, @intFromEnum(agent_hooks.AgentKind.devin)), agentIconIndex("devin"));
+    try std.testing.expectEqual(@as(usize, @intFromEnum(agent_hooks.AgentKind.grok)), agentIconIndex("grok"));
+    try std.testing.expectEqual(@as(usize, @intFromEnum(agent_hooks.AgentKind.windsurf)), agentIconIndex("windsurf"));
     // The usage column's Copilot row has its logo too.
-    try std.testing.expectEqual(extra_icon_base + extra_agents.len - 1, agentIconIndex("copilot"));
+    try std.testing.expectEqual(@as(usize, @intFromEnum(agent_hooks.AgentKind.copilot)), agentIconIndex("copilot"));
     var bubble: hook_server.Bubble = .{};
     @memcpy(bubble.agent[0.."junie".len], "junie");
     bubble.agent_len = "junie".len;
@@ -6863,6 +7094,7 @@ test "an error wears a badge, and waiting on the user glows, still or not" {
 }
 
 test "an open card offers the agent's Warp pane or Terminal tab" {
+    if (builtin.target.os.tag != .macos) return;
     var model: Model = .{};
     testPushBubble(&model, "alpha", "reading", true, -1);
     try std.testing.expectEqual(Destination.none, bubbleDestination(&model.bubbles[0]));
@@ -6886,6 +7118,7 @@ test "an open card offers the agent's Warp pane or Terminal tab" {
 }
 
 test "a press on the open card's button belongs to the button" {
+    if (builtin.target.os.tag != .macos) return;
     var model: Model = .{};
     testPushBubble(&model, "alpha", "reading", true, -1);
     const url = "warp://session/0123456789abcdef0123456789abcdef";

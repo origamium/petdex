@@ -39,12 +39,18 @@ on:
   push:
     paths:
       - "packages/petdex-desktop-native/**"
+      - "packages/petdex-cli/src/hooks/mcp-server*"
+      - "packages/petdex-cli/bin/petdex-mcp.ts"
+      - "scripts/build-petdex-mcp.ts"
       - "patches/native-sdk-*.patch"
       - "scripts/patch-native-sdk.sh"
       - ".github/workflows/desktop-native-ci.yml"
   pull_request:
     paths:
       - "packages/petdex-desktop-native/**"
+      - "packages/petdex-cli/src/hooks/mcp-server*"
+      - "packages/petdex-cli/bin/petdex-mcp.ts"
+      - "scripts/build-petdex-mcp.ts"
       - "patches/native-sdk-*.patch"
       - "scripts/patch-native-sdk.sh"
       - ".github/workflows/desktop-native-ci.yml"
@@ -99,6 +105,13 @@ jobs:
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
+
+      - name: Verify bundled MCP server and protocol tests
+        run: |
+          bun scripts/build-petdex-mcp.ts --check
+          bun test packages/petdex-cli/src/hooks/mcp-server.test.ts packages/petdex-cli/src/hooks/mcp-server-runtime.test.ts
+          bun test packages/petdex-desktop-native/integrations/amp/plugin.test.js
+          bun test packages/petdex-desktop-native/integrations/plugins/notifications.test.ts
 
       - name: Test DSH plugin and embedded archive
         if: matrix.platform == 'macos'

@@ -99,8 +99,9 @@ async function main() {
   }
 
   // `petdex mcp-server` is also a hot path run as a subprocess by
-  // Antigravity. Any stdout output (telemetry notice, help text)
-  // before the client sends `initialize` breaks the MCP handshake.
+  // MCP clients (Codex, Claude Code, Cursor, Junie, Antigravity, …).
+  // Any stdout output (telemetry notice, help text) before the client
+  // sends `initialize` breaks the MCP handshake.
   if (cmd === "mcp-server") {
     const { runMcpServer } = await import("../src/hooks/mcp-server.js");
     await runMcpServer();

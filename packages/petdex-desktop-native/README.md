@@ -177,25 +177,109 @@ moves right when the chat or the screen's edge takes the left. Click a row to
 open its windows beside the column, each with its bar and how long until it
 resets; click it again to close them.
 
-- **Claude Code** hands its limits to its statusline. Turning the column on
-  wraps the `statusLine` command in `~/.claude/settings.json`; the wrapper
-  keeps the numbers and runs your command as before. Turning the column off,
-  or removing Petdex's Claude Code hooks, puts yours back. The row needs those
-  hooks.
-- **Codex** writes them into its session log, read by the Stop hook at the end
-  of each turn.
-- **Junie** spends JetBrains AI credits, read from the quota file the JetBrains
-  IDEs keep, as of an IDE's last check.
-- **Copilot** and **Cursor** are asked every five minutes, with the sign-ins
-  their own apps keep (`~/.config/github-copilot/apps.json`, Cursor's settings
-  database).
+Automatic activity comes from host lifecycle hooks or plugins. MCP tools are
+optional manual controls; registration alone does not prove that an agent
+will emit notifications. Connections installs the following local integrations:
 
-An agent with nothing to report has no row. Petdex never refreshes an agent's
-sign-in.
+| Agent | Automatic event source |
+| --- | --- |
+| Claude Code | `settings.json` lifecycle hooks; existing statusline wrapped only when usage is enabled |
+| Codex | `hooks.json` and `features.hooks = true`; restart Codex after installation |
+| Gemini CLI | `settings.json`: prompt, tool, notification, turn completion and session end |
+| OpenCode | `plugins/petdex.js` event plugin |
+| Cursor | `~/.cursor/hooks.json` with Cursor's direct-handler schema |
+| Junie | `~/.junie/config.json`, **CLI EAP TUI/batch only**; upstream ACP/server/IDE hooks are not available |
+| Antigravity | `~/.gemini/config/hooks.json`, named hook definition with conversation metadata |
+| Devin CLI | `~/.config/devin/config.json` (`%APPDATA%/devin` on Windows) |
+| Grok Build | `~/.grok/hooks/petdex.json` lifecycle hooks |
+| Copilot CLI | `~/.copilot/hooks/petdex.json`: prompts, tools, permission notifications, errors and turn/session end |
+| Windsurf / Devin Desktop | `~/.codeium/windsurf/hooks.json`: Cascade prompts, read/write/command/MCP activity and response completion |
+| Amp | `~/.config/amp/plugins/petdex.js`: local turn start/end and tool results; run `plugins: reload` after installation |
+| Droid | `~/.factory/hooks.json`: prompts, tools, notifications and completion; legacy `settings.json.hooks` is preserved |
+| Qoder / Kimi Code / CodeBuddy / OMP / Hermes / DSH | Existing dedicated hooks/plugins; DSH requires a live plugin handshake |
+
+Existing custom roots (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_HOME`,
+`JUNIE_HOME`, `XDG_CONFIG_HOME`, `GROK_HOME`, `COPILOT_HOME`) are respected. Settings says
+**configured**, not connected: host versions, global hook opt-outs, inherited
+project settings and host restarts still govern delivery. Junie permission
+hooks are deliberately omitted because synchronous success would auto-approve
+an operation; its tool/stop payloads also do not always carry a session id.
+Cursor observes prompt submission, tool results and completion without
+installing permission-decision hooks; it has no general permission-dialog
+notification event. These upstream
+limits cannot be repaired by asking the model to call an MCP tool reliably.
+
+The optional MCP server is bundled at `~/.petdex/bin/petdex-mcp-server.mjs`
+and refreshed when Desktop starts. It uses Node 20+, with no `npx` or
+package-registry dependency. Restart host MCP processes after a Desktop upgrade.
+Both activity
+tools require the host's stable `session_id`; state, model, effort and focus
+metadata are forwarded to that conversation. OpenCode preserves existing
+V1/V2 layouts and edits JSONC without creating a shadow JSON config; a new MCP
+config defaults to V2. Hooks/plugins keep working without Node.
+
+MCP v0.4.0 exposes five tools: `petdex_set_state`, `petdex_show_bubble`,
+`petdex_report_usage`, `petdex_status`, and `petdex_get_sessions`. Status reports
+notification enablement and per-agent hooks/MCP configuration. Session readback
+defaults to the calling agent and returns current cards, model/workspace metadata
+and receipt timestamps; it does not discover running processes or read transcripts.
+Both use the local token-protected `/integrations` endpoint. Older Desktop builds
+fall back to health-only status and explicitly reject unsupported session readback.
+Supplemental messages retain omitted host metadata, and provider-qualified session
+keys isolate identical ids from different agents.
+
+There are 19 direct integration rows and 13 MCP installers. The detailed
+[support matrix and upstream limitations](../../docs/agent-integration-support.md)
+distinguish automatic events, optional tools, usage reporting and unverified hosts.
+
+After upgrading from the MCP-only integration, open Settings → Connections
+and press Install/Update for the affected agent, then restart that host. This
+restores automatic hooks and replaces its old `npx` MCP entry. MCP registration
+by itself remains “Hooks not installed”; intentional hook opt-outs are not
+silently migrated at startup.
+
+After updating Codex hooks, restart Codex and review the new definitions in
+`/hooks`. Codex requires trust for each new or changed non-managed hook;
+Petdex installs configuration without bypassing that host review.
+
+Usage sources are separate from notifications:
+
+- Claude Code supplies plan limits through its statusline relay; removing the
+  integration or disabling usage restores the previous statusline command.
+- Codex uses quota observations in rollout files under the resolved Codex root.
+  Resumed sessions are compared by observation time, not creation filenames.
+- Junie uses the latest JetBrains IDE quota observation. Copilot, Cursor and
+  Grok use their own existing account credentials and endpoints.
+- Copilot reads the current public GitHub session in `auth.db`, with legacy
+  stores used only when appropriate. Unlimited credits retain their absolute
+  consumption and reset time; no percentage is invented without a denominator.
+- Gemini reads its own macOS Keychain item, encrypted FileKeychain fallback,
+  or legacy OAuth file. Antigravity reads its separate macOS Keychain item,
+  including go-keyring envelopes. Petdex never refreshes or rewrites tokens.
+  Locked/unavailable credentials, expired tokens and unsupported credential
+  layouts yield unknown usage; Gemini credentials are never lent to Antigravity.
+- `petdex_report_usage` accepts up to 16 numeric windows and writes an atomic,
+  timestamped snapshot. Fresh reports survive unavailable network credentials;
+  newer observations win. It requests Desktop refresh independently of the
+  notification switch and reports whether persistence and refresh succeeded.
+  Model/pool labels from quota endpoints are retained.
+
+Settings → Notifications shows current usage, reset times and a Refresh action,
+including credit-only consumption. Missing readings remain explicitly unknown.
+The floating usage detail scrolls when all windows do not fit on screen.
+
+Usage observations older than one hour, or past their reset time, are unknown
+and hidden until refreshed; they are never assumed to mean 0%. Usage acquisition
+currently runs on macOS. Antigravity file-only authentication and unverified
+credential layouts are not claimed as supported. Live-account endpoint behavior
+still depends on the provider's account entitlements and response contract.
 
 The [usage acquisition audit](../../docs/agent-usage-research.md) records
 additional Grok, Gemini, Kimi and Qoder integration paths, live verification
 results, and the difference between missing support and unavailable credentials.
+The [September 19 integration verification](../../docs/integration-verification-2026-09-19.md)
+records the hook/MCP runtime checks, actual usage and notification UI checks,
+current Copilot acquisition, and remaining platform/authentication limits.
 
 The pet knows the numbers too: while the column is on, chat requests other
 than casual small talk carry each agent's windows and how long until they reset, so a reply, the
@@ -276,7 +360,9 @@ Remote shell-exec agents (codex, hermes) invoke `~/.petdex/bin/petdex-hook` on
 the remote, where a small POSIX sh + curl script (`src/assets/petdex-remote-hook.sh`)
 mirrors the desktop hook runner's contract: stdin drain, killswitch
 (`~/.petdex/runtime/hooks-disabled`), token-gated POSTs to `127.0.0.1:7777`,
-never fails outward. The opencode plugin POSTs directly and works unchanged.
+never fails outward. Remote OpenCode posts from its self-contained event plugin
+through the same tunnel. Remote installers use explicit staging roots, so local
+config-root environment overrides cannot modify desktop account settings.
 
 Notes:
 - SSH only; there is no API fallback transport. Windows remotes are out of scope.

@@ -20,6 +20,18 @@ pub fn load(home: []const u8, account: []const u8, out: []u8) ?[]const u8 {
     return fileLoad(home, account, out);
 }
 
+/// Read a specific host-owned credential without writing, refreshing, or
+/// allowing macOS authentication UI. An inaccessible item is simply unknown.
+/// Distinguish absence from refusal so callers cannot fall back to an old
+/// account's file when the authoritative Keychain item is locked.
+pub const ForeignRead = union(enum) { missing, unavailable, value: []const u8 };
+
+pub fn readForeign(service_name: []const u8, account: []const u8, out: []u8) ForeignRead {
+    if (builtin.is_test) return .missing;
+    if (!use_keychain) return .unavailable;
+    return keychain.readService(service_name, account, out);
+}
+
 pub fn save(home: []const u8, account: []const u8, bytes: []const u8) bool {
     if (!accountOk(account) or bytes.len == 0) return false;
     if (use_keychain) return keychain.save(account, bytes);
@@ -110,6 +122,26 @@ const keychain = struct {
         const source: [*]const u8 = @ptrCast(password_data.?);
         @memcpy(out[0..password_len], source[0..password_len]);
         return out[0..password_len];
+    }
+
+    extern "c" fn SecKeychainGetUserInteractionAllowed(allowed: *u8) c_int;
+    extern "c" fn SecKeychainSetUserInteractionAllowed(allowed: u8) c_int;
+    fn readService(service_name: []const u8, account: []const u8, out: []u8) ForeignRead {
+        var allowed: u8 = 0;
+        if (SecKeychainGetUserInteractionAllowed(&allowed) != 0) return .unavailable;
+        if (SecKeychainSetUserInteractionAllowed(0) != 0) return .unavailable;
+        defer _ = SecKeychainSetUserInteractionAllowed(allowed);
+        var password_len: u32 = 0;
+        var password_data: ?*anyopaque = null;
+        const status = SecKeychainFindGenericPassword(null, @intCast(service_name.len), service_name.ptr, @intCast(account.len), account.ptr, &password_len, &password_data, null);
+        defer if (password_data != null) {
+            _ = SecKeychainItemFreeContent(null, password_data);
+        };
+        if (status == err_sec_item_not_found) return .missing;
+        if (status != 0 or password_len == 0 or password_len > out.len or password_data == null) return .unavailable;
+        const source: [*]const u8 = @ptrCast(password_data.?);
+        @memcpy(out[0..password_len], source[0..password_len]);
+        return .{ .value = out[0..password_len] };
     }
 
     fn save(account: []const u8, bytes: []const u8) bool {
