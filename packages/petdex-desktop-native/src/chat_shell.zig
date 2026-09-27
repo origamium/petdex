@@ -225,7 +225,7 @@ fn timerReplyFinished(model: *Model, success: bool) void {
     const completion = st.timer_completion orelse return;
     st.timer_completion = null;
     st.session.quiet();
-    if (model.focus_mode or !model.timer.clock.config.speak) return;
+    if (!st.open or model.focus_mode or !model.timer.clock.config.speak) return;
     const clock = &model.timer.clock;
     if (clock.serial != completion.id or clock.pending != null) return;
     // Persist fallback-only while a completed generation waits for a
@@ -243,9 +243,9 @@ fn timerReplyFinished(model: *Model, success: bool) void {
 fn timerSpeech(model: *Model, fx: *Effects) void {
     const st = &model.chat;
     const ts = &model.timer;
-    if (model.focus_mode or !ts.clock.config.speak or st.pet_len == 0) return;
+    if (!st.open or model.focus_mode or !ts.clock.config.speak or st.pet_len == 0) return;
     const p = ts.clock.claim(st.session.phase != .idle or st.session.wire != null, st.input.len > 0) orelse return;
-    timer_shell.save(ts); // Acknowledge before opening a window or fetching.
+    timer_shell.save(ts); // Acknowledge before displaying a line or fetching.
     const generated = ts.generated_len > 0 and ts.generated_id == p.id;
     if (generated or p.fallback_only or !st.ready() or needsRefresh(st, fx)) {
         const line = if (generated) ts.generated[0..ts.generated_len] else p.fallback();
@@ -254,9 +254,6 @@ fn timerSpeech(model: *Model, fx: *Effects) void {
         st.session.lost_text = false;
         if (ensureHistory()) |h| _ = h.append(st.petSlug(), .assistant, line, st.kind, fx.wallMs());
         ts.generated_len = 0;
-        const was_open = st.open;
-        show(model, fx);
-        if (!was_open) st.quiet_open = true;
         st.history = false;
         st.scroll = 0;
         return;
@@ -272,6 +269,7 @@ test "completed timer generation waits behind a new draft and failures become fa
     app.env_home = null;
     defer app.env_home = saved_home;
     var model: Model = .{};
+    model.chat.open = true;
     model.timer.clock.start(1000);
     _ = model.timer.clock.tick(model.timer.clock.deadline_ms, false);
     const p = model.timer.clock.claim(false, false).?;
@@ -330,7 +328,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .open_chat => open(model, fx),
         .show_chat => show(model, fx),
         .chat_brief => brief(model, fx),
-        .chat_closed => st.open = false,
+        .chat_closed => close(model, fx),
         .chat_input => |edit| st.input.apply(edit),
         .chat_submit => submit(model, fx),
         .chat_stop => stop(model, fx),
@@ -386,18 +384,29 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
 /// Cmd+K, the tray and the pet's menu toggle the chat.
 fn open(model: *Model, fx: *Effects) void {
     const st = &model.chat;
-    if (st.open) {
-        st.open = false;
-        return;
-    }
+    if (st.open) return close(model, fx);
     syncPet(model, fx);
     st.scroll = 0;
     st.history = false;
     st.place = .{};
-    // Opened by the user unless speak says otherwise right after.
+    // Only an explicit user action opens chat.
     st.quiet_open = false;
     app.registerTail(model.dark, fx);
     st.open = true;
+}
+
+fn close(model: *Model, fx: *Effects) void {
+    const st = &model.chat;
+    st.open = false;
+    // Keep the clock running, but discard queued/generated timer speech.
+    timer_shell.tick(model, fx);
+    if (!st.session.proactive() or !st.session.busy()) return;
+    const key = st.session.streamKey();
+    // A partial unsolicited line must not return when chat is reopened.
+    if (st.session.pending) st.session.transcript.dropLast();
+    st.session.cancel();
+    st.session.quiet();
+    fx.cancel(key);
 }
 
 /// The chat bubble is up beside the pet, where the hook stack must not
@@ -425,25 +434,16 @@ fn brief(model: *Model, fx: *Effects) void {
     begin(model, action, fx);
 }
 
-/// The pet speaks first, unprompted: into its own bubble, never the chat
-/// window, and without touching its pose. False when it can't right now:
-/// unconfigured, the chat is open (the user is already there), bubbles
-/// are off or in Focus, or a request is still on the wire.
+/// The pet speaks first in an open chat, without touching its pose.
+/// False while closed, unconfigured, drafting, in Focus, or busy.
 pub fn speak(model: *Model, prompt: session.Prompt, fx: *Effects) bool {
     if (!canSpeak(model)) return false;
     const st = &model.chat;
-    // Sync before choosing the angle, including a pet switched while
-    // the chat was closed. Opening the window must not reset this turn.
+    // Sync the active pet before choosing this turn's angle.
     syncPet(model, fx);
     if (st.pet_len == 0) return false;
     const action = st.session.brief(prompt, needsRefresh(st, fx), if (prompt == .chatter) randomU64() else 0);
     if (action == .none) return false;
-    // Said in the chat, which opens beside the pet if it was shut; the
-    // line stays there like any reply. Opened this way, it takes neither
-    // the keyboard nor the front from the app the user is in.
-    const was_open = st.open;
-    show(model, fx);
-    if (!was_open) st.quiet_open = true;
     st.history = false;
     st.scroll = 0;
     pickThinking(st);
@@ -451,20 +451,19 @@ pub fn speak(model: *Model, prompt: session.Prompt, fx: *Effects) bool {
     return true;
 }
 
-/// Whether the pet may speak unprompted now: configured, not in Focus, and
-/// not while the user is typing in the chat.
+/// Unprompted speech requires an open, configured chat with no draft.
 fn canSpeak(model: *const Model) bool {
     const st = &model.chat;
-    return st.ready() and !model.focus_mode and !(st.open and st.input.len > 0);
+    return st.open and st.ready() and !model.focus_mode and st.input.len == 0;
 }
 
-test "the pet speaks unless the user is typing, in Focus, or it's unconfigured" {
+test "the pet only speaks in an open chat without a draft or Focus" {
     const t = std.testing;
     var model: Model = .{};
     model.chat.kind = .openai_compat;
     try t.expect(!canSpeak(&model));
     model.chat.local_url.set("http://localhost:1234/v1");
-    try t.expect(canSpeak(&model));
+    try t.expect(!canSpeak(&model));
     // An open chat is where it speaks, as long as nobody is typing there.
     model.chat.open = true;
     try t.expect(canSpeak(&model));
@@ -473,6 +472,146 @@ test "the pet speaks unless the user is typing, in Focus, or it's unconfigured" 
     model.chat.input.clear();
     model.focus_mode = true;
     try t.expect(!canSpeak(&model));
+    model.focus_mode = false;
+    try t.expect(canSpeak(&model));
+    model.chat.local_url.clear();
+    try t.expect(!canSpeak(&model));
+}
+
+test "closed chat skips due small talk and agent nudges" {
+    const t = std.testing;
+    var model: Model = .{};
+    var fx = Effects.init(t.allocator);
+    defer fx.deinit();
+    model.chat.kind = .openai_compat;
+    model.chat.local_url.set("http://localhost:1234/v1");
+    setField(&model.chat.pet, &model.chat.pet_len, "boba");
+    model.chat.chatter_minutes = 5;
+    model.chat.next_chatter_ms = 1;
+
+    chatterTick(&model, &fx);
+    try t.expect(model.chat.next_chatter_ms > 1);
+    try t.expect(!nudge(&model, &.{}, &fx));
+    try t.expect(!model.chat.open);
+    try t.expectEqual(session.Phase.idle, model.chat.session.phase);
+    try t.expectEqual(@as(u32, 0), model.chat.session.request_id);
+    try t.expect(model.chat.session.wire == null);
+    try t.expectEqual(@as(usize, 0), model.chat.session.transcript.len());
+}
+
+test "both chat close actions cancel unsolicited streams and credential waits" {
+    const t = std.testing;
+    const saved_home = app.env_home;
+    app.env_home = null;
+    defer app.env_home = saved_home;
+    var fx = Effects.init(t.allocator);
+    defer fx.deinit();
+    for ([_]bool{ false, true }) |toggle| {
+        for ([_]session.Prompt{ .chatter, .nudge }) |prompt| {
+            for ([_]bool{ false, true }) |refresh| {
+                var model: Model = .{};
+                model.chat.open = true;
+                model.chat.input.set("Keep this draft");
+                const s = &model.chat.session;
+                s.transcript.append(.assistant, "Keep this completed reply");
+                _ = s.brief(prompt, refresh, 0);
+                const key = s.streamKey();
+                if (!refresh) {
+                    s.wire = key;
+                    s.onLine(.openai_compat, key, "data: {\"choices\":[{\"delta\":{\"content\":\"Partial small talk\"}}]}", false, false, &parse_scratch);
+                    try t.expect(s.pending);
+                }
+
+                if (toggle) open(&model, &fx) else close(&model, &fx);
+                try t.expect(!model.chat.open);
+                try t.expectEqual(session.Phase.idle, s.phase);
+                try t.expectEqual(session.Prompt.none, s.prompt);
+                try t.expectEqualStrings("Keep this draft", model.chat.input.text());
+                try t.expectEqual(@as(usize, 1), s.transcript.len());
+                try t.expectEqualStrings("Keep this completed reply", s.transcript.last().?.text);
+                s.onLine(.openai_compat, key, "data: {\"choices\":[{\"delta\":{\"content\":\"Late text\"}}]}", false, false, &parse_scratch);
+                try t.expectEqual(session.Action.none, s.onResponse(.openai_compat, key, 200, null));
+                try t.expectEqual(session.Action.none, s.onRefreshed(true, ""));
+                try t.expect(s.wire == null);
+                try t.expectEqual(@as(usize, 1), s.transcript.len());
+            }
+        }
+    }
+}
+
+test "closing chat preserves requests explicitly started by the user" {
+    const t = std.testing;
+    var fx = Effects.init(t.allocator);
+    defer fx.deinit();
+    for ([_]session.Prompt{ .none, .briefing }) |prompt| {
+        var model: Model = .{};
+        model.chat.open = true;
+        const s = &model.chat.session;
+        if (prompt == .none) {
+            _ = s.submit("Hello", false);
+        } else {
+            _ = s.brief(prompt, false, 0);
+        }
+        const key = s.streamKey();
+        s.wire = key;
+        close(&model, &fx);
+        try t.expect(!model.chat.open);
+        try t.expectEqual(session.Phase.streaming, s.phase);
+        try t.expectEqual(key, s.streamKey());
+        try t.expectEqual(key, s.wire.?);
+    }
+}
+
+test "closed chat discards timer notices without stopping the clock or replaying" {
+    const t = std.testing;
+    const saved_home = app.env_home;
+    app.env_home = null;
+    defer app.env_home = saved_home;
+    var fx = Effects.init(t.allocator);
+    defer fx.deinit();
+    var model: Model = .{};
+    setField(&model.chat.pet, &model.chat.pet_len, "boba");
+    model.chat.open = true;
+    model.timer.clock.start(fx.wallMs());
+    close(&model, &fx);
+    try t.expectEqual(timer.Status.running, model.timer.clock.status);
+    model.timer.clock.deadline_ms = fx.wallMs() - 1;
+    timer_shell.tick(&model, &fx);
+    timerSpeech(&model, &fx);
+    try t.expectEqual(timer.Status.completed, model.timer.clock.status);
+    try t.expect(model.timer.clock.pending == null);
+    try t.expect(!model.chat.open);
+    model.chat.open = true;
+    timerSpeech(&model, &fx);
+    try t.expectEqual(@as(usize, 0), model.chat.session.transcript.len());
+
+    // A generated notice delayed by a draft is discarded on close too.
+    model.timer.clock.start(1000);
+    _ = model.timer.clock.tick(model.timer.clock.deadline_ms, false);
+    model.timer.generated[0] = 'x';
+    model.timer.generated_len = 1;
+    model.timer.generated_id = model.timer.clock.serial;
+    open(&model, &fx);
+    try t.expect(model.timer.clock.pending == null);
+    try t.expectEqual(@as(usize, 0), model.timer.generated_len);
+
+    // A request already on the wire cannot restore its notice after close.
+    model.chat.open = true;
+    model.timer.clock.start(1000);
+    _ = model.timer.clock.tick(model.timer.clock.deadline_ms, false);
+    model.chat.timer_completion = model.timer.clock.claim(false, false);
+    _ = model.chat.session.brief(.timer_done, false, 0);
+    const key = model.chat.session.streamKey();
+    model.chat.session.wire = key;
+    close(&model, &fx);
+    try t.expect(model.chat.timer_completion == null);
+    try t.expectEqual(session.Phase.idle, model.chat.session.phase);
+    try t.expectEqual(session.Action.none, model.chat.session.onResponse(.openai_compat, key, 200, null));
+    timerReplyFinished(&model, true);
+    model.chat.open = true;
+    timerSpeech(&model, &fx);
+    try t.expect(model.timer.clock.pending == null);
+    try t.expectEqual(@as(usize, 0), model.chat.session.transcript.len());
 }
 
 /// Small talk on its clock, checked on every poll tick: no timer, and a

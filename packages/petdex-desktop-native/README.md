@@ -121,8 +121,9 @@ default:
 - **Speak up when an agent needs you** says so once each time a coding agent
   starts waiting on you.
 
-Either line is said in the chat, which opens beside the pet if it was closed,
-and stays there like any reply; it is saved to history too. The request
+Either line is said only while chat is open and stays there like any reply;
+it is saved to history too. Closing chat cancels an in-progress unprompted
+line, and automatic speech never opens it again. The request
 carries the persona and the app's prompt, and the pet keeps its pose. Each
 scheduled small-talk turn has a one-in-three chance of being simple everyday
 chat based on the character sheet (or the pet description when no sheet exists).
@@ -156,9 +157,11 @@ default, so each work or break interval starts when you choose.
 **Pet announces when finished** is on by default. Each completion asks the
 current pet for a short chat bubble using its persona and selected model,
 without audio or taking keyboard focus. A draft or ongoing request delays
-the notice; only the latest completion waits. Focus mode suppresses notices
-and never replays them afterwards. Missing credentials, a failed generation
-or a 15-second timeout uses a short English/Japanese fallback without retry.
+the notice; only the latest completion waits. Closing chat or entering Focus
+mode discards pending notices and cancels their generation; completions while
+chat is closed are silent and never replay afterwards. Missing credentials,
+a failed generation or a 15-second timeout uses a short English/Japanese
+fallback without retry.
 
 There is one timer for the app: closing chat, resetting the conversation or
 switching pets does not stop it. Configuration and clock transitions are
