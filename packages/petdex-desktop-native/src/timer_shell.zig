@@ -57,8 +57,9 @@ pub fn save(st: *State) void {
 pub fn tick(model: *app.Model, fx: *app.Effects) void {
     const st = &model.timer;
     st.now_ms = fx.wallMs();
-    if (st.clock.tick(st.now_ms, model.focus_mode)) save(st);
-    if (model.focus_mode or !st.clock.config.speak) {
+    const silent = model.focus_mode or !model.chat.open;
+    if (st.clock.tick(st.now_ms, silent)) save(st);
+    if (silent or !st.clock.config.speak) {
         st.generated_len = 0;
         chat_shell.cancelTimerSpeech(model, fx);
     }
