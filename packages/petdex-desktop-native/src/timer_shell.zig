@@ -127,7 +127,7 @@ pub fn update(model: *app.Model, msg: app.Msg, fx: *app.Effects) void {
     save(st);
 }
 
-fn syncFields(st: *State) void {
+pub fn syncFields(st: *State) void {
     const c = st.clock.config;
     var buf: [8]u8 = undefined;
     st.work.set(std.fmt.bufPrint(&buf, "{d}", .{c.work_minutes}) catch "25");

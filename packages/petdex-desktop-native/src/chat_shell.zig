@@ -29,6 +29,7 @@ const openai_compat = chat.openai_compat;
 const session = chat.session;
 const persona = chat.persona;
 const config = chat.config;
+const intent = chat.intent;
 
 const Model = app.Model;
 const Msg = app.Msg;
@@ -132,6 +133,11 @@ pub const State = struct {
     next_chatter_ms: i64 = 0,
     /// Speak up when a coding agent starts waiting on the user (Settings).
     nudge: bool = false,
+    /// Facts this pet was asked to remember. Oldest first.
+    fact_ids: [chat_history.max_facts]i64 = @splat(0),
+    fact_text: [chat_history.max_facts][chat_history.max_fact_bytes]u8 = @splat(@splat(0)),
+    fact_len: [chat_history.max_facts]u16 = @splat(0),
+    fact_count: u8 = 0,
     /// Since when the open chat's window can't be found; 0 while it can.
     lost_since_ms: i64 = 0,
     /// The window went missing and was closed; it opens again at this
@@ -174,6 +180,10 @@ pub const State = struct {
 
     pub fn noteText(self: *const State) []const u8 {
         return self.note[0..self.note_len];
+    }
+
+    pub fn factText(self: *const State, index: usize) []const u8 {
+        return self.fact_text[index][0..self.fact_len[index]];
     }
 
     /// Whether a message can be sent right now with this backend.
@@ -357,6 +367,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             st.nudge = !st.nudge;
             saveConfig(st);
         },
+        .forget_fact => |index| forgetFact(st, index),
         .set_chat_provider => |raw| {
             st.kind = std.enums.fromInt(domain.ProviderKind, raw) orelse return;
             st.note_len = 0;
@@ -807,6 +818,13 @@ fn followProbed(model: *Model, fx: *Effects) void {
     p.tail_y = tailY(pet.y, pet.h, landed.y, speech_top, chat_view.cardHeight(model));
 }
 
+/// Options can open before the chat, and a pet switch while the chat is
+/// closed waits for the next sync. Load this pet so the remembered list
+/// is its own, not empty and not the previous pet's.
+pub fn ensureSynced(model: *Model, fx: *Effects) void {
+    syncPet(model, fx);
+}
+
 /// Point the conversation at the active pet: its transcript from the
 /// database and a persona built from its pet.json.
 fn syncPet(model: *Model, fx: *Effects) void {
@@ -827,6 +845,7 @@ fn syncPet(model: *Model, fx: *Effects) void {
     st.session.load(&.{});
     setField(&st.pet, &st.pet_len, entry.slice());
     if (ensureHistory()) |h| h.loadInto(st.petSlug(), &st.session.transcript);
+    reloadFacts(st);
     buildPersona(st, entry.rootSlice());
 }
 
@@ -866,6 +885,9 @@ fn buildPersona(st: *State, root: []const u8) void {
     }
     persona_len = persona.build(&persona_buf, st.petSlug(), info, character).len;
     setField(&st.pet_name, &st.pet_name_len, info.name orelse st.petSlug());
+    // After the file is read, so a line added since the chat opened
+    // shows on this request and not the one after it.
+    pickThinking(st);
 }
 
 test "persona edits reload without resetting the conversation and blank overrides fall back" {
@@ -915,6 +937,58 @@ test "persona edits reload without resetting the conversation and blank override
     try t.expect(std.mem.endsWith(u8, persona_buf[0..persona_len], "一人称は拙者。ユーザーは殿。"));
 }
 
+test "options load this pet's facts before the chat opens" {
+    const t = std.testing;
+    var dir = t.tmpDir(.{});
+    defer dir.cleanup();
+    var home_buf: [256]u8 = undefined;
+    const home = try std.fmt.bufPrint(&home_buf, ".zig-cache/tmp/{s}", .{dir.sub_path});
+    const previous_home = app.env_home;
+    const previous_entry0 = catalog_mod.catalog[0];
+    const previous_entry1 = catalog_mod.catalog[1];
+    const previous_count = catalog_mod.catalog_len;
+    const previous_history = history;
+    const previous_tried = history_tried;
+    history = null;
+    history_tried = false;
+    defer {
+        if (history) |*h| h.close();
+        history = previous_history;
+        history_tried = previous_tried;
+        app.env_home = previous_home;
+        catalog_mod.catalog[0] = previous_entry0;
+        catalog_mod.catalog[1] = previous_entry1;
+        catalog_mod.catalog_len = previous_count;
+    }
+    app.env_home = home;
+    catalog_mod.catalog_len = 2;
+    catalog_mod.catalog[0] = .{};
+    catalog_mod.catalog[1] = .{};
+    setField(&catalog_mod.catalog[0].name, &catalog_mod.catalog[0].len, "boba");
+    setField(&catalog_mod.catalog[0].root, &catalog_mod.catalog[0].root_len, "pets");
+    setField(&catalog_mod.catalog[1].name, &catalog_mod.catalog[1].len, "mocha");
+    setField(&catalog_mod.catalog[1].root, &catalog_mod.catalog[1].root_len, "pets");
+
+    const h = ensureHistory() orelse return error.SkipZigTest;
+    try t.expect(h.remember("boba", "呼び方は先生", 1));
+    try t.expect(h.remember("mocha", "呼び方は殿", 2));
+
+    var model: Model = .{};
+    // Nothing is in flight, so sync does not touch effects.
+    var fx: Effects = undefined;
+    ensureSynced(&model, &fx);
+    try t.expect(!model.chat.open);
+    try t.expectEqualStrings("boba", model.chat.petSlug());
+    try t.expectEqual(@as(u8, 1), model.chat.fact_count);
+    try t.expectEqualStrings("呼び方は先生", model.chat.factText(0));
+
+    model.active_pet = 1;
+    ensureSynced(&model, &fx);
+    try t.expectEqualStrings("mocha", model.chat.petSlug());
+    try t.expectEqual(@as(u8, 1), model.chat.fact_count);
+    try t.expectEqualStrings("呼び方は殿", model.chat.factText(0));
+}
+
 /// Copy the pet's thinking lines out of the parse scratch, which the
 /// next streamed reply reuses.
 fn keepThinking(lines: []const []const u8) void {
@@ -950,6 +1024,10 @@ fn submit(model: *Model, fx: *Effects) void {
     const st = &model.chat;
     if (st.pet_len == 0) syncPet(model, fx);
     if (st.pet_len == 0) return;
+    if (intent.parse(st.inputText())) |parsed| {
+        perform(model, parsed, fx);
+        return;
+    }
     const action = st.session.submit(st.inputText(), needsRefresh(st, fx));
     if (action == .none) return;
     st.input.clear();
@@ -959,6 +1037,202 @@ fn submit(model: *Model, fx: *Effects) void {
         if (ensureHistory()) |h| _ = h.append(st.petSlug(), .user, m.text, st.kind, fx.wallMs());
     }
     begin(model, action, fx);
+}
+
+const TimerAct = enum { started, resumed, paused, reset, already_running, left_paused, not_running };
+
+fn applyTimer(clock: *timer.State, now: i64, cmd: intent.Timer) TimerAct {
+    switch (cmd.verb) {
+        .pause => {
+            if (clock.status != .running) return .not_running;
+            clock.pause(now);
+            return .paused;
+        },
+        .@"resume" => {
+            if (clock.status == .running) return .already_running;
+            if (clock.status != .paused) return .not_running;
+            clock.start(now);
+            return .resumed;
+        },
+        .reset => {
+            clock.reset();
+            return .reset;
+        },
+        .start => {
+            if (clock.status == .running) return .already_running;
+            if (cmd.seconds) |seconds| {
+                if (clock.status == .paused) return .left_paused;
+                if (!clock.setCountdown(seconds)) return .not_running;
+                clock.start(now);
+                return .started;
+            }
+            if (clock.status == .paused) {
+                clock.start(now);
+                return .resumed;
+            }
+            const mode: timer.Mode = if (cmd.pomodoro) .pomodoro else .timer;
+            if (clock.mode != mode) clock.setMode(mode);
+            clock.start(now);
+            return .started;
+        },
+    }
+}
+
+const Said = struct { detail: []const u8, fallback: []const u8 };
+
+fn timerSaid(act: TimerAct, cmd: intent.Timer, detail: []u8, fallback: []u8) Said {
+    return switch (act) {
+        .started => if (cmd.seconds) |seconds| .{
+            .detail = std.fmt.bufPrint(detail, "Started a countdown timer of {d} seconds.", .{seconds}) catch "Started a countdown timer.",
+            .fallback = i18n.bufPrint(fallback, "Started a {d}:{d:0>2} timer.", "{d}分{d:0>2}秒のタイマーを始めたよ。", .{ seconds / 60, seconds % 60 }) catch i18n.t("Started the timer.", "タイマーを始めたよ。"),
+        } else if (cmd.pomodoro) .{
+            .detail = "Started a pomodoro.",
+            .fallback = i18n.t("Started a pomodoro.", "ポモドーロを始めたよ。"),
+        } else .{
+            .detail = "Started the timer.",
+            .fallback = i18n.t("Started the timer.", "タイマーを始めたよ。"),
+        },
+        .resumed => .{ .detail = "Resumed the timer.", .fallback = i18n.t("Started again.", "再開したよ。") },
+        .paused => .{ .detail = "Paused the timer.", .fallback = i18n.t("Paused the timer.", "タイマーを止めたよ。") },
+        .reset => .{ .detail = "Reset the timer.", .fallback = i18n.t("Reset the timer.", "タイマーを戻したよ。") },
+        .already_running => .{
+            .detail = "The timer was already running, so it was left unchanged.",
+            .fallback = i18n.t("It's already running.", "もう動いてるよ。"),
+        },
+        .left_paused => .{
+            .detail = "The timer is paused, so its length was left unchanged.",
+            .fallback = i18n.t("It's paused, so I left the length alone.", "止まってるから、長さはそのままにしたよ。"),
+        },
+        .not_running => .{
+            .detail = "The timer was not running.",
+            .fallback = i18n.t("It wasn't running.", "動いてなかったよ。"),
+        },
+    };
+}
+
+fn perform(model: *Model, parsed: intent.Intent, fx: *Effects) void {
+    const st = &model.chat;
+    if (st.session.busy() or st.session.wire != null) return;
+    const text = st.inputText();
+    var fact_buf: [chat_history.max_fact_bytes]u8 = undefined;
+    var fact: []const u8 = "";
+    if (parsed == .remember) {
+        const src = parsed.remember;
+        const n = @min(src.len, fact_buf.len);
+        @memcpy(fact_buf[0..n], src);
+        fact = fact_buf[0..n];
+    }
+    var detail_buf: [640]u8 = undefined;
+    var fallback_buf: [640]u8 = undefined;
+    const said = describe(model, parsed, fact, fx, &detail_buf, &fallback_buf);
+    if (!st.ready()) {
+        if (!st.session.localExchange(text, said.fallback)) return;
+        finishLocal(model, fx);
+        return;
+    }
+    ack_len = ackPrompt(said.detail).len;
+    const action = st.session.acknowledge(text, needsRefresh(st, fx));
+    if (action == .none) return;
+    st.input.clear();
+    st.scroll = 0;
+    st.history = false;
+    if (st.session.transcript.last()) |m| {
+        if (ensureHistory()) |h| _ = h.append(st.petSlug(), .user, m.text, st.kind, fx.wallMs());
+    }
+    begin(model, action, fx);
+}
+
+fn finishLocal(model: *Model, fx: *Effects) void {
+    const st = &model.chat;
+    st.input.clear();
+    st.scroll = 0;
+    st.history = false;
+    const count = st.session.transcript.len();
+    if (count >= 2) {
+        if (ensureHistory()) |h| {
+            _ = h.append(st.petSlug(), .user, st.session.transcript.get(count - 2).text, st.kind, fx.wallMs());
+            _ = h.append(st.petSlug(), .assistant, st.session.transcript.get(count - 1).text, st.kind, fx.wallMs());
+        }
+    }
+    app.applyState(model, .waving, reply_wave_ms, fx);
+}
+
+fn describe(model: *Model, parsed: intent.Intent, fact: []const u8, fx: *Effects, detail_buf: []u8, fallback_buf: []u8) Said {
+    const st = &model.chat;
+    switch (parsed) {
+        .timer => |cmd| {
+            const act = applyTimer(&model.timer.clock, fx.wallMs(), cmd);
+            if (act == .started or act == .resumed) model.timer.clock.config.visible = true;
+            if (act == .started or act == .reset) {
+                model.timer.clock.pending = null;
+                model.timer.generated_len = 0;
+                cancelTimerSpeech(model, fx);
+            }
+            timer_shell.syncFields(&model.timer);
+            timer_shell.save(&model.timer);
+            if (act == .started or act == .resumed) follow(model, fx);
+            return timerSaid(act, cmd, detail_buf, fallback_buf);
+        },
+        .open => {
+            if (app.openFirstWaiting(model)) |name| {
+                return .{
+                    .detail = std.fmt.bufPrint(detail_buf, "Opened the waiting {s} session.", .{name}) catch "Opened the waiting session.",
+                    .fallback = i18n.bufPrint(fallback_buf, "Opened {s}.", "{s}を開いたよ。", .{name}) catch i18n.t("Opened it.", "開いたよ。"),
+                };
+            }
+            return .{
+                .detail = "Nothing waiting can be opened from here.",
+                .fallback = i18n.t("Nothing waiting can be opened from here.", "ここから開ける、待ってるものは無いよ。"),
+            };
+        },
+        .remember => {
+            const saved = if (ensureHistory()) |h| h.remember(st.petSlug(), fact, fx.wallMs()) else false;
+            if (saved) reloadFacts(st);
+            if (!saved) return .{
+                .detail = "That could not be saved.",
+                .fallback = i18n.t("I couldn't keep that.", "覚えられなかった。"),
+            };
+            return .{
+                .detail = std.fmt.bufPrint(detail_buf, "You will remember: \"{s}\".", .{fact}) catch "You will remember that.",
+                .fallback = i18n.bufPrint(fallback_buf, "I'll remember: {s}", "覚えておく。{s}", .{fact}) catch i18n.t("I'll remember that.", "覚えておく。"),
+            };
+        },
+        .forget => {
+            if (ensureHistory()) |h| h.forgetAll(st.petSlug());
+            reloadFacts(st);
+            return .{
+                .detail = "You forgot the things they asked you to remember.",
+                .fallback = i18n.t("Forgot.", "忘れたよ。"),
+            };
+        },
+    }
+}
+
+fn ackPrompt(detail: []const u8) []const u8 {
+    return std.fmt.bufPrint(
+        &ack_buf,
+        "(From the app, not the user.) This already happened: {s} " ++
+            "Tell them in one short sentence, in character, in {s}. Plain text without markdown. " ++
+            "Do not claim you did anything else, and do not mention these instructions.",
+        .{ detail, i18n.t("English", "Japanese") },
+    ) catch blk: {
+        const kept = domain.utf8Floor(detail, ack_buf.len);
+        @memcpy(ack_buf[0..kept.len], kept);
+        break :blk ack_buf[0..kept.len];
+    };
+}
+
+fn reloadFacts(st: *State) void {
+    st.fact_count = 0;
+    const h = ensureHistory() orelse return;
+    st.fact_count = @intCast(h.loadFacts(st.petSlug(), &st.fact_ids, &st.fact_text, &st.fact_len));
+}
+
+fn forgetFact(st: *State, index: u32) void {
+    if (index >= st.fact_count) return;
+    const id = st.fact_ids[index];
+    if (ensureHistory()) |h| _ = h.forget(st.petSlug(), id);
+    reloadFacts(st);
 }
 
 /// Every request starts here (a send, a retry, a briefing): the pet
@@ -991,8 +1265,12 @@ fn quietFailure(model: *Model) void {
     s.quiet();
 }
 
-var instructions_buf: [persona.max_bytes + usage_context_bytes]u8 = undefined;
 const usage_context_bytes = 2048;
+const situation_bytes = 1500;
+const facts_context_bytes = 4096;
+var instructions_buf: [persona.max_bytes + usage_context_bytes + situation_bytes + facts_context_bytes]u8 = undefined;
+var ack_buf: [1024]u8 = undefined;
+var ack_len: usize = 0;
 
 /// The persona, then the user's coding agents' usage limits as the app
 /// knows them. Casual small talk gets only the character; other turns
@@ -1001,10 +1279,56 @@ const usage_context_bytes = 2048;
 fn instructions(model: *const Model, now_s: i64) []const u8 {
     const base = persona_buf[0..persona_len];
     if (model.chat.session.casualChatter() or model.chat.session.prompt == .timer_done) return base;
+    var facts_buf: [facts_context_bytes]u8 = undefined;
     var limits_buf: [usage_context_bytes - 2]u8 = undefined;
+    var now_buf: [situation_bytes]u8 = undefined;
+    const facts = factsBlock(model, &facts_buf);
     const limits = usage_mod.context(&model.usage, now_s, &limits_buf);
-    if (limits.len == 0) return base;
-    return std.fmt.bufPrint(&instructions_buf, "{s}\n\n{s}", .{ base, domain.utf8Floor(limits, limits_buf.len) }) catch base;
+    const now = situation(model, &now_buf);
+    if (facts.len == 0 and limits.len == 0 and now.len == 0) return base;
+    var w: std.Io.Writer = .fixed(&instructions_buf);
+    w.writeAll(base) catch {};
+    if (facts.len > 0) w.print("\n\n{s}", .{facts}) catch {};
+    if (limits.len > 0) w.print("\n\n{s}", .{domain.utf8Floor(limits, limits_buf.len)}) catch {};
+    if (now.len > 0) w.print("\n\n{s}", .{now}) catch {};
+    return w.buffered();
+}
+
+fn factsBlock(model: *const Model, out: []u8) []const u8 {
+    const st = &model.chat;
+    if (st.fact_count == 0) return "";
+    var w: std.Io.Writer = .fixed(out);
+    w.writeAll("Things they asked you to remember:") catch {};
+    for (0..st.fact_count) |i| w.print("\n- {s}", .{st.factText(i)}) catch {};
+    return w.buffered();
+}
+
+fn situation(model: *const Model, out: []u8) []const u8 {
+    var w: std.Io.Writer = .fixed(out);
+    var any = false;
+    const ranks = [_][]const u8{ "waiting", "failed", "working", "finished" };
+    for (ranks) |rank| {
+        for (model.bubbles[0..model.bubbles_len]) |*b| {
+            const state = if (b.agent_state_len > 0) b.agentStateSlice() else if (b.busy) "working" else "finished";
+            if (!std.mem.eql(u8, state, rank)) continue;
+            if (!any) w.writeAll("Right now, from the app:") catch {};
+            any = true;
+            persona.writeNote(&w, noteFor(b, state));
+        }
+    }
+    const clock = model.timer.clock;
+    if (clock.status != .idle) {
+        if (!any) w.writeAll("Right now, from the app:") catch {};
+        any = true;
+        w.print("\n- timer: {s} {s}, {d}s left, {s}", .{
+            @tagName(clock.mode),
+            @tagName(clock.phase),
+            clock.remaining(model.timer.now_ms),
+            @tagName(clock.status),
+        }) catch {};
+    }
+    if (!any) return "";
+    return domain.utf8Floor(w.buffered(), out.len);
 }
 
 test "the instructions carry the usage limits after the persona" {
@@ -1025,7 +1349,7 @@ fn requestMessages(model: *const Model, out: *[session.context_messages + 1]doma
     const st = &model.chat;
     const count = switch (st.session.prompt) {
         .none => return st.session.context(out[0..session.context_messages]),
-        .briefing => st.session.context(out[0..session.context_messages]).len,
+        .briefing, .ack => st.session.context(out[0..session.context_messages]).len,
         .chatter => if (st.session.casualChatter()) 0 else st.session.chatterContext(out[0..session.chatter_context_messages]).len,
         .nudge, .timer_done => 0,
     };
@@ -1035,6 +1359,7 @@ fn requestMessages(model: *const Model, out: *[session.context_messages + 1]doma
         .chatter => chatterPrompt(st),
         .nudge => nudge_buf[0..nudge_len],
         .timer_done => (st.timer_completion orelse unreachable).prompt(&timer_prompt_buf),
+        .ack => ack_buf[0..ack_len],
     };
     out[count] = .{ .role = .user, .text = prompt };
     return out[0 .. count + 1];
@@ -1140,7 +1465,7 @@ test "casual small talk omits work context while replies and notifications keep 
         try t.expect(std.mem.indexOf(u8, req.body, "weekly limit 15%") == null);
         try t.expect(std.mem.indexOf(u8, req.body, "Codex is still working.") == null);
     }
-    for ([_]session.Prompt{ .none, .briefing, .nudge }) |prompt| {
+    for ([_]session.Prompt{ .none, .briefing, .nudge, .ack }) |prompt| {
         s.prompt = prompt;
         try t.expect(std.mem.indexOf(u8, instructions(&model, 1000), "weekly limit 15%") != null);
     }
@@ -1148,6 +1473,58 @@ test "casual small talk omits work context while replies and notifications keep 
     s.chatter_topic = .contextual;
     try t.expectEqual(@as(usize, 3), requestMessages(&model, &out).len);
     try t.expect(std.mem.indexOf(u8, instructions(&model, 1000), "weekly limit 15%") != null);
+}
+
+test "ordinary replies carry the moment and remembered facts, casual talk does not" {
+    const t = std.testing;
+    var model: Model = .{};
+    persona_len = persona.build(&persona_buf, "boba", .{ .name = "Boba" }, null).len;
+    model.bubbles_len = 2;
+    setField(&model.bubbles[0].agent, &model.bubbles[0].agent_len, "codex");
+    setField(&model.bubbles[0].agent_state, &model.bubbles[0].agent_state_len, "working");
+    setField(&model.bubbles[0].source_cwd, &model.bubbles[0].source_cwd_len, "/work/other");
+    setField(&model.bubbles[1].agent, &model.bubbles[1].agent_len, "claude");
+    setField(&model.bubbles[1].agent_state, &model.bubbles[1].agent_state_len, "waiting");
+    setField(&model.bubbles[1].source_cwd, &model.bubbles[1].source_cwd_len, "/work/petdex");
+    setField(&model.bubbles[1].title, &model.bubbles[1].title_len, "Allow Bash?");
+    model.timer.clock.mode = .pomodoro;
+    model.timer.clock.phase = .work;
+    model.timer.clock.status = .running;
+    model.timer.clock.deadline_ms = 1000 + 12 * 60 * 1000;
+    model.timer.now_ms = 1000;
+    const fact = "呼び方は先生";
+    @memcpy(model.chat.fact_text[0][0..fact.len], fact);
+    model.chat.fact_len[0] = @intCast(fact.len);
+    model.chat.fact_count = 1;
+
+    const text = instructions(&model, 1000);
+    const waiting = std.mem.indexOf(u8, text, "claude, waiting").?;
+    const working = std.mem.indexOf(u8, text, "codex, working").?;
+    try t.expect(waiting < working);
+    try t.expect(std.mem.indexOf(u8, text, "in petdex: Allow Bash?") != null);
+    try t.expect(std.mem.indexOf(u8, text, "timer: pomodoro work, 720s left, running") != null);
+    try t.expect(std.mem.indexOf(u8, text, "呼び方は先生") != null);
+    const facts_at = std.mem.indexOf(u8, text, "Things they asked you to remember:").?;
+    const now_at = std.mem.indexOf(u8, text, "Right now, from the app:").?;
+    try t.expect(facts_at < now_at);
+
+    model.chat.session.prompt = .chatter;
+    model.chat.session.chatter_topic = .casual;
+    const casual = instructions(&model, 1000);
+    try t.expect(std.mem.indexOf(u8, casual, "Right now, from the app:") == null);
+    try t.expect(std.mem.indexOf(u8, casual, "呼び方は先生") == null);
+    try t.expect(std.mem.indexOf(u8, casual, "timer:") == null);
+}
+
+test "a running timer keeps its length when a duration start arrives" {
+    const t = std.testing;
+    var clock: timer.State = .{};
+    try t.expect(clock.setCountdown(60));
+    clock.start(1000);
+    const act = applyTimer(&clock, 1500, .{ .verb = .start, .seconds = 1500, .pomodoro = false });
+    try t.expectEqual(TimerAct.already_running, act);
+    try t.expectEqual(@as(u16, 60), clock.config.timer_seconds);
+    try t.expectEqual(timer.Status.running, clock.status);
 }
 
 fn startRequest(model: *Model, fx: *Effects) void {

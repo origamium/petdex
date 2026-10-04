@@ -28,17 +28,117 @@ pub fn petInfo(pet_json: []const u8, scratch: []u8) PetInfo {
     return .{ .name = nonEmpty(parsed.displayName), .description = nonEmpty(parsed.description) };
 }
 
-const ThinkingJson = struct {
-    thinking: ?[]const []const u8 = null,
-};
+const max_thinking_lines = 16;
 
-/// pet.json's `thinking`: lines the pet shows while a reply is on its
-/// way. Parsed apart from petInfo, so a malformed list costs only
-/// itself. Strings live in `scratch`.
+/// Lines the pet shows while a reply is on its way. `thinking` wins;
+/// `alt` / `altText` (a string or a list) is the same text under the
+/// name pet files already use. Otherwise the review, waiting, and
+/// thinking states' own `alt` lines, then idle, then any other state.
+/// Parsed apart from petInfo, so a bad value costs only itself.
+/// Strings live in `scratch`.
 pub fn thinkingLines(pet_json: []const u8, scratch: []u8) []const []const u8 {
     var fba = std.heap.FixedBufferAllocator.init(scratch);
-    const parsed = std.json.parseFromSliceLeaky(ThinkingJson, fba.allocator(), pet_json, .{ .ignore_unknown_fields = true }) catch return &.{};
-    return parsed.thinking orelse &.{};
+    const alloc = fba.allocator();
+    const root = std.json.parseFromSliceLeaky(std.json.Value, alloc, pet_json, .{ .ignore_unknown_fields = true }) catch return &.{};
+    if (root != .object) return &.{};
+    var buf: [max_thinking_lines][]const u8 = undefined;
+    var n: usize = 0;
+    takeLines(&n, &buf, root.object.get("thinking"));
+    if (n == 0) takeLines(&n, &buf, root.object.get("alt"));
+    if (n == 0) takeLines(&n, &buf, root.object.get("altText"));
+    if (n == 0) if (root.object.get("states")) |states| takeStateAlts(&n, &buf, states);
+    if (n == 0) return &.{};
+    const out = alloc.alloc([]const u8, n) catch return &.{};
+    @memcpy(out, buf[0..n]);
+    return out;
+}
+
+fn takeLines(n: *usize, buf: *[max_thinking_lines][]const u8, value: ?std.json.Value) void {
+    const v = value orelse return;
+    switch (v) {
+        .string => |s| pushLine(n, buf, s),
+        .array => |list| {
+            for (list.items) |item| if (item == .string) pushLine(n, buf, item.string);
+        },
+        else => {},
+    }
+}
+
+fn pushLine(n: *usize, buf: *[max_thinking_lines][]const u8, raw: []const u8) void {
+    if (n.* == buf.len) return;
+    const line = std.mem.trim(u8, raw, " \t\r\n");
+    if (line.len == 0) return;
+    buf[n.*] = line;
+    n.* += 1;
+}
+
+const AltRank = enum { preferred, idle, other };
+
+fn altRank(name: []const u8) AltRank {
+    if (std.mem.eql(u8, name, "review") or std.mem.eql(u8, name, "waiting") or std.mem.eql(u8, name, "thinking")) return .preferred;
+    if (std.mem.eql(u8, name, "idle")) return .idle;
+    return .other;
+}
+
+fn stateAlt(value: std.json.Value) ?[]const u8 {
+    return switch (value) {
+        .string => |s| s,
+        .object => |obj| blk: {
+            if (obj.get("alt")) |v| if (v == .string) break :blk v.string;
+            if (obj.get("altText")) |v| if (v == .string) break :blk v.string;
+            break :blk null;
+        },
+        else => null,
+    };
+}
+
+fn stateId(value: std.json.Value) []const u8 {
+    if (value != .object) return "";
+    const obj = value.object;
+    if (obj.get("id")) |v| if (v == .string) return v.string;
+    if (obj.get("name")) |v| if (v == .string) return v.string;
+    if (obj.get("state")) |v| if (v == .string) return v.string;
+    return "";
+}
+
+fn takeStateAlts(n: *usize, buf: *[max_thinking_lines][]const u8, states: std.json.Value) void {
+    var preferred: [max_thinking_lines][]const u8 = undefined;
+    var idle: [max_thinking_lines][]const u8 = undefined;
+    var other: [max_thinking_lines][]const u8 = undefined;
+    var counts = [_]usize{ 0, 0, 0 };
+    const put = struct {
+        fn put(rank: AltRank, line: []const u8, preferred_buf: *[max_thinking_lines][]const u8, idle_buf: *[max_thinking_lines][]const u8, other_buf: *[max_thinking_lines][]const u8, counts_out: *[3]usize) void {
+            const slot: *usize = switch (rank) {
+                .preferred => &counts_out[0],
+                .idle => &counts_out[1],
+                .other => &counts_out[2],
+            };
+            const dest: *[max_thinking_lines][]const u8 = switch (rank) {
+                .preferred => preferred_buf,
+                .idle => idle_buf,
+                .other => other_buf,
+            };
+            pushLine(slot, dest, line);
+        }
+    }.put;
+    switch (states) {
+        .array => |list| {
+            for (list.items) |item| {
+                const line = stateAlt(item) orelse continue;
+                put(altRank(stateId(item)), line, &preferred, &idle, &other, &counts);
+            }
+        },
+        .object => |obj| {
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                const line = stateAlt(entry.value_ptr.*) orelse continue;
+                put(altRank(entry.key_ptr.*), line, &preferred, &idle, &other, &counts);
+            }
+        },
+        else => return,
+    }
+    const chosen: []const []const u8 = if (counts[0] > 0) preferred[0..counts[0]] else if (counts[1] > 0) idle[0..counts[1]] else other[0..counts[2]];
+    for (chosen) |line| pushLine(n, buf, line);
 }
 
 fn nonEmpty(value: ?[]const u8) ?[]const u8 {
@@ -81,7 +181,10 @@ pub fn build(out: *[max_bytes]u8, slug: []const u8, info: PetInfo, character: ?[
         "Follow an ongoing topic naturally, and repeat facts or wording when the user needs that. " ++
         "Keep your identity, established preferences, and shared facts consistent. " ++
         "Do not invent shared memories or claim to see screen contents, activity, or surroundings " ++
-        "that the user or app has not provided.") catch {};
+        "that the user or app has not provided. " ++
+        "When the app appends a Right now block, use it only if the user asks how things are or it changes your answer. " ++
+        "Do not recite it on an ordinary reply. Do not add agents, times, or memories that are not in that block " ++
+        "or in the things they asked you to remember.") catch {};
     if (nonEmpty(character)) |sheet| {
         w.print("\n\nYour character:\n{s}", .{sheet}) catch {};
     } else if (info.description) |d| {
@@ -120,7 +223,7 @@ pub fn briefing(out: []u8, notes: []const Note) []const u8 {
     return finish(&w);
 }
 
-fn writeNote(w: *std.Io.Writer, n: Note) void {
+pub fn writeNote(w: *std.Io.Writer, n: Note) void {
     w.print("\n- {s}, {s}", .{ n.agent, n.state }) catch {};
     if (n.project.len > 0) w.print(", in {s}", .{n.project}) catch {};
     if (n.title.len > 0) w.print(": {s}", .{n.title}) catch {};
@@ -272,16 +375,30 @@ test "a briefing lists each agent after the request" {
     try t.expect(std.unicode.utf8ValidateSlice(cut));
 }
 
-test "thinking lines come from pet.json, and a bad list costs nothing else" {
+test "thinking lines come from pet.json, and a bad value costs nothing else" {
     const t = std.testing;
-    var scratch: [1024]u8 = undefined;
+    var scratch: [2048]u8 = undefined;
     const lines = thinkingLines("{\"displayName\":\"Ui\",\"thinking\":[\"眠いなあ…\",\"先生、何考えてるんだろう…\"]}", &scratch);
     try t.expectEqual(@as(usize, 2), lines.len);
     try t.expectEqualStrings("眠いなあ…", lines[0]);
     try t.expectEqualStrings("先生、何考えてるんだろう…", lines[1]);
     try t.expectEqual(@as(usize, 0), thinkingLines("{\"displayName\":\"Ui\"}", &scratch).len);
 
-    const broken = "{\"displayName\":\"Ui\",\"thinking\":\"not a list\"}";
+    const alt = thinkingLines("{\"displayName\":\"Ui\",\"alt\":\"  頁をめくっている  \"}", &scratch);
+    try t.expectEqual(@as(usize, 1), alt.len);
+    try t.expectEqualStrings("頁をめくっている", alt[0]);
+    // thinking wins when both are present.
+    const both = thinkingLines("{\"thinking\":[\"こっち\"],\"alt\":[\"あっち\"]}", &scratch);
+    try t.expectEqualStrings("こっち", both[0]);
+
+    const states = thinkingLines("{\"states\":[{\"id\":\"idle\",\"alt\":\"まばたき\"},{\"id\":\"running\",\"alt\":\"走っている\"},{\"name\":\"review\",\"alt\":\"頁をめくっている\"}]}", &scratch);
+    try t.expectEqual(@as(usize, 1), states.len);
+    try t.expectEqualStrings("頁をめくっている", states[0]);
+    const idle_only = thinkingLines("{\"states\":{\"idle\":\"まばたき\",\"running-right\":{\"altText\":\"右へ\"}}}", &scratch);
+    try t.expectEqual(@as(usize, 1), idle_only.len);
+    try t.expectEqualStrings("まばたき", idle_only[0]);
+
+    const broken = "{\"displayName\":\"Ui\",\"thinking\":1}";
     try t.expectEqual(@as(usize, 0), thinkingLines(broken, &scratch).len);
     try t.expectEqualStrings("Ui", petInfo(broken, &scratch).name.?);
 }

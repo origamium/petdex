@@ -11,6 +11,7 @@ pub const openai_compat = @import("openai_compat.zig");
 pub const session = @import("session.zig");
 pub const persona = @import("persona.zig");
 pub const config = @import("config.zig");
+pub const intent = @import("intent.zig");
 
 test {
     _ = domain;
@@ -20,4 +21,5 @@ test {
     _ = session;
     _ = persona;
     _ = config;
+    _ = intent;
 }

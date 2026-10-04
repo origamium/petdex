@@ -99,12 +99,15 @@ priority over variety; recurring interests can return with fresh details.
 The app keeps the framing: a desktop pet that answers in
 one to three short sentences of plain text, with varied reactions and phrasing
 while preserving the character's identity and established facts. Catchphrases,
-advice and follow-up questions are optional. Until a reply's first words arrive,
-the chat shows one of the pet's `thinking` lines, picked at random, or
-"Thinking…" when it has none:
+advice and follow-up questions are optional. Until a reply's first words arrive, the chat shows one of the pet's own
+lines, picked at random, in its speaking voice. `thinking` is that list.
+`alt` or `altText` (a string or a list) is the same text when `thinking`
+is absent. A `states` entry can carry `alt` too: review, waiting, and
+thinking come first, then idle. With none of these, the chat says
+"Thinking…":
 
 ```json
-{ "displayName": "古関ウイ", "thinking": ["眠いなあ…", "先生、何考えてるんだろう…"] }
+{ "displayName": "古関ウイ", "alt": ["眠いなあ…", "先生、何考えてるんだろう…"] }
 ```
 
 History lives in `~/.petdex/petdex.db`: user messages and completed replies,
@@ -112,7 +115,28 @@ including unprompted lines, survive app restarts. Every save removes the oldest
 rows over 400 messages per pet or 10,000 in total. Failed replies do not postpone
 cleanup. The app restores the newest 64 messages into its bounded memory;
 only a smaller recent window goes to the model. Reset conversation clears that pet's
-saved conversation.
+saved conversation. It does not clear facts the user asked the pet to remember.
+
+An ordinary reply, a catch-up and a nudge also see a short Right now block:
+who is waiting, working, failed or finished, and the timer when it is not
+idle. Casual small talk leaves that block, remembered facts and usage limits
+out. The pet is told to use Right now only when it matters, not to recite it.
+
+A whole message can ask for one small thing, and nothing else in the line:
+
+- `25分タイマー始めて`, `timer start`, `ポモドーロ始めて`, `タイマー一時停止`,
+  `timer resume`, `タイマーリセット` run the one app timer. A length is only
+  for the countdown, and only while the clock is stopped. A running clock
+  stays as it is.
+- `開いて`, `待ってるやつ開いて` or `open` brings forward the first waiting
+  conversation that has a Warp pane or Terminal tab.
+- `覚えて、呼び方は先生` or `remember: call me sensei` keeps up to 12 facts,
+  80 characters each, per pet. `忘れて` or `forget` drops that pet's facts.
+  Chat options lists them and can drop one. The model is not asked to decide
+  what is worth keeping.
+
+The action happens even when no model can answer; the pet then says a short
+fixed line instead. With a model, it says what happened in one sentence.
 
 Two options under Chat options have the pet speak first, both off by
 default:
@@ -126,7 +150,7 @@ and stays there like any reply; it is saved to history too. The request
 carries the persona and the app's prompt, and the pet keeps its pose. Each
 scheduled small-talk turn has a one-in-three chance of being simple everyday
 chat based on the character sheet (or the pet description when no sheet exists).
-Those turns omit conversation context, recent-reply quotes and live usage limits, and explicitly
+Those turns omit conversation context, recent-reply quotes, remembered facts, the Right now block and live usage limits, and explicitly
 avoid work and coding-agent topics. The other two thirds can use up to six
 recent conversation messages within 4 KiB and the available usage context,
 plus the last three replies for language and repetition avoidance. A randomly selected angle (a
