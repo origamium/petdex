@@ -127,6 +127,22 @@ pub const State = struct {
         self.reset();
     }
 
+    /// Countdown length, only while nothing is in progress. A running or
+    /// paused clock is left untouched, including its seconds.
+    pub fn setCountdown(self: *State, length: u16) bool {
+        if (self.locked()) return false;
+        if (length < 1 or length > 5999) return false;
+        self.mode = .timer;
+        self.phase = .countdown;
+        self.status = .idle;
+        self.rounds = 0;
+        self.deadline_ms = 0;
+        self.paused_ms = 0;
+        self.pending = null;
+        self.config.timer_seconds = length;
+        return true;
+    }
+
     /// Returns true only when persisted state changes. Focus/off drops
     /// queued speech too; turning it back on never replays it.
     pub fn tick(self: *State, now: i64, focus: bool) bool {
@@ -296,4 +312,19 @@ test "hidden timers persist and still complete with a pet announcement" {
     restored.reset();
     restored.setMode(.timer);
     try t.expect(!restored.config.visible);
+}
+
+test "a running countdown keeps its length" {
+    const t = std.testing;
+    var s: State = .{};
+    try t.expect(s.setCountdown(60));
+    try t.expectEqual(Mode.timer, s.mode);
+    try t.expectEqual(Phase.countdown, s.phase);
+    s.start(1000);
+    try t.expect(!s.setCountdown(1500));
+    try t.expectEqual(@as(u16, 60), s.config.timer_seconds);
+    try t.expectEqual(Status.running, s.status);
+    s.pause(1000);
+    try t.expect(!s.setCountdown(1500));
+    try t.expectEqual(@as(u16, 60), s.config.timer_seconds);
 }

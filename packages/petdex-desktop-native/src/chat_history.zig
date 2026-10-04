@@ -18,6 +18,10 @@ pub const per_pet_limit = 400;
 pub const total_limit = 10_000;
 
 /// Append only; entry N brings the schema to user_version N+1.
+pub const max_facts = 12;
+/// 80 code points, the longest UTF-8 sequence each.
+pub const max_fact_bytes = 320;
+
 const migrations = [_][:0]const u8{
     \\CREATE TABLE message (
     \\  id INTEGER PRIMARY KEY,
@@ -28,6 +32,14 @@ const migrations = [_][:0]const u8{
     \\  created_ms INTEGER NOT NULL
     \\);
     \\CREATE INDEX message_pet_id ON message (pet, id);
+    ,
+    \\CREATE TABLE fact (
+    \\  id INTEGER PRIMARY KEY,
+    \\  pet TEXT NOT NULL,
+    \\  text TEXT NOT NULL,
+    \\  created_ms INTEGER NOT NULL
+    \\);
+    \\CREATE INDEX fact_pet_id ON fact (pet, id);
 };
 
 pub const History = struct {
@@ -102,6 +114,63 @@ pub const History = struct {
         self.db.exec("PRAGMA incremental_vacuum(2000);") catch {};
     }
 
+    /// The pet's facts, oldest first. Copies into the caller. At most `max_facts`.
+    pub fn loadFacts(self: *History, pet: []const u8, ids: *[max_facts]i64, bufs: *[max_facts][max_fact_bytes]u8, lens: *[max_facts]u16) usize {
+        var stmt = self.db.prepare("SELECT id, text FROM fact WHERE pet = ?1 ORDER BY id ASC LIMIT ?2") catch return 0;
+        defer stmt.finalize();
+        stmt.bindText(1, pet) catch return 0;
+        stmt.bindInt(2, max_facts) catch return 0;
+        var n: usize = 0;
+        while (stmt.step() catch false) {
+            if (n == max_facts) break;
+            const text = stmt.text(1);
+            const kept = domain.utf8Floor(text, max_fact_bytes);
+            @memcpy(bufs[n][0..kept.len], kept);
+            lens[n] = @intCast(kept.len);
+            ids[n] = stmt.int(0);
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Saves one fact and drops the oldest past `max_facts`. Empty text is refused.
+    pub fn remember(self: *History, pet: []const u8, text: []const u8, now_ms: i64) bool {
+        const kept = takeChars(std.mem.trim(u8, text, " \t\r\n"), 80);
+        if (kept.len == 0) return false;
+        var stmt = self.db.prepare("INSERT INTO fact (pet, text, created_ms) VALUES (?1, ?2, ?3)") catch return false;
+        defer stmt.finalize();
+        stmt.bindText(1, pet) catch return false;
+        stmt.bindText(2, kept) catch return false;
+        stmt.bindInt(3, now_ms) catch return false;
+        _ = stmt.step() catch return false;
+        self.pruneFacts(pet);
+        return true;
+    }
+
+    pub fn forgetAll(self: *History, pet: []const u8) void {
+        var stmt = self.db.prepare("DELETE FROM fact WHERE pet = ?1") catch return;
+        defer stmt.finalize();
+        stmt.bindText(1, pet) catch return;
+        _ = stmt.step() catch {};
+    }
+
+    pub fn forget(self: *History, pet: []const u8, id: i64) bool {
+        var stmt = self.db.prepare("DELETE FROM fact WHERE pet = ?1 AND id = ?2") catch return false;
+        defer stmt.finalize();
+        stmt.bindText(1, pet) catch return false;
+        stmt.bindInt(2, id) catch return false;
+        _ = stmt.step() catch return false;
+        return true;
+    }
+
+    fn pruneFacts(self: *History, pet: []const u8) void {
+        var stmt = self.db.prepare("DELETE FROM fact WHERE pet = ?1 AND id < (SELECT id FROM fact WHERE pet = ?1 ORDER BY id DESC LIMIT 1 OFFSET ?2)") catch return;
+        defer stmt.finalize();
+        stmt.bindText(1, pet) catch return;
+        stmt.bindInt(2, max_facts - 1) catch return;
+        _ = stmt.step() catch {};
+    }
+
     /// Refill `transcript` with the pet's newest messages, oldest first.
     /// The transcript's own eviction keeps the newest if they overflow it.
     pub fn loadInto(self: *History, pet: []const u8, transcript: *session.Transcript) void {
@@ -116,6 +185,18 @@ pub const History = struct {
         }
     }
 };
+
+fn takeChars(s: []const u8, max: usize) []const u8 {
+    var i: usize = 0;
+    var n: usize = 0;
+    while (i < s.len and n < max) {
+        const width = std.unicode.utf8ByteSequenceLength(s[i]) catch return s[0..i];
+        if (i + width > s.len) return s[0..i];
+        i += width;
+        n += 1;
+    }
+    return s[0..i];
+}
 
 fn migrate(db: *sqlite.Db) !void {
     try db.exec("PRAGMA busy_timeout=2000;");
@@ -159,7 +240,7 @@ test "opening migrates once, owner-only, with incremental vacuum and WAL" {
     const path = try testPath(&buf, &dir);
 
     var h = History.open(path).?;
-    try t.expectEqual(@as(i64, 1), try h.db.scalarInt("PRAGMA user_version"));
+    try t.expectEqual(@as(i64, 2), try h.db.scalarInt("PRAGMA user_version"));
     try t.expectEqual(@as(i64, 2), try h.db.scalarInt("PRAGMA auto_vacuum"));
     var mode = try h.db.prepare("PRAGMA journal_mode");
     try t.expect(try mode.step());
@@ -257,4 +338,37 @@ test "the global cap and clear" {
     h.clear("b");
     try t.expectEqual(@as(i64, 0), count(&h, "b"));
     try t.expectEqual(@as(i64, 1), count(&h, "a"));
+}
+
+test "facts outlive a cleared conversation and keep the newest twelve" {
+    if (!sqlite.load()) return error.SkipZigTest;
+    var h = History.open(":memory:").?;
+    defer h.close();
+    try t.expect(!h.remember("boba", "   ", 0));
+    for (0..max_facts + 1) |i| {
+        var text: [16]u8 = undefined;
+        try t.expect(h.remember("boba", try std.fmt.bufPrint(&text, "f{d}", .{i}), @intCast(i)));
+    }
+    var ids: [max_facts]i64 = undefined;
+    var bufs: [max_facts][max_fact_bytes]u8 = undefined;
+    var lens: [max_facts]u16 = undefined;
+    const n = h.loadFacts("boba", &ids, &bufs, &lens);
+    try t.expectEqual(max_facts, n);
+    try t.expectEqualStrings("f1", bufs[0][0..lens[0]]);
+    try t.expectEqualStrings("f12", bufs[max_facts - 1][0..lens[max_facts - 1]]);
+    try t.expect(h.append("boba", .user, "hi", .codex, 1));
+    h.clear("boba");
+    try t.expectEqual(@as(i64, 0), count(&h, "boba"));
+    try t.expectEqual(max_facts, h.loadFacts("boba", &ids, &bufs, &lens));
+    try t.expect(h.forget("boba", ids[0]));
+    try t.expectEqual(max_facts - 1, h.loadFacts("boba", &ids, &bufs, &lens));
+    try t.expectEqualStrings("f2", bufs[0][0..lens[0]]);
+    h.forgetAll("boba");
+    try t.expectEqual(@as(usize, 0), h.loadFacts("boba", &ids, &bufs, &lens));
+
+    const long = "あ" ** 90;
+    try t.expect(h.remember("boba", long, 1));
+    try t.expectEqual(@as(usize, 1), h.loadFacts("boba", &ids, &bufs, &lens));
+    try t.expectEqual(@as(u16, 80 * 3), lens[0]);
+    try t.expect(std.unicode.utf8ValidateSlice(bufs[0][0..lens[0]]));
 }

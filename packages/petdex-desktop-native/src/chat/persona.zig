@@ -81,7 +81,10 @@ pub fn build(out: *[max_bytes]u8, slug: []const u8, info: PetInfo, character: ?[
         "Follow an ongoing topic naturally, and repeat facts or wording when the user needs that. " ++
         "Keep your identity, established preferences, and shared facts consistent. " ++
         "Do not invent shared memories or claim to see screen contents, activity, or surroundings " ++
-        "that the user or app has not provided.") catch {};
+        "that the user or app has not provided. " ++
+        "When the app appends a Right now block, use it only if the user asks how things are or it changes your answer. " ++
+        "Do not recite it on an ordinary reply. Do not add agents, times, or memories that are not in that block " ++
+        "or in the things they asked you to remember.") catch {};
     if (nonEmpty(character)) |sheet| {
         w.print("\n\nYour character:\n{s}", .{sheet}) catch {};
     } else if (info.description) |d| {
@@ -120,7 +123,7 @@ pub fn briefing(out: []u8, notes: []const Note) []const u8 {
     return finish(&w);
 }
 
-fn writeNote(w: *std.Io.Writer, n: Note) void {
+pub fn writeNote(w: *std.Io.Writer, n: Note) void {
     w.print("\n- {s}, {s}", .{ n.agent, n.state }) catch {};
     if (n.project.len > 0) w.print(", in {s}", .{n.project}) catch {};
     if (n.title.len > 0) w.print(": {s}", .{n.title}) catch {};

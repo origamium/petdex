@@ -209,6 +209,7 @@ pub const Msg = union(enum) {
     set_theme: u32,
     set_chatter: u32,
     toggle_nudge,
+    forget_fact: u32,
     reset_position,
     chat_model_input: canvas.TextInputEvent,
     chat_url_input: canvas.TextInputEvent,
@@ -2709,6 +2710,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.settings_open = true;
         },
         .open_chat_options => {
+            chat_shell.ensureSynced(model, fx);
             openChatOptions(model);
             fx.focusWindow(settings_window_label);
         },
@@ -2861,6 +2863,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .set_chat_stack,
         .set_chatter,
         .toggle_nudge,
+        .forget_fact,
         .chat_model_input,
         .chat_url_input,
         .chat_detect_models,
@@ -2994,6 +2997,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             registerFlockFrames(fx);
             armFrameTimer(model, fx);
             saveSettings(model);
+            if (model.chat_options_open) chat_shell.ensureSynced(model, fx);
         },
         .toggle_bubbles => {
             model.bubbles_enabled = !model.bubbles_enabled;
@@ -3662,6 +3666,19 @@ fn openDestination(bubble: *const hook_server.Bubble) void {
         .terminal => _ = plat.activateOriginApplication(.terminal, bubble.ttySlice(), bubble.cwdSlice()),
         .none => {},
     }
+}
+
+/// Opens the first waiting conversation that has a pane or tab to bring
+/// forward. The returned name points at the bubble and is only valid
+/// until the next mailbox drain.
+pub fn openFirstWaiting(model: *const Model) ?[]const u8 {
+    for (model.bubbles[0..model.bubbles_len], 0..) |*bubble, slot| {
+        if (bubbleState(model, slot) != .waiting) continue;
+        if (bubbleDestination(bubble) == .none) continue;
+        openDestination(bubble);
+        return bubble.agent[0..bubble.agent_len];
+    }
+    return null;
 }
 
 const HookRect = struct { x: f32, y: f32, w: f32, h: f32 };

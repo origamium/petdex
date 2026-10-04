@@ -535,6 +535,36 @@ fn optionsSection(ui: *AppUi, model: *const Model) AppUi.Node {
                 .semantics = .{ .label = i18n.t("Speak up when an agent needs you", "対応が必要なとき声をかける") },
             }, .{}),
         })),
+        factsPanel(ui, model),
+    });
+}
+
+fn factsPanel(ui: *AppUi, model: *const Model) AppUi.Node {
+    const st = &model.chat;
+    var rows: [12]AppUi.Node = undefined;
+    for (0..st.fact_count) |i| {
+        rows[i] = ui.row(.{ .cross = .center, .gap = 12 }, .{
+            ui.column(.{ .grow = 1 }, .{
+                ui.paragraph(.{}, &.{.{ .text = st.factText(i) }}),
+            }),
+            ui.button(.{
+                .size = .sm,
+                .variant = .secondary,
+                .on_press = Msg{ .forget_fact = @intCast(i) },
+            }, i18n.t("Forget", "忘れる")),
+        });
+    }
+    const list: AppUi.Node = if (st.fact_count == 0)
+        muted(ui, i18n.t("Nothing yet.", "まだない。"))
+    else
+        ui.column(.{ .gap = 8 }, rows[0..@as(usize, st.fact_count)]);
+    return ui.column(.{ .gap = 10 }, .{
+        ui.el(.stack, .{ .height = 8 }, .{}),
+        ui.text(.{ .size = .sm, .style_tokens = .{ .foreground = .text_muted } }, i18n.t("REMEMBERED", "覚えていること")),
+        panel(ui, ui.column(.{ .padding = 12, .gap = 8 }, .{
+            muted(ui, i18n.t("Say \"remember, ...\" to keep a fact. Resetting the chat leaves these.", "「覚えて、…」で覚える。会話を消しても残る。")),
+            list,
+        })),
     });
 }
 

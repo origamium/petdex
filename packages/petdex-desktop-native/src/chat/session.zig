@@ -38,6 +38,8 @@ pub const Prompt = enum {
     /// A coding agent started waiting on the user.
     nudge,
     timer_done,
+    /// The user asked for something the app already did.
+    ack,
 };
 
 pub const Action = enum {
@@ -252,6 +254,29 @@ pub const Session = struct {
         self.transcript.append(.user, trimmed);
         self.prompt = .none;
         return self.begin(needs_refresh);
+    }
+
+    /// The user asked, and the app already did it. The shell appends the
+    /// result as the request's last turn. Not proactive: a failure stays
+    /// on screen and can be retried.
+    pub fn acknowledge(self: *Session, text: []const u8, needs_refresh: bool) Action {
+        if (!self.canSend()) return .none;
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len == 0) return .none;
+        self.transcript.append(.user, trimmed);
+        self.prompt = .ack;
+        return self.begin(needs_refresh);
+    }
+
+    /// User line and reply, with no request. Used when nothing can generate one.
+    pub fn localExchange(self: *Session, user: []const u8, reply: []const u8) bool {
+        if (!self.canSend()) return false;
+        const trimmed = std.mem.trim(u8, user, " \t\r\n");
+        if (trimmed.len == 0 or reply.len == 0) return false;
+        self.transcript.append(.user, trimmed);
+        self.transcript.append(.assistant, reply);
+        self.prompt = .none;
+        return true;
     }
 
     /// Re-send after a failure: the user's message is still the newest,
@@ -478,6 +503,19 @@ test "a briefing streams a reply without a user turn and can be retried" {
     try t.expectEqualStrings("Claude is waiting.", s.lastReply().?);
     try t.expectEqual(Action.request, s.submit("thanks", false));
     try t.expectEqual(Prompt.none, s.prompt);
+}
+
+test "an acknowledgement is the user's request and can be retried" {
+    const s = newSession();
+    defer t.allocator.destroy(s);
+    try t.expectEqual(Action.request, s.acknowledge("タイマー始めて", false));
+    try t.expectEqual(Prompt.ack, s.prompt);
+    try t.expect(!s.proactive());
+    try t.expectEqual(@as(usize, 1), s.transcript.len());
+    try t.expectEqual(Role.user, s.transcript.last().?.role);
+    try t.expectEqual(Action.failed, s.onResponse(.openai_compat, s.streamKey(), 0, "down"));
+    try t.expectEqual(Action.request, s.retry(false));
+    try t.expectEqual(Prompt.ack, s.prompt);
 }
 
 test "unprompted small talk that fails passes quietly" {
