@@ -273,7 +273,11 @@ fn speech(st: *const State, buf: []u8) Speech {
     // From the moment a request starts (a send, a retry, a briefing,
     // a credential refresh) until its first words: the thinking line.
     const reply = s.currentReply() orelse "";
-    if (s.busy() and s.prompt != .timer_done and reply.len == 0) return .{ .text = st.thinkingText() };
+    // The pet's own line is speech. The generic label stays quiet.
+    if (s.busy() and s.prompt != .timer_done and reply.len == 0) return .{
+        .text = st.thinkingText(),
+        .tone = if (st.thinking_len > 0) .speech else .quiet,
+    };
     if (reply.len > 0) return .{ .text = reply, .tone = .speech };
     if (!st.ready()) return .{
         .text = if (st.kind == .codex)
@@ -388,7 +392,11 @@ fn statusRow(ui: *AppUi, st: *const State) AppUi.Node {
             }),
         });
     }
-    if (s.thinking()) return ui.column(.{ .padding = 8 }, .{muted(ui, st.thinkingText())});
+    if (s.thinking()) {
+        const line = st.thinkingText();
+        const node = if (st.thinking_len > 0) ui.paragraph(.{}, &.{.{ .text = line }}) else muted(ui, line);
+        return ui.column(.{ .padding = 8 }, .{node});
+    }
     return ui.column(.{ .padding = 8 }, .{muted(ui, i18n.t("Part of this reply was lost.", "返事の一部が失われました。"))});
 }
 
@@ -838,7 +846,14 @@ test "the reply card thinks until the first words, a briefing included" {
     // A briefing adds no user turn: the old reply joins the stack and
     // the card thinks.
     try std.testing.expectEqual(chat.session.Action.request, s.brief(.briefing, false, 0));
+    try std.testing.expectEqual(Tone.quiet, speech(st, &buf).tone);
     try std.testing.expectEqualStrings(st.thinkingText(), speech(st, &buf).text);
+    const line = "頁をめくっている";
+    @memcpy(st.thinking[0..line.len], line);
+    st.thinking_len = line.len;
+    try std.testing.expectEqual(Tone.speech, speech(st, &buf).tone);
+    try std.testing.expectEqualStrings(line, speech(st, &buf).text);
+    st.thinking_len = 0;
     try std.testing.expectEqual(@as(usize, 2), stacked(&model).to);
     // The first words replace the thinking line; the old reply stays stacked.
     var scratch: [4096]u8 = undefined;

@@ -99,12 +99,15 @@ priority over variety; recurring interests can return with fresh details.
 The app keeps the framing: a desktop pet that answers in
 one to three short sentences of plain text, with varied reactions and phrasing
 while preserving the character's identity and established facts. Catchphrases,
-advice and follow-up questions are optional. Until a reply's first words arrive,
-the chat shows one of the pet's `thinking` lines, picked at random, or
-"Thinking…" when it has none:
+advice and follow-up questions are optional. Until a reply's first words arrive, the chat shows one of the pet's own
+lines, picked at random, in its speaking voice. `thinking` is that list.
+`alt` or `altText` (a string or a list) is the same text when `thinking`
+is absent. A `states` entry can carry `alt` too: review, waiting, and
+thinking come first, then idle. With none of these, the chat says
+"Thinking…":
 
 ```json
-{ "displayName": "古関ウイ", "thinking": ["眠いなあ…", "先生、何考えてるんだろう…"] }
+{ "displayName": "古関ウイ", "alt": ["眠いなあ…", "先生、何考えてるんだろう…"] }
 ```
 
 History lives in `~/.petdex/petdex.db`: user messages and completed replies,

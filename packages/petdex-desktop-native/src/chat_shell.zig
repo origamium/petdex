@@ -885,6 +885,9 @@ fn buildPersona(st: *State, root: []const u8) void {
     }
     persona_len = persona.build(&persona_buf, st.petSlug(), info, character).len;
     setField(&st.pet_name, &st.pet_name_len, info.name orelse st.petSlug());
+    // After the file is read, so a line added since the chat opened
+    // shows on this request and not the one after it.
+    pickThinking(st);
 }
 
 test "persona edits reload without resetting the conversation and blank overrides fall back" {
