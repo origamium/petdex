@@ -32,13 +32,26 @@ function parseJsonLines(output: string): unknown[] {
     .map((line) => JSON.parse(line));
 }
 
-async function runServer(input: string, beforeInputDelay = 0) {
+async function runServer(
+  runtime: "bun" | "node",
+  input: string | Uint8Array | Uint8Array[],
+  beforeInputDelay = 0,
+) {
   const child = spawn(
-    process.execPath,
-    [
-      "-e",
-      'import("./src/hooks/mcp-server.ts").then(({ runMcpServer }) => runMcpServer())',
-    ],
+    runtime === "bun" ? process.execPath : "node",
+    runtime === "bun"
+      ? [
+          "-e",
+          'import("./src/hooks/mcp-server.ts").then(({ runMcpServer }) => runMcpServer())',
+        ]
+      : [
+          fileURLToPath(
+            new URL(
+              "../../../petdex-desktop-native/src/assets/petdex-mcp-server.mjs",
+              import.meta.url,
+            ),
+          ),
+        ],
     {
       cwd: CLI_PACKAGE_DIR,
       stdio: ["pipe", "pipe", "pipe"],
@@ -58,7 +71,15 @@ async function runServer(input: string, beforeInputDelay = 0) {
     await new Promise((resolve) => setTimeout(resolve, beforeInputDelay));
   }
   const beforeInputStdout = stdout;
-  child.stdin.end(input);
+  // Early rejection may close stdin while a test is still writing a large frame.
+  child.stdin.on("error", () => {});
+  if (Array.isArray(input)) {
+    for (const chunk of input) {
+      child.stdin.write(chunk);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    child.stdin.end();
+  } else child.stdin.end(input);
   const code = await new Promise<number | null>((resolve) => {
     child.on("close", resolve);
   });
@@ -71,7 +92,12 @@ async function runServer(input: string, beforeInputDelay = 0) {
   };
 }
 
-describe("Petdex MCP server stdio", () => {
+describe.each([
+  "bun",
+  "node",
+] as const)("Petdex MCP server stdio (%s)", (runtime) => {
+  const execute = (input: string | Uint8Array | Uint8Array[], delay = 0) =>
+    runServer(runtime, input, delay);
   test("does not write stdout before initialize", async () => {
     const initialize = frame({
       jsonrpc: "2.0",
@@ -80,7 +106,7 @@ describe("Petdex MCP server stdio", () => {
       params: { protocolVersion: "2025-03-26" },
     });
 
-    const result = await runServer(initialize, 100);
+    const result = await execute(initialize, 100);
 
     expect(result.beforeInputStdout).toBe("");
     expect(result.stderr).toBe("");
@@ -111,7 +137,7 @@ describe("Petdex MCP server stdio", () => {
       method: "tools/list",
     });
 
-    const result = await runServer(initialize + toolsList);
+    const result = await execute(initialize + toolsList);
 
     expect(result.stderr).toBe("");
     expect(result.code).toBe(0);
@@ -142,7 +168,7 @@ describe("Petdex MCP server stdio", () => {
       "\n",
     );
 
-    const result = await runServer(initialize);
+    const result = await execute(initialize);
 
     expect(result.stderr).toBe("");
     expect(result.code).toBe(0);
@@ -154,7 +180,7 @@ describe("Petdex MCP server stdio", () => {
   });
 
   test("malformed JSONL lines receive errors and do not block subsequent requests", async () => {
-    const result = await runServer(
+    const result = await execute(
       'garbage\nnull\n[]\n{"jsonrpc":"2.0","id":5,"method":"ping","params":"bad"}\n{"jsonrpc":"2.0","id":6,"method":"ping"}',
     );
     const replies = parseJsonLines(result.stdout) as Array<{
@@ -175,7 +201,7 @@ describe("Petdex MCP server stdio", () => {
   });
 
   test("unicode framed requests and queued replies preserve byte boundaries", async () => {
-    const result = await runServer(
+    const result = await execute(
       frame({ jsonrpc: "2.0", id: "日本語", method: "ping" }) +
         frame({ jsonrpc: "2.0", id: "🦊", method: "ping" }),
     );
@@ -186,7 +212,7 @@ describe("Petdex MCP server stdio", () => {
   });
 
   test("truncated framed messages fail explicitly at EOF", async () => {
-    const result = await runServer(
+    const result = await execute(
       'Content-Length: 100\r\n\r\n{"jsonrpc":"2.0"}',
     );
     expect(result.code).toBe(1);
@@ -196,6 +222,116 @@ describe("Petdex MCP server stdio", () => {
         id: null,
         error: { code: -32700, message: "Incomplete message" },
       },
+    ]);
+  });
+
+  test("framed clients may send Content-Type before Content-Length", async () => {
+    const result = await execute(
+      "Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n" +
+        frame({ jsonrpc: "2.0", id: 8, method: "ping" }),
+    );
+    expect(result.code).toBe(0);
+    expect(result.frames).toEqual([{ jsonrpc: "2.0", id: 8, result: {} }]);
+  });
+
+  test("invalid frame lengths fail explicitly instead of dispatching a prefix", async () => {
+    const body = JSON.stringify({ jsonrpc: "2.0", id: 9, method: "ping" });
+    for (const length of [
+      `${body.length}junk`,
+      `${body.length}\r\nContent-Length: ${body.length}`,
+      "-1",
+    ]) {
+      const result = await execute(`Content-Length: ${length}\r\n\r\n${body}`);
+      expect(result.code).toBe(1);
+      expect(result.frames).toHaveLength(1);
+      expect(result.frames[0]).toMatchObject({
+        id: null,
+        error: { code: -32700 },
+      });
+    }
+  });
+
+  test("non-finite request ids are invalid and cannot become a null response id", async () => {
+    const result = await execute(
+      '{"jsonrpc":"2.0","id":1e400,"method":"ping"}\n',
+    );
+    expect(parseJsonLines(result.stdout)).toEqual([
+      {
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32600, message: "Invalid Request" },
+      },
+    ]);
+  });
+
+  test("a maximum-size frame can arrive beside a second complete message", async () => {
+    const request = {
+      jsonrpc: "2.0",
+      id: 10,
+      method: "ping",
+      params: { padding: "" },
+    };
+    request.params.padding = "x".repeat(
+      1024 * 1024 - JSON.stringify(request).length,
+    );
+    const result = await execute(
+      frame(request) + frame({ jsonrpc: "2.0", id: 11, method: "ping" }),
+    );
+    expect(result.code).toBe(0);
+    expect(result.frames).toEqual([
+      { jsonrpc: "2.0", id: 10, result: {} },
+      { jsonrpc: "2.0", id: 11, result: {} },
+    ]);
+  });
+
+  test("oversized messages and headers close the transport with an explicit error", async () => {
+    for (const input of [
+      `Content-Length: ${1024 * 1024 + 1}\r\n\r\n`,
+      `Content-Length: 2\r\nX-Padding: ${"x".repeat(8192)}\r\n\r\n{}`,
+      `${JSON.stringify({ jsonrpc: "2.0", id: 12, method: "ping", params: { padding: "x".repeat(1024 * 1024) } })}\n`,
+    ]) {
+      const result = await execute(input);
+      expect(result.code).toBe(1);
+      const replies = input.startsWith("Content-")
+        ? result.frames
+        : parseJsonLines(result.stdout);
+      expect(replies).toHaveLength(1);
+      expect(replies[0]).toMatchObject({ id: null, error: { code: -32700 } });
+    }
+  });
+
+  test("fragmented headers and Unicode bodies preserve exact request ids", async () => {
+    const bytes = Buffer.from(
+      frame({ jsonrpc: "2.0", id: "🦊日本語", method: "ping" }),
+    );
+    const emoji = bytes.indexOf("🦊");
+    const result = await execute([
+      bytes.subarray(0, 7),
+      bytes.subarray(7, emoji + 1),
+      bytes.subarray(emoji + 1),
+    ]);
+    expect(result.code).toBe(0);
+    expect(result.frames).toEqual([
+      { jsonrpc: "2.0", id: "🦊日本語", result: {} },
+    ]);
+  });
+
+  test("invalid UTF-8 is rejected without corrupting the next JSONL request", async () => {
+    const input = Buffer.concat([
+      Buffer.from('{"jsonrpc":"2.0","id":"'),
+      Buffer.from([0xff]),
+      Buffer.from(
+        '","method":"ping"}\n{"jsonrpc":"2.0","id":13,"method":"ping"}\n',
+      ),
+    ]);
+    const result = await execute(input);
+    expect(parseJsonLines(result.stdout)).toEqual([
+      {
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32700, message: "Invalid JSON or UTF-8" },
+      },
+      { jsonrpc: "2.0", id: 13, result: {} },
     ]);
   });
 
@@ -214,32 +350,7 @@ describe("Petdex MCP server stdio", () => {
       },
     })}\n`;
 
-    const child = spawn(
-      process.execPath,
-      [
-        "-e",
-        'import("./src/hooks/mcp-server.ts").then(({ runMcpServer }) => runMcpServer())',
-      ],
-      {
-        cwd: CLI_PACKAGE_DIR,
-        stdio: ["pipe", "pipe", "pipe"],
-      },
-    );
-    let stdout = "";
-    let stderr = "";
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
-    child.stdin.end(initialize);
-    const code = await new Promise<number | null>((resolve) => {
-      child.on("close", resolve);
-    });
-
+    const { stdout, stderr, code } = await execute(initialize);
     expect(stderr).toBe("");
     expect(code).toBe(0);
     expect(parseJsonLines(stdout)).toEqual([

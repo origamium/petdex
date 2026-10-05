@@ -12,6 +12,7 @@
  *
  * IMPORTANT: Do not write to stdout until the client sends `initialize`.
  */
+import { once } from "node:events";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -865,155 +866,144 @@ async function handleRequest(req: JsonRpcRequest): Promise<void> {
 export async function runMcpServer(): Promise<void> {
   let buffer = new Uint8Array(0);
   let inputMode: TransportMode | undefined;
-  let pending = 0;
-  let queue = Promise.resolve();
   const maxMessage = 1024 * 1024;
-  let draining = false;
-  const decoder = new TextDecoder();
+  const maxHeader = 8192;
+  const decoder = new TextDecoder("utf-8", { fatal: true });
 
-  function exitWhenDrained() {
-    if (pending === 0 && process.exitCode === undefined) process.exitCode = 0;
+  function failFrame(message: string): void {
+    sendMessage(errorResponse(null, -32700, message), inputMode ?? "framed");
+    process.exitCode = 1;
   }
 
-  process.stdin.on("data", (chunk: Uint8Array | string) => {
+  // Await each request and stdout backpressure before accepting more input.
+  // An unbounded promise queue retained every tool argument while Desktop was
+  // slow or offline. The stream now provides the bound, in both runtimes.
+  for await (const chunk of process.stdin) {
     const raw =
       typeof chunk === "string" ? new TextEncoder().encode(chunk) : chunk;
-    if (buffer.length + raw.length > maxMessage) {
-      process.stdin.destroy();
-      process.exitCode = 1;
-      return;
-    }
     const newBuf = new Uint8Array(buffer.length + raw.length);
     newBuf.set(buffer);
     newBuf.set(raw, buffer.length);
     buffer = newBuf;
 
-    while (true) {
-      const firstByte = firstNonWhitespaceByte(buffer);
-      if (firstByte === null) break;
-      // Select once per stream, including malformed JSONL input. Otherwise a
-      // line such as `null` or `garbage` is mistaken for an incomplete header
-      // and the client waits forever for its parse/invalid-request response.
-      if (inputMode === undefined) {
-        const prefix = decoder.decode(buffer).trimStart().toLowerCase();
-        const marker = "content-length:";
-        if (marker.startsWith(prefix)) break;
-        inputMode = prefix.startsWith(marker) ? "framed" : "jsonl";
+    while (buffer.length > 0) {
+      if (firstNonWhitespaceByte(buffer) === null) {
+        buffer = new Uint8Array(0);
+        break;
       }
+      if (inputMode === undefined) {
+        // Inspect only the ASCII header prefix; a UTF-8 JSON body may arrive
+        // split through a code point and must only be decoded when complete.
+        let start = 0;
+        while ([0x20, 0x09, 0x0a, 0x0d].includes(buffer[start])) start++;
+        const prefix = Buffer.from(buffer.subarray(start, start + 64))
+          .toString("ascii")
+          .toLowerCase();
+        const markers = ["content-length:", "content-type:"];
+        if (markers.some((marker) => marker.startsWith(prefix))) break;
+        inputMode = markers.some((marker) => prefix.startsWith(marker))
+          ? "framed"
+          : "jsonl";
+      }
+      transportMode = inputMode;
       if (inputMode === "jsonl") {
         const lineEnd = findSequence(buffer, new Uint8Array([0x0a]));
+        if ((lineEnd === -1 ? buffer.length : lineEnd) > maxMessage) {
+          failFrame("Message exceeds 1 MiB");
+          return;
+        }
         if (lineEnd === -1) break;
-        const lineBytes = trimTrailingCarriageReturn(buffer.slice(0, lineEnd));
+        const line = trimTrailingCarriageReturn(buffer.subarray(0, lineEnd));
         buffer = buffer.slice(lineEnd + 1);
-        const line = decoder.decode(lineBytes).trim();
-        if (!line) continue;
-        dispatchRequest(line, "jsonl");
-        continue;
+        if (firstNonWhitespaceByte(line) !== null) await dispatchRequest(line);
+      } else {
+        const boundary = findHeaderBoundary(buffer);
+        if (
+          (boundary.index === -1 ? buffer.length : boundary.index) > maxHeader
+        ) {
+          failFrame("Frame header exceeds 8 KiB");
+          return;
+        }
+        if (boundary.index === -1) break;
+        let contentLength: number | undefined;
+        try {
+          const headers = decoder
+            .decode(buffer.subarray(0, boundary.index))
+            .trim()
+            .split(/\r?\n/);
+          for (const header of headers) {
+            const match = /^([^: \t]+):[ \t]*(.*)$/.exec(header);
+            if (!match) throw new Error("Invalid frame header");
+            if (match[1].toLowerCase() !== "content-length") continue;
+            const value = match[2].trim();
+            if (contentLength !== undefined || !/^\d+$/.test(value))
+              throw new Error("Invalid Content-Length");
+            contentLength = Number(value);
+          }
+          if (
+            contentLength === undefined ||
+            !Number.isSafeInteger(contentLength) ||
+            contentLength > maxMessage
+          )
+            throw new Error("Invalid Content-Length");
+        } catch {
+          failFrame("Invalid frame header or Content-Length");
+          return;
+        }
+        const bodyStart = boundary.index + boundary.length;
+        const frameEnd = bodyStart + contentLength;
+        if (buffer.length < frameEnd) break;
+        const body = buffer.subarray(bodyStart, frameEnd);
+        buffer = buffer.slice(frameEnd);
+        await dispatchRequest(body);
       }
-
-      const headerBoundary = findHeaderBoundary(buffer);
-      const headerEnd = headerBoundary.index;
-      if (headerEnd === -1) break;
-
-      const headerSection = buffer.slice(0, headerEnd);
-      const headerStr = decoder.decode(headerSection);
-      const contentLengthMatch = headerStr.match(/Content-Length:\s*(\d+)/i);
-      if (!contentLengthMatch) {
-        buffer = buffer.slice(headerEnd + headerBoundary.length);
-        continue;
-      }
-      const contentLength = parseInt(contentLengthMatch[1], 10);
-      if (!Number.isSafeInteger(contentLength) || contentLength > maxMessage) {
-        process.stdin.destroy();
-        process.exitCode = 1;
-        return;
-      }
-      const bodyStart = headerEnd + headerBoundary.length;
-      const frameEnd = bodyStart + contentLength;
-
-      if (buffer.length < frameEnd) break;
-
-      const bodyBytes = buffer.slice(bodyStart, frameEnd);
-      const bodyStr = decoder.decode(bodyBytes);
-      buffer = buffer.slice(frameEnd);
-      dispatchRequest(bodyStr, "framed");
+      if (process.stdout.writableNeedDrain) await once(process.stdout, "drain");
     }
-  });
+  }
 
-  process.stdin.on("end", () => {
-    if (inputMode === "jsonl" && firstNonWhitespaceByte(buffer) !== null) {
-      dispatchRequest(decoder.decode(buffer), "jsonl");
-      buffer = new Uint8Array(0);
-    } else if (firstNonWhitespaceByte(buffer) !== null) {
-      sendMessage(errorResponse(null, -32700, "Incomplete message"), "framed");
-      process.exitCode = 1;
-    }
-    draining = true;
-    exitWhenDrained();
-  });
+  if (firstNonWhitespaceByte(buffer) !== null) {
+    if (inputMode === "jsonl") await dispatchRequest(buffer);
+    else failFrame("Incomplete message");
+  }
+  if (process.stdout.writableNeedDrain) await once(process.stdout, "drain");
 
-  function dispatchRequest(bodyStr: string, mode: TransportMode) {
+  async function dispatchRequest(body: Uint8Array): Promise<void> {
+    let req: JsonRpcRequest;
     try {
-      const req = JSON.parse(bodyStr) as JsonRpcRequest;
-      if (
-        !req ||
-        typeof req !== "object" ||
-        Array.isArray(req) ||
-        req.jsonrpc !== "2.0" ||
-        typeof req.method !== "string" ||
-        (req.id !== undefined &&
-          req.id !== null &&
-          typeof req.id !== "string" &&
-          typeof req.id !== "number")
-      ) {
-        sendMessage(errorResponse(null, -32600, "Invalid Request"), mode);
-        return;
-      }
-      if (
-        req.params !== undefined &&
-        (typeof req.params !== "object" ||
-          req.params === null ||
-          Array.isArray(req.params))
-      ) {
-        if (req.id !== undefined)
-          sendMessage(
-            errorResponse(req.id, -32602, "params must be an object"),
-            mode,
-          );
-        return;
-      }
-      pending++;
-      queue = queue
-        .then(() => {
-          transportMode = mode;
-          return handleRequest(req);
-        })
-        .catch((err) => {
-          if (req.id !== undefined)
-            sendMessage(
-              errorResponse(
-                req.id,
-                -32603,
-                `Internal error: ${(err as Error).message}`,
-              ),
-            );
-        })
-        .finally(() => {
-          pending--;
-          if (draining) exitWhenDrained();
-        });
-    } catch (err) {
-      sendMessage(
-        {
-          jsonrpc: "2.0",
-          id: null,
-          error: {
-            code: -32700,
-            message: `Parse error: ${(err as Error).message}`,
-          },
-        },
-        mode,
-      );
+      req = JSON.parse(decoder.decode(body)) as JsonRpcRequest;
+    } catch {
+      sendMessage(errorResponse(null, -32700, "Invalid JSON or UTF-8"));
+      return;
+    }
+    if (
+      !req ||
+      typeof req !== "object" ||
+      Array.isArray(req) ||
+      req.jsonrpc !== "2.0" ||
+      typeof req.method !== "string" ||
+      (req.id !== undefined &&
+        req.id !== null &&
+        typeof req.id !== "string" &&
+        (typeof req.id !== "number" || !Number.isFinite(req.id)))
+    ) {
+      sendMessage(errorResponse(null, -32600, "Invalid Request"));
+      return;
+    }
+    if (
+      req.params !== undefined &&
+      (typeof req.params !== "object" ||
+        req.params === null ||
+        Array.isArray(req.params))
+    ) {
+      if (req.id !== undefined)
+        sendMessage(errorResponse(req.id, -32602, "params must be an object"));
+      return;
+    }
+    try {
+      await handleRequest(req);
+    } catch {
+      if (req.id !== undefined)
+        sendMessage(errorResponse(req.id, -32603, "Internal error"));
     }
   }
 }

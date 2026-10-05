@@ -1,6 +1,6 @@
 # AI agent integration support
 
-Updated 2026-09-17. This records the implementation after the [notification audit and repairs](pets-mcp-notification-audit-2026-09-17.md). It describes source/build support, not a claim that every upstream application has been exercised end to end.
+Updated 2026-10-05. This records the implementation after the [notification audit and repairs](pets-mcp-notification-audit-2026-09-17.md) and subsequent configuration/transport hardening. It describes source/build support, not a claim that every upstream application has been exercised end to end.
 
 ## Connection coverage
 
@@ -43,11 +43,19 @@ MCP shapes are based on [Copilot configuration](https://docs.github.com/en/copil
 
 Install/update retains foreign JSON keys and hook entries and creates a backup beside edited existing files. Reinstalling is idempotent. Droid's legacy `settings.json.hooks` is copied before creating `hooks.json`, because the latter shadows the former. Malformed input fails without replacing the file. Explicit host hook-disable settings remain disabled. Windows Copilot/Cascade commands use PowerShell stdin forwarding; other platforms use the native POSIX wrapper.
 
+MCP configuration writes require a readable existing backup or a successfully created backup. New backups and rewritten MCP configurations use owner-only permissions (`0600`) on POSIX, including when the file contains another server's credentials. Installation, backup and connection detection share a 1 MiB limit; an update that would exceed it leaves the original untouched.
+
+Codex/Grok TOML updates distinguish actual tables from table-like text inside multiline strings and arrays, and preserve foreign quoted names such as `"petdex.helper"`. Detection uses the same statement boundaries. Escaped keys, incomplete syntax and inline/dotted definitions of the managed MCP table are refused before writing; these require manual conversion to ordinary `[mcp_servers.petdex]` tables. A current TOML configuration is not rewritten on reinstall.
+
+New OpenCode configurations use the [stable V1 layout](https://opencode.ai/docs/mcp-servers/). Existing [V2 layouts](https://dev.opencode.ai/v2/docs/mcp-servers/) retain `mcp.servers` and omit the V1 `enabled` field. A JSONC override without an MCP section inherits the layout from the lower-precedence JSON file. V1 servers named `servers`, V2 servers named `type`, and V2 timeout-only configurations are distinguished. Without existing V2 configuration evidence, the installer defaults to V1.
+
 Amp sends bounded display metadata rather than full tool results or file contents. Remote executors and missing thread ids are skipped. Hook/plugin installation is local to the machine running Desktop; the existing SSH integrations do not automatically extend to these four new adapters.
 
 ## MCP v0.4.0
 
 The server is bundled with Desktop and runs under Node 20+. No registry download is needed for its startup.
+
+The transport accepts newline-delimited JSON-RPC and legacy Content-Length frames, with a 1 MiB body limit and an 8 KiB frame-header limit. Invalid/duplicate lengths, invalid UTF-8, incomplete frames and non-finite request ids are rejected explicitly. Length limits apply per message, so a valid maximum-size frame can be followed by another request. Requests are processed in order with stdin/stdout backpressure instead of accumulating an unbounded asynchronous queue. Protocol regressions execute both the Bun source entry and the generated Node asset.
 
 | Tool | Purpose |
 | --- | --- |
@@ -75,6 +83,6 @@ The host's version, trust mode, project overrides and disabled tools can still p
 
 Regression coverage includes per-host schema round trips, duplicate prevention, foreign-hook preservation, disabled settings, legacy Droid migration, metadata retention, provider session isolation, diagnostic snapshots, authenticated MCP requests, default session filtering, offline behavior, Amp event mapping and Windows command quoting. The bundled server is launched under Node to verify all five tools. CI runs the new Amp tests alongside the MCP protocol tests on all three platforms.
 
-Local checks: native suite **449/449**, CLI hooks plus Amp plugin **86/86**, CLI typecheck/build, macOS native release build, generated MCP asset check and formatting. Windows hooks/server and Linux hooks also pass compile-only checks. These use temporary homes and stubbed host/network boundaries; they do not alter live agent configurations or prove live-provider compatibility.
+Latest local checks (2026-10-05): native suite **482/482**; complete CLI suite **148/148**; combined CLI hook/MCP and Amp/OpenCode/OMP fixtures **120/120**. The CLI and combined fixture counts overlap. CLI typecheck/build, macOS ReleaseFast build, generated MCP asset check and formatting passed. The modified MCP configuration module also passes Windows and Linux compile-only checks. Local protocol tests use Bun 1.3.12 and Node 22.22.0; CI includes the portable MCP suite on Windows across the existing Node 20/22/24 matrix. These checks use temporary homes and stubbed host/network boundaries; they do not alter live agent configurations or prove live-provider compatibility. CI results are separate from these local results.
 
 To activate, use the updated Desktop build, open **Settings → Connections**, install/update the relevant integration, then restart the host (or reload Amp plugins). A hooks-only configuration shows that optional MCP tools are not enabled and offers **Set up MCP**, alongside Disconnect. Restart existing MCP subprocesses after Desktop updates. This development task did not replace or restart the running Desktop application and did not publish a release.

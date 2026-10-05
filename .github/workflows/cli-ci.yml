@@ -5,11 +5,15 @@ on:
     paths:
       - ".github/workflows/cli-ci.yml"
       - "packages/petdex-cli/**"
+      - "packages/petdex-desktop-native/src/assets/petdex-mcp-server.mjs"
+      - "scripts/build-petdex-mcp.ts"
   push:
     branches: [main]
     paths:
       - ".github/workflows/cli-ci.yml"
       - "packages/petdex-cli/**"
+      - "packages/petdex-desktop-native/src/assets/petdex-mcp-server.mjs"
+      - "scripts/build-petdex-mcp.ts"
   workflow_dispatch:
 
 permissions:
@@ -61,6 +65,10 @@ jobs:
         run: |
           Write-Host "Skipping the full Bun test suite on Windows because several current CLI tests assert POSIX-only process, shell, path, and chmod behavior."
           Write-Host "This Windows job still verifies build, typecheck, npm pack, and npx.cmd execution for the packaged CLI."
+
+      - name: Run portable MCP tests on Windows
+        if: runner.os == 'Windows'
+        run: bun test src/hooks/mcp-server.test.ts src/hooks/mcp-server-runtime.test.ts
 
       - name: Verify built binary
         run: node dist/petdex.js --version

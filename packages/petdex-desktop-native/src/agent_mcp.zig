@@ -78,6 +78,7 @@ pub const AgentInfo = struct {
 };
 
 const server_name = "petdex";
+const max_config_bytes = 1024 * 1024;
 const mcp_command = "node";
 // Bundled with this desktop build, independent of the published npm CLI.
 const mcp_args = [_][]const u8{ "--input-type=commonjs", "-e", "import(require('node:url').pathToFileURL(require('node:path').join(require('node:os').homedir(),'.petdex','bin','petdex-mcp-server.mjs')).href)" };
@@ -127,7 +128,9 @@ fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max: usize) ?[]
 }
 
 fn writeFile(path: []const u8, contents: []const u8) bool {
-    return plat.writeFile(path, contents);
+    // Host configs can contain credentials for unrelated MCP servers. Atomic
+    // replacement must not turn a private original into a world-readable file.
+    return plat.writeFileMode(path, contents, 0o600);
 }
 
 fn ensureParentDir(path: []const u8) bool {
@@ -136,14 +139,27 @@ fn ensureParentDir(path: []const u8) bool {
     return true;
 }
 
-fn backupBeside(path: []const u8) void {
+fn backupBeside(path: []const u8) bool {
     var bak_buf: [576]u8 = undefined;
-    const bak = std.fmt.bufPrint(&bak_buf, "{s}.petdex-bak", .{path}) catch return;
-    if (fileExists(bak)) return;
+    const bak = std.fmt.bufPrint(&bak_buf, "{s}.petdex-bak", .{path}) catch return false;
     const allocator = std.heap.page_allocator;
-    const src = readFileAlloc(allocator, path, 1024 * 1024) orelse return;
+    // Keep the first backup, but a directory or unreadable file is not one.
+    if (fileExists(bak)) {
+        const saved = readFileAlloc(allocator, bak, max_config_bytes) orelse return false;
+        defer allocator.free(saved);
+        return true;
+    }
+    const src = readFileAlloc(allocator, path, max_config_bytes) orelse return false;
     defer allocator.free(src);
-    _ = plat.writeFile(bak, src);
+    return writeFile(bak, src);
+}
+
+/// Use the same bound for installation, backups and connection detection.
+/// Formatting or appending must not produce a config we can no longer read.
+fn replaceConfigFile(path: []const u8, contents: []const u8, has_original: bool) bool {
+    if (contents.len > max_config_bytes) return false;
+    if (has_original and !backupBeside(path)) return false;
+    return writeFile(path, contents);
 }
 
 /// The directory whose existence marks the agent as installed and which owns
@@ -347,6 +363,35 @@ fn opencodeHasPetdex(content: []const u8, kind: McpAgent, allocator: std.mem.All
     return opencodeOverrideStatus(content, kind, allocator) orelse .none;
 }
 
+const OpenCodeSchema = enum { v1, v2 };
+
+fn opencodeSchema(mcp: std.json.Value) ?OpenCodeSchema {
+    if (mcp != .object or mcp.object.count() == 0) return null;
+    if (mcp.object.get("servers")) |servers| {
+        // V1 permits a foreign server literally named "servers". It is not
+        // the V2 container, and we must never insert a child into its config.
+        if (servers == .object) {
+            if (servers.object.get("type")) |typ| {
+                if (typ == .string) return .v1;
+            }
+            if (servers.object.get("enabled")) |enabled| {
+                if (enabled == .bool) return .v1;
+            }
+        }
+        return .v2;
+    }
+    if (mcp.object.get("timeout")) |timeout| {
+        if (timeout == .object) {
+            for ([_][]const u8{ "startup", "catalog", "execution" }) |key| {
+                if (timeout.object.get(key)) |value| {
+                    if (value == .integer or value == .float) return .v2;
+                }
+            }
+        }
+    }
+    return .v1;
+}
+
 /// A higher-precedence file with no Petdex entry preserves the lower one.
 /// An explicit disabled, old or malformed entry must override it instead.
 fn opencodeOverrideStatus(content: []const u8, kind: McpAgent, allocator: std.mem.Allocator) ?Status {
@@ -356,12 +401,13 @@ fn opencodeOverrideStatus(content: []const u8, kind: McpAgent, allocator: std.me
     const mcp = parsed.value.object.get("mcp") orelse return null;
     if (mcp != .object) return .none;
     // V2: mcp.servers.petdex — V1 (current docs): mcp.petdex
-    if (mcp.object.get("servers")) |servers| {
-        if (servers == .object) {
-            if (servers.object.get(server_name)) |entry| {
-                return if (opencodeEntryLooksCurrent(entry, kind)) .current else .none;
-            }
+    if (opencodeSchema(mcp) == .v2) {
+        const servers = mcp.object.get("servers") orelse return null;
+        if (servers != .object) return .none;
+        if (servers.object.get(server_name)) |entry| {
+            return if (opencodeEntryLooksCurrent(entry, kind)) .current else .none;
         }
+        return null;
     }
     if (mcp.object.get(server_name)) |entry| {
         return if (opencodeEntryLooksCurrent(entry, kind)) .current else .none;
@@ -372,56 +418,176 @@ fn opencodeOverrideStatus(content: []const u8, kind: McpAgent, allocator: std.me
 fn tomlHasPetdex(content: []const u8, kind: McpAgent) Status {
     var buf: [1024]u8 = undefined;
     const expected = tomlMcpBlock(kind, &buf) orelse return .none;
-    var expected_lines = std.mem.tokenizeAny(u8, expected, "\n\r");
-    var expected_table: TomlTable = .other;
-    while (expected_lines.next()) |line| {
-        if (line[0] == '[') {
-            expected_table = tomlTable(line);
-            continue;
-        }
+    var expected_statements = TomlStatements{ .content = expected };
+    while (expected_statements.next() catch return .none) |wanted| {
+        const line = std.mem.trim(u8, wanted.bytes, " \t\r\n");
+        if (line.len == 0 or wanted.header) continue;
         var found = false;
-        var actual_table: TomlTable = .other;
-        var lines = std.mem.tokenizeAny(u8, content, "\n\r");
-        while (lines.next()) |actual| {
-            const trimmed = std.mem.trim(u8, actual, " \t");
-            if (trimmed.len > 0 and trimmed[0] == '[') actual_table = tomlTable(trimmed);
-            if (actual_table == expected_table and std.mem.eql(u8, trimmed, line)) {
-                found = true;
-                break;
-            }
+        var actual = TomlStatements{ .content = content };
+        while (actual.next() catch return .none) |statement| {
+            if (statement.table == wanted.table and std.mem.eql(u8, std.mem.trim(u8, statement.bytes, " \t\r\n"), line)) found = true;
         }
         if (!found) return .none;
     }
-    var in_petdex = false;
-    var lines = std.mem.tokenizeAny(u8, content, "\n\r");
-    while (lines.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t");
-        if (std.mem.startsWith(u8, line, "[")) in_petdex = tomlTable(line) == .server;
-        if (in_petdex and std.mem.startsWith(u8, line, "enabled")) {
-            const eq = std.mem.indexOfScalar(u8, line, '=') orelse return .none;
-            const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
-            if (std.mem.startsWith(u8, value, "false")) return .none;
+    var actual = TomlStatements{ .content = content };
+    while (actual.next() catch return .none) |statement| {
+        const line = std.mem.trim(u8, statement.bytes, " \t\r\n");
+        if (statement.table != .server or statement.header or line.len == 0 or line[0] == '#') continue;
+        const assignment = tomlKeys(line, '=') catch return .none;
+        if (assignment.count == 1 and std.mem.eql(u8, assignment.keys[0], "enabled")) {
+            const value = std.mem.trim(u8, assignment.tail[1..], " \t");
+            const end = std.mem.indexOfScalar(u8, value, '#') orelse value.len;
+            if (!std.mem.eql(u8, std.mem.trim(u8, value[0..end], " \t\r\n"), "true")) return .none;
         }
     }
     return .current;
 }
 
-const TomlTable = enum { other, server, env, child };
+const TomlTable = enum {
+    root,
+    mcp_root,
+    other,
+    server,
+    env,
+    child,
 
-/// Recognize the table we own, including quoted keys and trailing comments.
-fn tomlTable(raw: []const u8) TomlTable {
-    const line = std.mem.trim(u8, raw, " \t\r");
-    if (line.len < 2 or line[0] != '[' or line[1] == '[') return .other;
-    const end = std.mem.indexOfScalar(u8, line, ']') orelse return .other;
-    const tail = std.mem.trim(u8, line[end + 1 ..], " \t");
-    if (tail.len != 0 and tail[0] != '#') return .other;
-    var keys = std.mem.splitScalar(u8, line[1..end], '.');
-    const first = std.mem.trim(u8, keys.next() orelse return .other, " \t\"'");
-    const second = std.mem.trim(u8, keys.next() orelse return .other, " \t\"'");
-    if (!std.mem.eql(u8, first, "mcp_servers") or !std.mem.eql(u8, second, "petdex")) return .other;
-    const third = std.mem.trim(u8, keys.next() orelse return .server, " \t\"'");
-    return if (std.mem.eql(u8, third, "env") and keys.next() == null) .env else .child;
+    fn owned(self: TomlTable) bool {
+        return self == .server or self == .env or self == .child;
+    }
+};
+
+const TomlKeys = struct {
+    keys: [3][]const u8 = @splat(""),
+    count: usize = 0,
+    tail: []const u8,
+};
+
+/// Read dotted keys without splitting dots inside quoted names. Escaped keys
+/// are deliberately refused: guessing their decoded ownership could delete a
+/// foreign server or append a duplicate Petdex table.
+fn tomlKeys(raw: []const u8, terminator: u8) error{UnsafeToml}!TomlKeys {
+    var rest = std.mem.trimStart(u8, raw, " \t");
+    var result = TomlKeys{ .tail = rest };
+    while (rest.len > 0) {
+        var key: []const u8 = undefined;
+        if (rest[0] == '"' or rest[0] == '\'') {
+            const quote = rest[0];
+            const end = std.mem.indexOfScalarPos(u8, rest, 1, quote) orelse return error.UnsafeToml;
+            key = rest[1..end];
+            if (quote == '"' and std.mem.indexOfScalar(u8, key, '\\') != null) return error.UnsafeToml;
+            rest = rest[end + 1 ..];
+        } else {
+            var end: usize = 0;
+            while (end < rest.len and (std.ascii.isAlphanumeric(rest[end]) or rest[end] == '_' or rest[end] == '-')) : (end += 1) {}
+            if (end == 0) return error.UnsafeToml;
+            key = rest[0..end];
+            rest = rest[end..];
+        }
+        if (result.count < result.keys.len) result.keys[result.count] = key;
+        result.count += 1;
+        rest = std.mem.trimStart(u8, rest, " \t");
+        if (rest.len == 0) return error.UnsafeToml;
+        if (rest[0] == terminator) {
+            result.tail = rest;
+            return result;
+        }
+        if (rest[0] != '.') return error.UnsafeToml;
+        rest = std.mem.trimStart(u8, rest[1..], " \t");
+    }
+    return error.UnsafeToml;
 }
+
+fn tomlTable(raw: []const u8) error{UnsafeToml}!TomlTable {
+    const array = std.mem.startsWith(u8, raw, "[[");
+    const keys = try tomlKeys(raw[if (array) @as(usize, 2) else 1..], ']');
+    const closing: []const u8 = if (array) "]]" else "]";
+    if (!std.mem.startsWith(u8, keys.tail, closing)) return error.UnsafeToml;
+    const tail = std.mem.trim(u8, keys.tail[closing.len..], " \t\r\n");
+    if (tail.len != 0 and tail[0] != '#') return error.UnsafeToml;
+    if (!std.mem.eql(u8, keys.keys[0], "mcp_servers")) return .other;
+    if (keys.count == 1) return if (array) error.UnsafeToml else .mcp_root;
+    if (!std.mem.eql(u8, keys.keys[1], "petdex")) return .other;
+    if (keys.count == 2) return if (array) .child else .server;
+    return if (keys.count == 3 and std.mem.eql(u8, keys.keys[2], "env") and !array) .env else .child;
+}
+
+/// A lexical statement iterator, not a TOML reserializer. Keep foreign bytes
+/// verbatim and never interpret headers inside multiline strings or arrays.
+/// Unsupported inline/dotted definitions of our table fail before any write.
+const TomlStatements = struct {
+    content: []const u8,
+    offset: usize = 0,
+    table: TomlTable = .root,
+
+    const Statement = struct { bytes: []const u8, table: TomlTable, header: bool };
+
+    fn next(self: *TomlStatements) error{UnsafeToml}!?Statement {
+        if (self.offset == self.content.len) return null;
+        const start = self.offset;
+        var quote: u8 = 0;
+        var multiline = false;
+        var square: usize = 0;
+        var curly: usize = 0;
+        while (self.offset < self.content.len) {
+            const i = self.offset;
+            const c = self.content[i];
+            self.offset += 1;
+            if (quote != 0) {
+                if (!multiline and (c == '\n' or c == '\r')) return error.UnsafeToml;
+                if (quote == '"' and c == '\\') {
+                    if (self.offset == self.content.len) return error.UnsafeToml;
+                    self.offset += 1;
+                } else if (c == quote) {
+                    if (!multiline) {
+                        quote = 0;
+                    } else if (self.offset + 1 < self.content.len and self.content[self.offset] == quote and self.content[self.offset + 1] == quote) {
+                        self.offset += 2;
+                        // TOML allows one or two quotes just before the closing triple.
+                        var extra: usize = 0;
+                        while (extra < 2 and self.offset < self.content.len and self.content[self.offset] == quote) : (extra += 1) self.offset += 1;
+                        quote = 0;
+                    }
+                }
+                continue;
+            }
+            switch (c) {
+                '"', '\'' => {
+                    quote = c;
+                    multiline = self.offset + 1 < self.content.len and self.content[self.offset] == c and self.content[self.offset + 1] == c;
+                    if (multiline) self.offset += 2;
+                },
+                '#' => {
+                    while (self.offset < self.content.len and self.content[self.offset] != '\n') self.offset += 1;
+                },
+                '[' => square += 1,
+                ']' => {
+                    if (square == 0) return error.UnsafeToml;
+                    square -= 1;
+                },
+                '{' => curly += 1,
+                '}' => {
+                    if (curly == 0) return error.UnsafeToml;
+                    curly -= 1;
+                },
+                '\n' => if (square == 0 and curly == 0) break,
+                else => {},
+            }
+        }
+        if (quote != 0 or square != 0 or curly != 0) return error.UnsafeToml;
+        const bytes = self.content[start..self.offset];
+        const line = std.mem.trim(u8, bytes, " \t\r\n");
+        const header = line.len > 0 and line[0] == '[';
+        if (header) {
+            self.table = try tomlTable(line);
+        } else if (line.len > 0 and line[0] != '#') {
+            const keys = try tomlKeys(line, '=');
+            if (self.table == .root and std.mem.eql(u8, keys.keys[0], "mcp_servers") and
+                (keys.count == 1 or std.mem.eql(u8, keys.keys[1], "petdex"))) return error.UnsafeToml;
+            if (self.table == .mcp_root and std.mem.eql(u8, keys.keys[0], "petdex")) return error.UnsafeToml;
+        }
+        return .{ .bytes = bytes, .table = self.table, .header = header };
+    }
+};
 
 /// True when any Antigravity surface has run here. `~/.gemini` is shared
 /// with plain Gemini CLI, so its existence alone proves nothing; the AGY
@@ -449,7 +615,7 @@ pub fn scanOne(allocator: std.mem.Allocator, home: []const u8, kind: McpAgent) S
     var path_buf: [576]u8 = undefined;
     if (kind == .antigravity) {
         if (configPath(&path_buf, home, kind)) |path| {
-            if (readFileAlloc(allocator, path, 512 * 1024)) |content| {
+            if (readFileAlloc(allocator, path, max_config_bytes)) |content| {
                 defer allocator.free(content);
                 const status = jsonHasPetdex(content, kind, allocator);
                 if (status == .current) return .current;
@@ -457,7 +623,7 @@ pub fn scanOne(allocator: std.mem.Allocator, home: []const u8, kind: McpAgent) S
         }
         var legacy_buf: [576]u8 = undefined;
         if (antigravityLegacyPath(&legacy_buf, home)) |legacy| {
-            if (readFileAlloc(allocator, legacy, 512 * 1024)) |content| {
+            if (readFileAlloc(allocator, legacy, max_config_bytes)) |content| {
                 defer allocator.free(content);
                 return jsonHasPetdex(content, kind, allocator);
             }
@@ -470,13 +636,13 @@ pub fn scanOne(allocator: std.mem.Allocator, home: []const u8, kind: McpAgent) S
         // override first, rather than reporting a shadowed .json as current.
         var jsonc_buf: [576]u8 = undefined;
         if (opencodeJsoncPath(&jsonc_buf, home)) |jsonc| {
-            if (readFileAlloc(allocator, jsonc, 512 * 1024)) |content| {
+            if (readFileAlloc(allocator, jsonc, max_config_bytes)) |content| {
                 defer allocator.free(content);
                 if (opencodeOverrideStatus(content, kind, allocator)) |status| return status;
             } else if (fileExists(jsonc)) return .none;
         }
         if (configPath(&path_buf, home, kind)) |path| {
-            if (readFileAlloc(allocator, path, 512 * 1024)) |content| {
+            if (readFileAlloc(allocator, path, max_config_bytes)) |content| {
                 defer allocator.free(content);
                 return opencodeHasPetdex(content, kind, allocator);
             }
@@ -486,7 +652,7 @@ pub fn scanOne(allocator: std.mem.Allocator, home: []const u8, kind: McpAgent) S
 
     if (kind == .devin) {
         if (configPath(&path_buf, home, kind)) |path| {
-            if (readFileAlloc(allocator, path, 512 * 1024)) |content| {
+            if (readFileAlloc(allocator, path, max_config_bytes)) |content| {
                 defer allocator.free(content);
                 const status = jsonHasPetdex(content, kind, allocator);
                 if (status == .current) return .current;
@@ -494,7 +660,7 @@ pub fn scanOne(allocator: std.mem.Allocator, home: []const u8, kind: McpAgent) S
         }
         var legacy_buf: [576]u8 = undefined;
         if (devinLegacyConfigPath(&legacy_buf, home)) |legacy| {
-            if (readFileAlloc(allocator, legacy, 512 * 1024)) |content| {
+            if (readFileAlloc(allocator, legacy, max_config_bytes)) |content| {
                 defer allocator.free(content);
                 return jsonHasPetdex(content, kind, allocator);
             }
@@ -503,7 +669,7 @@ pub fn scanOne(allocator: std.mem.Allocator, home: []const u8, kind: McpAgent) S
     }
 
     const path = configPath(&path_buf, home, kind) orelse return .none;
-    const content = readFileAlloc(allocator, path, 512 * 1024) orelse return .none;
+    const content = readFileAlloc(allocator, path, max_config_bytes) orelse return .none;
     defer allocator.free(content);
     return if (usesTomlMcp(kind)) tomlHasPetdex(content, kind) else jsonHasPetdex(content, kind, allocator);
 }
@@ -558,6 +724,10 @@ fn mergeJsonMcpServers(allocator: std.mem.Allocator, existing: ?[]const u8, kind
 }
 
 fn mergeOpencodeMcp(allocator: std.mem.Allocator, existing: ?[]const u8, kind: McpAgent) ?[]u8 {
+    return mergeOpencodeMcpWithSchema(allocator, existing, kind, .v1);
+}
+
+fn mergeOpencodeMcpWithSchema(allocator: std.mem.Allocator, existing: ?[]const u8, kind: McpAgent, fallback: OpenCodeSchema) ?[]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -574,15 +744,17 @@ fn mergeOpencodeMcp(allocator: std.mem.Allocator, existing: ?[]const u8, kind: M
     const mcp_entry = root.object.getOrPut(a, "mcp") catch return null;
     if (!mcp_entry.found_existing) {
         mcp_entry.value_ptr.* = .{ .object = std.json.ObjectMap.init(a, &.{}, &.{}) catch return null };
-        // New configs use current OpenCode V2. Existing V1 maps stay V1.
-        mcp_entry.value_ptr.object.put(a, "servers", .{ .object = std.json.ObjectMap.init(a, &.{}, &.{}) catch return null }) catch return null;
+        // Default to the stable OpenCode schema; retain V2 when already present.
     } else if (mcp_entry.value_ptr.* != .object) return null;
 
     var entry_buf: [1024]u8 = undefined;
     const entry_json = opencodeEntryJson(kind, &entry_buf) orelse return null;
     const entry_parsed = std.json.parseFromSlice(std.json.Value, a, entry_json, .{}) catch return null;
 
-    if (mcp_entry.value_ptr.object.getPtr("servers")) |servers| {
+    if ((opencodeSchema(mcp_entry.value_ptr.*) orelse fallback) == .v2) {
+        const servers_entry = mcp_entry.value_ptr.object.getOrPut(a, "servers") catch return null;
+        if (!servers_entry.found_existing) servers_entry.value_ptr.* = .{ .object = std.json.ObjectMap.init(a, &.{}, &.{}) catch return null };
+        const servers = servers_entry.value_ptr;
         if (servers.* != .object) return null;
         _ = mcp_entry.value_ptr.object.orderedRemove(server_name);
         // Removal may invalidate a map pointer; acquire it again.
@@ -626,10 +798,12 @@ fn stripOpencodePetdex(allocator: std.mem.Allocator, existing: []const u8) ?[]u8
     if (root.object.getPtr("mcp")) |mcp| {
         if (mcp.* == .object) {
             _ = mcp.object.orderedRemove(server_name);
-            if (mcp.object.getPtr("servers")) |servers| {
-                if (servers.* == .object) {
-                    _ = servers.object.orderedRemove(server_name);
-                    if (servers.object.count() == 0) _ = mcp.object.orderedRemove("servers");
+            if (opencodeSchema(mcp.*) == .v2) {
+                if (mcp.object.getPtr("servers")) |servers| {
+                    if (servers.* == .object) {
+                        _ = servers.object.orderedRemove(server_name);
+                        if (servers.object.count() == 0) _ = mcp.object.orderedRemove("servers");
+                    }
                 }
             }
             if (mcp.object.count() == 0) _ = root.object.orderedRemove("mcp");
@@ -640,42 +814,38 @@ fn stripOpencodePetdex(allocator: std.mem.Allocator, existing: []const u8) ?[]u8
 
 fn installJson(allocator: std.mem.Allocator, path: []const u8, kind: McpAgent) bool {
     if (!ensureParentDir(path)) return false;
-    const existing = readFileAlloc(allocator, path, 1024 * 1024);
+    const existing = readFileAlloc(allocator, path, max_config_bytes);
     defer if (existing) |e| allocator.free(e);
     if (existing == null and fileExists(path)) return false;
     const merged = mergeJsonMcpServers(allocator, existing, kind) orelse return false;
     defer allocator.free(merged);
-    if (existing) |_| backupBeside(path);
-    return writeFile(path, merged);
+    return replaceConfigFile(path, merged, existing != null);
 }
 
-fn installOpencodeJson(allocator: std.mem.Allocator, path: []const u8, kind: McpAgent) bool {
+fn installOpencodeJson(allocator: std.mem.Allocator, path: []const u8, kind: McpAgent, fallback: OpenCodeSchema) bool {
     if (!ensureParentDir(path)) return false;
-    const existing = readFileAlloc(allocator, path, 1024 * 1024);
+    const existing = readFileAlloc(allocator, path, max_config_bytes);
     defer if (existing) |e| allocator.free(e);
     if (existing == null and fileExists(path)) return false;
-    const merged = mergeOpencodeMcp(allocator, existing, kind) orelse return false;
+    const merged = mergeOpencodeMcpWithSchema(allocator, existing, kind, fallback) orelse return false;
     defer allocator.free(merged);
-    if (existing) |_| backupBeside(path);
-    return writeFile(path, merged);
+    return replaceConfigFile(path, merged, existing != null);
 }
 
 fn uninstallJson(allocator: std.mem.Allocator, path: []const u8, kind: McpAgent) bool {
-    const existing = readFileAlloc(allocator, path, 1024 * 1024) orelse return !fileExists(path);
+    const existing = readFileAlloc(allocator, path, max_config_bytes) orelse return !fileExists(path);
     defer allocator.free(existing);
     const stripped = stripJsonPetdex(allocator, existing, kind) orelse return false;
     defer allocator.free(stripped);
-    backupBeside(path);
-    return writeFile(path, stripped);
+    return replaceConfigFile(path, stripped, true);
 }
 
 fn uninstallOpencodeJson(allocator: std.mem.Allocator, path: []const u8) bool {
-    const existing = readFileAlloc(allocator, path, 1024 * 1024) orelse return !fileExists(path);
+    const existing = readFileAlloc(allocator, path, max_config_bytes) orelse return !fileExists(path);
     defer allocator.free(existing);
     const stripped = stripOpencodePetdex(allocator, existing) orelse return false;
     defer allocator.free(stripped);
-    backupBeside(path);
-    return writeFile(path, stripped);
+    return replaceConfigFile(path, stripped, true);
 }
 
 fn tomlMcpBlock(kind: McpAgent, buf: []u8) ?[]const u8 {
@@ -696,53 +866,39 @@ fn tomlMcpBlock(kind: McpAgent, buf: []u8) ?[]const u8 {
 
 fn stripTomlPetdex(out: *std.array_list.Managed(u8), content: []const u8) bool {
     out.clearRetainingCapacity();
-    var line_start: usize = 0;
-    var skipping = false;
-    while (line_start <= content.len) {
-        const relative_end = std.mem.indexOfScalar(u8, content[line_start..], '\n');
-        const line_end = if (relative_end) |end| line_start + end else content.len;
-        const line = content[line_start..line_end];
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len > 0 and trimmed[0] == '[') {
-            skipping = tomlTable(trimmed) != .other;
-        }
-        if (!skipping) {
-            out.appendSlice(line) catch return false;
-            if (relative_end != null) out.append('\n') catch return false;
-        }
-        if (relative_end == null) break;
-        line_start = line_end + 1;
+    var statements = TomlStatements{ .content = content };
+    while (statements.next() catch return false) |statement| {
+        if (!statement.table.owned()) out.appendSlice(statement.bytes) catch return false;
     }
     return true;
 }
 
 fn installTomlMcp(allocator: std.mem.Allocator, path: []const u8, kind: McpAgent) bool {
     if (!ensureParentDir(path)) return false;
-    const existing = readFileAlloc(allocator, path, 1024 * 1024);
+    const existing = readFileAlloc(allocator, path, max_config_bytes);
     defer if (existing) |e| allocator.free(e);
     if (existing == null and fileExists(path)) return false;
 
     var cleaned = std.array_list.Managed(u8).init(allocator);
     defer cleaned.deinit();
     if (existing) |content| {
+        if (tomlHasPetdex(content, kind) == .current) return true;
         if (!stripTomlPetdex(&cleaned, content)) return false;
     }
 
     var block_buf: [1024]u8 = undefined;
     const block = tomlMcpBlock(kind, &block_buf) orelse return false;
     cleaned.appendSlice(block) catch return false;
-    if (existing) |_| backupBeside(path);
-    return writeFile(path, cleaned.items);
+    return replaceConfigFile(path, cleaned.items, existing != null);
 }
 
 fn uninstallTomlMcp(allocator: std.mem.Allocator, path: []const u8) bool {
-    const existing = readFileAlloc(allocator, path, 1024 * 1024) orelse return !fileExists(path);
+    const existing = readFileAlloc(allocator, path, max_config_bytes) orelse return !fileExists(path);
     defer allocator.free(existing);
     var cleaned = std.array_list.Managed(u8).init(allocator);
     defer cleaned.deinit();
     if (!stripTomlPetdex(&cleaned, existing)) return false;
-    backupBeside(path);
-    return writeFile(path, cleaned.items);
+    return replaceConfigFile(path, cleaned.items, true);
 }
 
 /// Keep the stable launch path on the desktop's bundled version after upgrades.
@@ -774,7 +930,20 @@ pub fn install(allocator: std.mem.Allocator, home: []const u8, kind: McpAgent) b
             var jsonc_buf: [576]u8 = undefined;
             const jsonc = opencodeJsoncPath(&jsonc_buf, home) orelse break :blk false;
             // JSONC wins when both exist in OpenCode. Never create a shadow file.
-            break :blk installOpencodeJson(allocator, if (fileExists(jsonc)) jsonc else path, kind);
+            const has_jsonc = fileExists(jsonc);
+            var schema: OpenCodeSchema = .v1;
+            if (has_jsonc and fileExists(path)) {
+                const inherited = readFileAlloc(allocator, path, max_config_bytes) orelse break :blk false;
+                defer allocator.free(inherited);
+                var parsed = parseJsonc(allocator, inherited) catch break :blk false;
+                defer parsed.deinit();
+                if (parsed.value != .object) break :blk false;
+                if (parsed.value.object.get("mcp")) |mcp| {
+                    if (mcp != .object) break :blk false;
+                    schema = opencodeSchema(mcp) orelse .v1;
+                }
+            }
+            break :blk installOpencodeJson(allocator, if (has_jsonc) jsonc else path, kind, schema);
         },
         else => blk: {
             const path = configPath(&path_buf, home, kind) orelse break :blk false;
@@ -856,6 +1025,202 @@ test "json merge keeps foreign servers" {
     try t.expect(std.mem.indexOf(u8, merged, "\"petdex\"") != null);
     try t.expect(std.mem.indexOf(u8, merged, "PETDEX_MCP_AGENT") != null);
     try t.expect(std.mem.indexOf(u8, merged, "junie") != null);
+}
+
+test "TOML MCP updates preserve quoted foreign names and multiline values" {
+    const t = std.testing;
+    const foreign =
+        \\instructions = '''
+        \\[mcp_servers.petdex]
+        \\This is documentation, not a server.
+        \\'''
+        \\[mcp_servers."petdex.helper"]
+        \\command = "keep-me"
+        \\[mcp_servers.'petdex.backup'.env]
+        \\VALUE = "untouched"
+        \\
+    ;
+    var cleaned = std.array_list.Managed(u8).init(t.allocator);
+    defer cleaned.deinit();
+    try t.expect(stripTomlPetdex(&cleaned, foreign));
+    try t.expectEqualStrings(foreign, cleaned.items);
+    const source = try std.fmt.allocPrint(t.allocator, "{s}[mcp_servers.petdex]\nargs = [\n  [\"nested\"],\n]\n[mcp_servers.petdex.env]\nPETDEX_MCP_AGENT = \"old\"\n", .{foreign});
+    defer t.allocator.free(source);
+    try t.expect(stripTomlPetdex(&cleaned, source));
+    try t.expectEqualStrings(foreign, cleaned.items);
+}
+
+test "TOML MCP detection does not find a server inside documentation" {
+    const t = std.testing;
+    var buf: [1024]u8 = undefined;
+    const source = try std.fmt.allocPrint(t.allocator, "instructions = '''{s}'''\n", .{tomlMcpBlock(.codex, &buf).?});
+    defer t.allocator.free(source);
+    try t.expectEqual(Status.none, tomlHasPetdex(source, .codex));
+}
+
+test "TOML MCP edits refuse ambiguous or incomplete syntax without changing the file" {
+    const t = std.testing;
+    const home = ".zig-cache/petdex-mcp-toml-safe";
+    _ = plat.deleteTree(home);
+    defer _ = plat.deleteTree(home);
+    const path = home ++ "/.codex/config.toml";
+    for ([_][]const u8{
+        "instructions = '''unfinished\n[mcp_servers.petdex]\n",
+        "mcp_servers = { petdex = { command = \"custom\" } }\n",
+        "[mcp_servers]\npetdex.command = \"custom\"\n",
+        "mcp_servers.petdex.command = \"custom\"\n",
+        "[mcp_servers.\"pet\\u0064ex\"]\ncommand = \"custom\"\n",
+    }) |source| {
+        try t.expect(writeFile(path, source));
+        try t.expect(!install(t.allocator, home, .codex));
+        try t.expect(!uninstall(t.allocator, home, .codex));
+        const unchanged = readFileAlloc(t.allocator, path, 1024).?;
+        defer t.allocator.free(unchanged);
+        try t.expectEqualStrings(source, unchanged);
+    }
+}
+
+test "new OpenCode configs use the stable V1 schema" {
+    const t = std.testing;
+    const merged = mergeOpencodeMcp(t.allocator, null, .opencode).?;
+    defer t.allocator.free(merged);
+    var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, merged, .{});
+    defer parsed.deinit();
+    const mcp = parsed.value.object.get("mcp").?.object;
+    try t.expect(mcp.get("servers") == null);
+    try t.expect(mcp.get("petdex") != null);
+}
+
+test "OpenCode preserves a V1 server named servers" {
+    const t = std.testing;
+    const source = "{\"mcp\":{\"servers\":{\"type\":\"local\",\"command\":[\"foreign\"]}}}";
+    const merged = mergeOpencodeMcp(t.allocator, source, .opencode).?;
+    defer t.allocator.free(merged);
+    var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, merged, .{});
+    defer parsed.deinit();
+    const mcp = parsed.value.object.get("mcp").?.object;
+    try t.expect(mcp.get("petdex") != null);
+    try t.expect(mcp.get("servers").?.object.get("petdex") == null);
+    try t.expectEqual(Status.current, opencodeHasPetdex(merged, .opencode, t.allocator));
+    const removed = stripOpencodePetdex(t.allocator, merged).?;
+    defer t.allocator.free(removed);
+    try t.expect(std.mem.indexOf(u8, removed, "foreign") != null);
+}
+
+test "OpenCode V2 recognizes timeout-only configs and a server named type" {
+    const t = std.testing;
+    for ([_][]const u8{
+        "{\"mcp\":{\"timeout\":{\"startup\":45000}}}",
+        "{\"mcp\":{\"servers\":{\"type\":{\"type\":\"local\",\"command\":[\"foreign\"]}}}}",
+    }) |source| {
+        const merged = mergeOpencodeMcp(t.allocator, source, .opencode).?;
+        defer t.allocator.free(merged);
+        var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, merged, .{});
+        defer parsed.deinit();
+        const mcp = parsed.value.object.get("mcp").?.object;
+        try t.expect(mcp.get("petdex") == null);
+        try t.expect(mcp.get("servers").?.object.get("petdex") != null);
+        try t.expectEqual(Status.current, opencodeHasPetdex(merged, .opencode, t.allocator));
+        const removed = stripOpencodePetdex(t.allocator, merged).?;
+        defer t.allocator.free(removed);
+        try t.expectEqual(Status.none, opencodeHasPetdex(removed, .opencode, t.allocator));
+    }
+}
+
+test "OpenCode JSONC updates retain the inherited V1 or V2 schema" {
+    const t = std.testing;
+    const home = ".zig-cache/petdex-mcp-jsonc-inherited-schema";
+    defer _ = plat.deleteTree(home);
+    for ([_][]const u8{
+        "{\"mcp\":{\"foreign\":{\"type\":\"local\",\"command\":[\"keep\"]}}}",
+        "{\"mcp\":{\"servers\":{\"foreign\":{\"type\":\"local\",\"command\":[\"keep\"]}}}}",
+    }, 0..) |source, index| {
+        _ = plat.deleteTree(home);
+        const json = home ++ "/.config/opencode/opencode.json";
+        const jsonc = home ++ "/.config/opencode/opencode.jsonc";
+        try t.expect(writeFile(json, source));
+        try t.expect(writeFile(jsonc, "{\"model\":\"unchanged\"}"));
+        try t.expect(install(t.allocator, home, .opencode));
+        try t.expectEqual(Status.current, scanOne(t.allocator, home, .opencode));
+        const updated = readFileAlloc(t.allocator, jsonc, 8192).?;
+        defer t.allocator.free(updated);
+        var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, updated, .{});
+        defer parsed.deinit();
+        const mcp = parsed.value.object.get("mcp").?.object;
+        try t.expectEqual(index == 1, mcp.get("servers") != null);
+        try t.expectEqual(index == 0, mcp.get("petdex") != null);
+        const original = readFileAlloc(t.allocator, json, 8192).?;
+        defer t.allocator.free(original);
+        try t.expectEqualStrings(source, original);
+    }
+}
+
+test "MCP config writes require a usable backup and keep credentials private" {
+    const t = std.testing;
+    const home = ".zig-cache/petdex-mcp-backup-failure";
+    _ = plat.deleteTree(home);
+    defer _ = plat.deleteTree(home);
+    for ([_]McpAgent{ .codex, .cursor, .opencode }) |kind| {
+        var path_buf: [576]u8 = undefined;
+        const path = configPath(&path_buf, home, kind).?;
+        var backup_buf: [600]u8 = undefined;
+        const backup = try std.fmt.bufPrint(&backup_buf, "{s}.petdex-bak", .{path});
+        const original = if (kind == .codex) "model = \"keep\"\n" else "{\"private_value\":\"keep\"}";
+        try t.expect(writeFile(path, original));
+        plat.makeDir(backup);
+        try t.expect(!install(t.allocator, home, kind));
+        try t.expect(!uninstall(t.allocator, home, kind));
+        const unchanged = readFileAlloc(t.allocator, path, 1024).?;
+        defer t.allocator.free(unchanged);
+        try t.expectEqualStrings(original, unchanged);
+        try t.expect(plat.deleteTree(backup));
+        try t.expect(install(t.allocator, home, kind));
+        if (@import("builtin").os.tag != .windows) {
+            var scope = plat.Scope.init();
+            defer scope.deinit();
+            for ([_][]const u8{ path, backup }) |private_path| {
+                const stat = try std.Io.Dir.cwd().statFile(scope.io(), private_path, .{});
+                try t.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+            }
+        }
+    }
+}
+
+test "TOML MCP reinstall is byte-for-byte idempotent" {
+    const t = std.testing;
+    const home = ".zig-cache/petdex-mcp-toml-idempotent";
+    _ = plat.deleteTree(home);
+    defer _ = plat.deleteTree(home);
+    try t.expect(install(t.allocator, home, .codex));
+    const path = home ++ "/.codex/config.toml";
+    const first = readFileAlloc(t.allocator, path, 8192).?;
+    defer t.allocator.free(first);
+    try t.expect(install(t.allocator, home, .codex));
+    const second = readFileAlloc(t.allocator, path, 8192).?;
+    defer t.allocator.free(second);
+    try t.expectEqualStrings(first, second);
+}
+
+test "large MCP configs stay detectable and cannot grow beyond the read limit" {
+    const t = std.testing;
+    const home = ".zig-cache/petdex-mcp-size-boundary";
+    _ = plat.deleteTree(home);
+    defer _ = plat.deleteTree(home);
+    const path = home ++ "/.codex/config.toml";
+    const source = try t.allocator.alloc(u8, max_config_bytes);
+    defer t.allocator.free(source);
+    @memset(source, ' ');
+    const marker = "model = \"preserved\"\n";
+    @memcpy(source[0..marker.len], marker);
+    try t.expect(writeFile(path, source[0 .. 700 * 1024]));
+    try t.expect(install(t.allocator, home, .codex));
+    try t.expectEqual(Status.current, scanOne(t.allocator, home, .codex));
+    try t.expect(uninstall(t.allocator, home, .codex));
+    try t.expect(writeFile(path, source));
+    try t.expect(!install(t.allocator, home, .codex));
+    const unchanged = readFileAlloc(t.allocator, path, max_config_bytes).?;
+    defer t.allocator.free(unchanged);
+    try t.expectEqualStrings(source, unchanged);
 }
 
 test "codex toml install and uninstall roundtrip" {
