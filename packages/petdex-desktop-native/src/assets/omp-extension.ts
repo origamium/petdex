@@ -109,6 +109,7 @@ async function notify({
   const bubbleBody: Record<string, unknown> = {
     text,
     agent_source: AGENT_SOURCE,
+    agent_state: state,
   };
   if (sessionId) {
     stateBody.session_id = sessionId;
@@ -179,6 +180,10 @@ type ToolResultEvent = {
   isError: boolean;
 };
 type InputEvent = { text: string };
+type AgentEndEvent = {
+  willContinue?: boolean;
+  messages?: Array<{ role?: string; stopReason?: string }>;
+};
 
 type ExtensionAPI = {
   on(
@@ -220,7 +225,9 @@ export default function petdex(pi: ExtensionAPI): void {
     await notify({
       state: "jumping",
       duration: 900,
-      busy: false,
+      text: "Thinking…",
+      title: titleFor(sessionId),
+      busy: true,
       sessionId,
     });
   }) as never);
@@ -248,7 +255,7 @@ export default function petdex(pi: ExtensionAPI): void {
         duration: 2500,
         text: `${describeTool(event?.toolName ?? "", event?.input ?? {}, true)} failed`,
         title: titleFor(sessionId),
-        busy: false,
+        busy: true,
         sessionId,
       });
       return;
@@ -273,12 +280,49 @@ export default function petdex(pi: ExtensionAPI): void {
     });
   }) as never);
 
-  pi.on("agent_end", (async (_event, ctx) => {
-    const sessionId = sessionIdFor(ctx);
+  pi.on("tool_approval_resolved", (async (event: SessionEvent, ctx) => {
+    const sessionId = sessionIdFor(ctx, event);
     await notify({
-      state: "waving",
+      state: "running",
+      text: "Continuing…",
+      title: titleFor(sessionId),
+      busy: true,
+      sessionId,
+    });
+  }) as never);
+
+  pi.on("agent_end", (async (event: AgentEndEvent, ctx) => {
+    const sessionId = sessionIdFor(ctx);
+    // OMP explicitly marks retries/continuations as non-terminal. A failed
+    // request scheduled to retry must not produce a misleading Done bubble.
+    if (event?.willContinue) {
+      await notify({
+        state: "running",
+        text: "Continuing…",
+        title: titleFor(sessionId),
+        busy: true,
+        sessionId,
+      });
+      return;
+    }
+    const reason = Array.isArray(event?.messages)
+      ? event.messages.findLast((message) => message?.role === "assistant")
+          ?.stopReason
+      : undefined;
+    await notify({
+      state:
+        reason === "error"
+          ? "failed"
+          : reason === "aborted"
+            ? "idle"
+            : "waving",
       duration: 1500,
-      text: "Done.",
+      text:
+        reason === "error"
+          ? "Stopped with an error"
+          : reason === "aborted"
+            ? "Cancelled."
+            : "Done.",
       title: titleFor(sessionId),
       busy: false,
       sessionId,
@@ -287,7 +331,12 @@ export default function petdex(pi: ExtensionAPI): void {
 
   pi.on("session_shutdown", (async (_event, ctx) => {
     const sessionId = sessionIdFor(ctx);
-    await notify({ state: "idle", busy: false, sessionId });
+    await notify({
+      state: "idle",
+      text: "Session ended.",
+      busy: false,
+      sessionId,
+    });
     prompts.delete(promptKey(sessionId));
   }) as never);
 

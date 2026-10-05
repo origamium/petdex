@@ -14,6 +14,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const plat = @import("plat.zig");
 const dsh_integration = @import("dsh_integration.zig");
+const agent_mcp = @import("agent_mcp.zig");
 
 pub const AgentKind = enum(u8) {
     claude_code,
@@ -34,6 +35,17 @@ pub const AgentKind = enum(u8) {
     // DSH Web is macOS-only in the first integration slice. Appended so the
     // existing icon atlas indices remain stable.
     dsh,
+    // Host-specific lifecycle schemas. Appended to preserve atlas indices.
+    cursor,
+    junie,
+    antigravity,
+    // Devin CLI / Grok CLI follow in the same stable atlas order.
+    devin,
+    grok,
+    copilot,
+    windsurf,
+    amp,
+    droid,
 
     pub fn displayName(self: AgentKind) []const u8 {
         return switch (self) {
@@ -47,6 +59,15 @@ pub const AgentKind = enum(u8) {
             .omp => "OMP",
             .hermes => "Hermes",
             .dsh => "DeepSeek Harness",
+            .cursor => "Cursor",
+            .junie => "Junie",
+            .antigravity => "Antigravity",
+            .devin => "Devin",
+            .grok => "Grok",
+            .copilot => "Copilot CLI",
+            .windsurf => "Windsurf / Devin Desktop",
+            .amp => "Amp",
+            .droid => "Droid",
         };
     }
 
@@ -62,6 +83,34 @@ pub const AgentKind = enum(u8) {
             .omp => "omp",
             .hermes => "hermes",
             .dsh => "dsh",
+            .cursor => "cursor",
+            .junie => "junie",
+            .antigravity => "antigravity",
+            .devin => "devin",
+            .grok => "grok",
+            .copilot => "copilot",
+            .windsurf => "windsurf",
+            .amp => "amp",
+            .droid => "droid",
+        };
+    }
+
+    pub fn mcpKind(self: AgentKind) ?agent_mcp.McpAgent {
+        return switch (self) {
+            .claude_code => .claude_code,
+            .codex => .codex,
+            .gemini => .gemini,
+            .opencode => .opencode,
+            .cursor => .cursor,
+            .junie => .junie,
+            .antigravity => .antigravity,
+            .devin => .devin,
+            .grok => .grok,
+            .copilot => .copilot,
+            .windsurf => .windsurf,
+            .amp => .amp,
+            .droid => .droid,
+            else => null,
         };
     }
 };
@@ -80,32 +129,30 @@ pub const HookStatus = enum(u8) {
 pub const AgentInfo = struct {
     kind: AgentKind,
     status: HookStatus = .absent,
+    mcp_status: ?agent_mcp.Status = null,
+
+    pub fn needsMcpSetup(self: AgentInfo) bool {
+        return if (self.mcp_status) |status| status != .current else false;
+    }
 };
 
-pub const agent_count = 10;
+pub const agent_count = @typeInfo(AgentKind).@"enum".fields.len;
 
 /// Claude Code keeps everything under ~/.claude unless CLAUDE_CONFIG_DIR
 /// points elsewhere — that env var is how people run several fully
 /// isolated Claude Code installs (separate settings, separate accounts)
 /// on one machine. Resolving it here means detection, install, refresh,
 /// and uninstall all target the instance the user actually launches
-/// instead of always the default one (#601). Snapshot set once from
-/// main()'s environ_map, the same pattern as env_home: Zig 0.16 has no
-/// global getenv.
-pub var env_claude_config_dir: ?[]const u8 = null;
-
+/// instead of always the default one (#601). The env snapshot lives in
+/// agent_mcp so MCP and hook paths can never disagree.
 fn claudeConfigDir(buf: []u8, home: []const u8) ?[]const u8 {
-    if (env_claude_config_dir) |dir| {
-        if (dir.len != 0) return std.fmt.bufPrint(buf, "{s}", .{dir}) catch null;
-    }
-    return std.fmt.bufPrint(buf, "{s}/.claude", .{home}) catch null;
+    return agent_mcp.presenceDir(buf, home, .claude_code);
 }
 
 fn claudeSettingsPath(buf: []u8, home: []const u8) ?[]const u8 {
-    if (env_claude_config_dir) |dir| {
-        if (dir.len != 0) return std.fmt.bufPrint(buf, "{s}/settings.json", .{dir}) catch null;
-    }
-    return std.fmt.bufPrint(buf, "{s}/.claude/settings.json", .{home}) catch null;
+    var dir_buf: [512]u8 = undefined;
+    const dir = claudeConfigDir(&dir_buf, home) orelse return null;
+    return std.fmt.bufPrint(buf, "{s}/settings.json", .{dir}) catch null;
 }
 
 /// `*_CONFIG_DIR` is a complete root path, like CLAUDE_CONFIG_DIR; `*_CLI_HOME`
@@ -224,7 +271,7 @@ fn qoderStatus(allocator: std.mem.Allocator, home: []const u8) HookStatus {
         const status = blk: {
             const content = readFileAlloc(allocator, path, 512 * 1024) orelse break :blk HookStatus.none;
             defer allocator.free(content);
-            break :blk classifyConfig(allocator, content);
+            break :blk lifecycleConfigStatus(allocator, content, .qoder);
         };
         folded = if (folded) |f| worseStatus(f, status) else status;
     }
@@ -265,26 +312,47 @@ const codex_events = [_]HookEvent{
     .{ .event = "Stop", .phase = "stop" },
 };
 
-/// Build the canonical hook command for one shell family. Unix keeps the
-/// bounded stdin drain in the shell wrapper; Windows delegates that work to
-/// the native runner through a regular .cmd launcher, because cmd.exe cannot
-/// parse POSIX tests, redirections, or `exec`.
+/// Build the canonical hook command for one shell family. The native runner
+/// owns bounded stdin consumption and the killswitch: a shell `cat` would
+/// wait forever when a host keeps its pipe open after sending a complete JSON
+/// payload. A missing runner exits immediately (the host may observe EPIPE).
 fn canonicalCommandForTarget(buf: []u8, phase: []const u8, agent: []const u8, windows: bool) ?[]const u8 {
     if (windows) {
         return std.fmt.bufPrint(
             buf,
-            "if exist \"%HOME%\\.petdex\\bin\\petdex-hook.cmd\" (call \"%HOME%\\.petdex\\bin\\petdex-hook.cmd\" bubble {s} {s}) else if exist \"%USERPROFILE%\\.petdex\\bin\\petdex-hook.cmd\" (call \"%USERPROFILE%\\.petdex\\bin\\petdex-hook.cmd\" bubble {s} {s}) & exit /b 0",
+            "if exist \"%HOME%\\.petdex\\bin\\petdex-hook.cmd\" (call \"%HOME%\\.petdex\\bin\\petdex-hook.cmd\" bubble {s} {s} >nul 2>&1) else if exist \"%USERPROFILE%\\.petdex\\bin\\petdex-hook.cmd\" (call \"%USERPROFILE%\\.petdex\\bin\\petdex-hook.cmd\" bubble {s} {s} >nul 2>&1) & exit /b 0",
             .{ phase, agent, phase, agent },
         ) catch null;
     }
     return std.fmt.bufPrint(
         buf,
-        "if [ -f \"$HOME/.petdex/runtime/hooks-disabled\" ]; then [ -t 0 ] || cat >/dev/null; exit 0; fi; if [ -x \"$HOME/.petdex/bin/petdex-hook\" ]; then exec \"$HOME/.petdex/bin/petdex-hook\" bubble {s} {s}; fi; [ -t 0 ] || cat >/dev/null; exit 0",
+        "if [ -x \"$HOME/.petdex/bin/petdex-hook\" ]; then \"$HOME/.petdex/bin/petdex-hook\" bubble {s} {s} >/dev/null 2>&1 || :; fi; exit 0",
         .{ phase, agent },
     ) catch null;
 }
 
+fn powershellCommand(buf: []u8, phase: []const u8, agent: []const u8) ?[]const u8 {
+    // With no pipeline input PowerShell lets the child inherit stdin. Never
+    // ReadToEnd here: only the native reader can enforce the stdin deadline.
+    // Catch invocation failures as well as suppressing native decision output.
+    return std.fmt.bufPrint(buf, "try {{if(Test-Path -LiteralPath \"$env:HOME/.petdex/bin/petdex-hook.cmd\"){{& \"$env:HOME/.petdex/bin/petdex-hook.cmd\" bubble {s} {s} *> $null}} elseif(Test-Path -LiteralPath \"$env:USERPROFILE/.petdex/bin/petdex-hook.cmd\"){{& \"$env:USERPROFILE/.petdex/bin/petdex-hook.cmd\" bubble {s} {s} *> $null}}}} catch {{}}; exit 0", .{ phase, agent, phase, agent }) catch null;
+}
+
 pub fn canonicalCommand(buf: []u8, phase: []const u8, agent: []const u8) ?[]const u8 {
+    if (builtin.os.tag == .windows and (std.mem.eql(u8, agent, "copilot") or std.mem.eql(u8, agent, "windsurf"))) {
+        // These hosts run PowerShell, not cmd.exe. Always finish with success
+        // and no decision output so notification failures cannot deny tools.
+        return powershellCommand(buf, phase, agent);
+    }
+    if (std.mem.eql(u8, agent, "cursor")) {
+        // Cursor expects JSON even if the notification runner is unavailable.
+        // No permission hooks are installed and no permission decision is sent.
+        const response: []const u8 = if (std.mem.eql(u8, phase, "user-prompt")) "{\"continue\":true}" else "{}";
+        if (builtin.os.tag == .windows) return std.fmt.bufPrint(buf, "if exist \"%HOME%\\.petdex\\bin\\petdex-hook.cmd\" (call \"%HOME%\\.petdex\\bin\\petdex-hook.cmd\" bubble {s} cursor >nul 2>&1) else if exist \"%USERPROFILE%\\.petdex\\bin\\petdex-hook.cmd\" (call \"%USERPROFILE%\\.petdex\\bin\\petdex-hook.cmd\" bubble {s} cursor >nul 2>&1) & echo {s}& exit /b 0", .{ phase, phase, response }) catch null;
+        var inner: [512]u8 = undefined;
+        const command = canonicalCommandForTarget(&inner, phase, agent, false) orelse return null;
+        return std.fmt.bufPrint(buf, "({s}); printf '%s\\n' '{s}'", .{ command, response }) catch null;
+    }
     return canonicalCommandForTarget(buf, phase, agent, builtin.os.tag == .windows);
 }
 
@@ -325,6 +393,8 @@ fn containsPetdexHomePath(command: []const u8, relative_path: []const u8) bool {
         "%USERPROFILE%/.petdex",
         "%USERPROFILE%\\.petdex",
         "%HOMEDRIVE%%HOMEPATH%\\.petdex",
+        "$env:USERPROFILE/.petdex",
+        "$env:HOME/.petdex",
     };
     var path_buf: [128]u8 = undefined;
     for (homes) |home| {
@@ -336,6 +406,8 @@ fn containsPetdexHomePath(command: []const u8, relative_path: []const u8) bool {
 
 fn containsWindowsPetdexHomePath(command: []const u8, relative_path: []const u8) bool {
     const homes = [_][]const u8{
+        "$env:USERPROFILE/.petdex",
+        "$env:HOME/.petdex",
         "%HOME%/.petdex",
         "%HOME%\\.petdex",
         "%USERPROFILE%/.petdex",
@@ -494,7 +566,19 @@ const fileExists = plat.fileExists;
 const writeFile = plat.writeFile;
 
 fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max: usize) ?[]u8 {
-    return plat.readFileAlloc(allocator, path, max);
+    // The platform reader returns a bounded prefix. Editing that prefix would
+    // discard the remainder of a larger, otherwise valid config or backup.
+    const bytes = plat.readFileAlloc(allocator, path, max + 1) orelse {
+        if (plat.fileSize(path)) |size| {
+            if (size == 0) return allocator.alloc(u8, 0) catch null;
+        }
+        return null;
+    };
+    if (bytes.len > max) {
+        allocator.free(bytes);
+        return null;
+    }
+    return bytes;
 }
 
 /// One-time backup beside the file we are about to edit.
@@ -519,6 +603,15 @@ pub fn scan(allocator: std.mem.Allocator, home: []const u8) [agent_count]AgentIn
         .{ .kind = .omp },
         .{ .kind = .hermes },
         .{ .kind = .dsh },
+        .{ .kind = .cursor },
+        .{ .kind = .junie },
+        .{ .kind = .antigravity },
+        .{ .kind = .devin },
+        .{ .kind = .grok },
+        .{ .kind = .copilot },
+        .{ .kind = .windsurf },
+        .{ .kind = .amp },
+        .{ .kind = .droid },
     };
     // Several roots behind one row: cannot ride the single-dir/single-config
     // shape below, so it is resolved up front. The arms `continue` rather than
@@ -526,7 +619,11 @@ pub fn scan(allocator: std.mem.Allocator, home: []const u8) [agent_count]AgentIn
     // panicking in release.
     out[@intFromEnum(AgentKind.qoder)].status = qoderStatus(allocator, home);
     var path: [512]u8 = undefined;
+    // Separate scratch: cfg arms format into `path` while reading `dir`,
+    // so `dir` must not alias it.
+    var dir_buf: [512]u8 = undefined;
     for (&out) |*info| {
+        if (info.kind.mcpKind()) |kind| info.mcp_status = agent_mcp.scanOne(allocator, home, kind);
         if (info.kind == .dsh) {
             if (builtin.os.tag != .macos) continue;
             info.status = switch (dsh_integration.detect(allocator, home)) {
@@ -537,56 +634,50 @@ pub fn scan(allocator: std.mem.Allocator, home: []const u8) [agent_count]AgentIn
             };
             continue;
         }
+        if (info.kind == .cursor or info.kind == .junie or info.kind == .antigravity or info.kind == .devin or info.kind == .grok or info.kind == .copilot or info.kind == .windsurf or info.kind == .amp or info.kind == .droid) {
+            info.status = lifecycleStatus(allocator, home, info.kind);
+            continue;
+        }
         if (info.kind == .hermes and builtin.os.tag == .windows) continue;
+        if (info.kind == .cursor or info.kind == .junie or info.kind == .antigravity or info.kind == .devin or info.kind == .grok or info.kind == .copilot or info.kind == .windsurf or info.kind == .amp or info.kind == .droid) continue;
         const dir = switch (info.kind) {
-            .claude_code => claudeConfigDir(&path, home) orelse continue,
-            .codex => std.fmt.bufPrint(&path, "{s}/.codex", .{home}) catch continue,
-            .gemini => std.fmt.bufPrint(&path, "{s}/.gemini", .{home}) catch continue,
-            .opencode => std.fmt.bufPrint(&path, "{s}/.config/opencode", .{home}) catch continue,
+            .claude_code => claudeConfigDir(&dir_buf, home) orelse continue,
+            .codex => agent_mcp.presenceDir(&dir_buf, home, .codex) orelse continue,
+            .gemini => agent_mcp.presenceDir(&dir_buf, home, .gemini) orelse continue,
+            .opencode => agent_mcp.presenceDir(&dir_buf, home, .opencode) orelse continue,
             .qoder => continue,
-            .kimi_code => kimiConfigDir(&path, home) orelse continue,
-            .codebuddy => std.fmt.bufPrint(&path, "{s}/.codebuddy", .{home}) catch continue,
-            .omp => ompAgentDir(&path, home) orelse continue,
-            .hermes => hermesHome(&path, home) orelse continue,
-            .dsh => unreachable,
+            .kimi_code => kimiConfigDir(&dir_buf, home) orelse continue,
+            .codebuddy => std.fmt.bufPrint(&dir_buf, "{s}/.codebuddy", .{home}) catch continue,
+            .omp => ompAgentDir(&dir_buf, home) orelse continue,
+            .hermes => hermesHome(&dir_buf, home) orelse continue,
+            .dsh, .cursor, .junie, .antigravity, .devin, .grok, .copilot, .windsurf, .amp, .droid => unreachable,
         };
         if (!dirExists(dir)) continue;
         info.status = .none;
         const cfg = switch (info.kind) {
             .claude_code => claudeSettingsPath(&path, home) orelse continue,
-            .codex => std.fmt.bufPrint(&path, "{s}/.codex/hooks.json", .{home}) catch continue,
-            .gemini => std.fmt.bufPrint(&path, "{s}/.gemini/settings.json", .{home}) catch continue,
-            .opencode => std.fmt.bufPrint(&path, "{s}/.config/opencode/plugins/petdex.js", .{home}) catch continue,
+            .codex => std.fmt.bufPrint(&path, "{s}/hooks.json", .{dir}) catch continue,
+            .gemini => std.fmt.bufPrint(&path, "{s}/settings.json", .{dir}) catch continue,
+            .opencode => std.fmt.bufPrint(&path, "{s}/plugins/petdex.js", .{dir}) catch continue,
             .qoder => continue,
             .kimi_code => kimiConfigPath(&path, home) orelse continue,
             .codebuddy => std.fmt.bufPrint(&path, "{s}/.codebuddy/settings.json", .{home}) catch continue,
             .omp => ompExtensionPath(&path, home) orelse continue,
             .hermes => hermesConfigPath(&path, home) orelse continue,
-            .dsh => unreachable,
+            .dsh, .cursor, .junie, .antigravity, .devin, .grok, .copilot, .windsurf, .amp, .droid => unreachable,
         };
         if (readFileAlloc(allocator, cfg, 512 * 1024)) |content| {
             defer allocator.free(content);
-            // The opencode plugin never touches a runner: a current
-            // snapshot means connected, anything else shows as
-            // outdated so Update can refresh it.
+            // OpenCode posts from its event plugin; compare the entire asset.
             if (info.kind == .opencode) {
-                info.status = if (std.mem.eql(u8, std.mem.trim(u8, content, " \n"), std.mem.trim(u8, opencode_plugin, " \n"))) .current else .node;
+                info.status = if (std.mem.eql(u8, content, opencode_plugin)) .current else .node;
             } else if (info.kind == .omp) {
                 // Same rule as the opencode plugin: this is a whole file we
                 // own, so a byte-identical copy is connected and anything
                 // else is an older build that Update refreshes.
                 info.status = if (std.mem.eql(u8, std.mem.trim(u8, content, " \n"), std.mem.trim(u8, omp_extension, " \n"))) .current else .node;
             } else if (info.kind == .kimi_code) {
-                // TOML, so the JSON classifier cannot read it. Substring
-                // matching is enough here: `petdex-hook` is the current
-                // runner and `petdex.js` is the legacy node one, and both
-                // only ever appear inside a command we wrote.
-                info.status = if (std.mem.indexOf(u8, content, "petdex-hook") != null)
-                    .current
-                else if (std.mem.indexOf(u8, content, "petdex") != null)
-                    .node
-                else
-                    .none;
+                info.status = kimiConfigStatus(allocator, content);
             } else if (info.kind == .hermes) {
                 const hooks = scanHermesHooks(content);
                 const plugin_enabled = isHermesDesktopPluginEnabled(content);
@@ -611,7 +702,17 @@ pub fn scan(allocator: std.mem.Allocator, home: []const u8) [agent_count]AgentIn
                 if (!std.mem.eql(u8, std.mem.trim(u8, installed, " \n"), std.mem.trim(u8, hermes_desktop_plugin_init, " \n"))) continue;
                 info.status = .current;
             } else {
-                info.status = classifyConfig(allocator, content);
+                info.status = lifecycleConfigStatus(allocator, content, info.kind);
+                if (info.kind == .codex and info.status == .current) {
+                    var toml_buf: [512]u8 = undefined;
+                    const toml_path = std.fmt.bufPrint(&toml_buf, "{s}/config.toml", .{dir}) catch continue;
+                    const toml = readFileAlloc(allocator, toml_path, 1024 * 1024) orelse {
+                        info.status = .node;
+                        continue;
+                    };
+                    defer allocator.free(toml);
+                    if (inspectFeatureHooks(toml).state != .enabled) info.status = .node;
+                }
             }
         }
     }
@@ -632,6 +733,7 @@ const HookEvent = struct { event: []const u8, phase: []const u8 };
 pub fn installClaude(allocator: std.mem.Allocator, home: []const u8) bool {
     var path_buf: [512]u8 = undefined;
     const path = claudeSettingsPath(&path_buf, home) orelse return false;
+    plat.makeDir(std.fs.path.dirname(path) orelse return false);
     return installJsonHooks(allocator, path, &claude_events, "claude-code", 2, false);
 }
 
@@ -700,6 +802,7 @@ pub fn uninstallClaudeStatusline(allocator: std.mem.Allocator, home: []const u8)
     var path_buf: [512]u8 = undefined;
     const path = claudeSettingsPath(&path_buf, home) orelse return false;
     const existing = readFileAlloc(allocator, path, 1024 * 1024) orelse {
+        if (fileExists(path)) return false;
         plat.deleteFile(saved_path);
         return true;
     };
@@ -715,9 +818,10 @@ pub fn uninstallClaudeStatusline(allocator: std.mem.Allocator, home: []const u8)
         plat.deleteFile(saved_path);
         return true;
     }
-    const saved = readFileAlloc(allocator, saved_path, 64 * 1024);
-    defer if (saved) |s| allocator.free(s);
-    const original: std.json.Value = if (saved) |s| std.json.parseFromSliceLeaky(std.json.Value, a, s, .{}) catch .null else .null;
+    const saved = readFileAlloc(allocator, saved_path, 1024 * 1024) orelse return false;
+    defer allocator.free(saved);
+    const original = std.json.parseFromSliceLeaky(std.json.Value, a, saved, .{}) catch return false;
+    if (original != .object and original != .null) return false;
     if (original == .object) {
         root.object.put(a, "statusLine", original) catch return false;
     } else {
@@ -754,14 +858,20 @@ fn uninstallQoder(allocator: std.mem.Allocator, home: []const u8) bool {
 /// Gemini rides the exact same settings.json hook shape as Claude,
 /// with its own event names.
 const gemini_events = [_]HookEvent{
+    .{ .event = "BeforeAgent", .phase = "user-prompt" },
+    .{ .event = "AfterAgent", .phase = "stop" },
+    .{ .event = "Notification", .phase = "notification" },
     .{ .event = "BeforeTool", .phase = "pre" },
     .{ .event = "AfterTool", .phase = "post" },
     .{ .event = "SessionEnd", .phase = "stop" },
 };
 
 pub fn installGemini(allocator: std.mem.Allocator, home: []const u8) bool {
+    var dir_buf: [512]u8 = undefined;
     var path_buf: [512]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{s}/.gemini/settings.json", .{home}) catch return false;
+    const dir = agent_mcp.presenceDir(&dir_buf, home, .gemini) orelse return false;
+    plat.makeDir(dir);
+    const path = std.fmt.bufPrint(&path_buf, "{s}/settings.json", .{dir}) catch return false;
     return installJsonHooks(allocator, path, &gemini_events, "gemini", 2000, true);
 }
 
@@ -898,10 +1008,82 @@ fn isKimiHookHeader(line: []const u8) bool {
     return std.mem.eql(u8, std.mem.trim(u8, trimmed[2 .. trimmed.len - 2], " \t"), "hooks");
 }
 
-/// Copy `content` minus every `[[hooks]]` block whose command mentions
-/// petdex, leaving foreign hooks and all other config untouched. A block
+/// Read the single-line string fields emitted by our TOML writer. Unknown or
+/// multiline syntax stays user-owned; a filename/comment mentioning Petdex
+/// does not authorize deleting a whole hook table.
+fn kimiStringField(allocator: std.mem.Allocator, block: []const u8, key: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, block, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        if (!std.mem.eql(u8, std.mem.trim(u8, trimmed[0..eq], " \t"), key)) continue;
+        const value = std.mem.trim(u8, trimmed[eq + 1 ..], " \t");
+        if (value.len < 2 or (value[0] != '\'' and value[0] != '"')) return null;
+        const quote = value[0];
+        var end: usize = 1;
+        while (end < value.len) : (end += 1) {
+            if (quote == '"' and value[end] == '\\') {
+                end += 1;
+                continue;
+            }
+            if (value[end] != quote) continue;
+            const tail = std.mem.trim(u8, value[end + 1 ..], " \t");
+            if (tail.len > 0 and tail[0] != '#') return null;
+            if (quote == '\'') return value[1..end];
+            return std.json.parseFromSliceLeaky([]const u8, allocator, value[0 .. end + 1], .{}) catch null;
+        }
+        return null;
+    }
+    return null;
+}
+
+const KimiHookBlocks = struct {
+    content: []const u8,
+    offset: usize = 0,
+
+    fn next(self: *KimiHookBlocks) ?[]const u8 {
+        var start: ?usize = null;
+        while (self.offset < self.content.len) {
+            const at = self.offset;
+            const end = if (std.mem.indexOfScalarPos(u8, self.content, at, '\n')) |nl| nl + 1 else self.content.len;
+            const line = std.mem.trim(u8, self.content[at..end], " \t\r\n");
+            if (start != null and std.mem.startsWith(u8, line, "[")) return self.content[start.?..at];
+            self.offset = end;
+            if (isKimiHookHeader(line)) start = at;
+        }
+        if (start) |at| return self.content[at..];
+        return null;
+    }
+};
+
+fn kimiConfigStatus(allocator: std.mem.Allocator, content: []const u8) HookStatus {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var blocks: KimiHookBlocks = .{ .content = content };
+    var seen: [kimi_events.len]bool = @splat(false);
+    var any = false;
+    while (blocks.next()) |block| {
+        const command = kimiStringField(a, block, "command") orelse continue;
+        if (commandGeneration(command) == .none) continue;
+        any = true;
+        const event = kimiStringField(a, block, "event") orelse continue;
+        for (kimi_events, 0..) |ev, i| {
+            var buf: [512]u8 = undefined;
+            const expected = canonicalCommand(&buf, ev.phase, "kimi-code") orelse continue;
+            if (std.mem.eql(u8, ev.event, event) and std.mem.eql(u8, expected, command)) seen[i] = true;
+        }
+    }
+    for (seen) |found| if (!found) return if (any) .node else .none;
+    return .current;
+}
+
+/// Copy `content` minus every `[[hooks]]` block with a managed Petdex
+/// runner command, leaving foreign hooks and all other config untouched. A block
 /// runs from its header to the next table header or end of file.
 fn stripKimiPetdexHooks(out: *std.array_list.Managed(u8), content: []const u8) bool {
+    var arena = std.heap.ArenaAllocator.init(out.allocator);
+    defer arena.deinit();
     var i: usize = 0;
     while (i < content.len) {
         const nl = std.mem.indexOfScalarPos(u8, content, i, '\n');
@@ -931,7 +1113,8 @@ fn stripKimiPetdexHooks(out: *std.array_list.Managed(u8), content: []const u8) b
         if (cursor >= content.len) block_end = content.len;
 
         const block = content[i..block_end];
-        const ours = std.mem.indexOf(u8, block, "petdex") != null;
+        const command = kimiStringField(arena.allocator(), block, "command");
+        const ours = if (command) |cmd| commandGeneration(cmd) != .none else false;
         if (!ours) out.appendSlice(block) catch return false;
         i = block_end;
     }
@@ -944,6 +1127,7 @@ fn stripKimiPetdexHooks(out: *std.array_list.Managed(u8), content: []const u8) b
 fn writeKimiHooks(allocator: std.mem.Allocator, path: []const u8, install: bool) bool {
     const existing = readFileAlloc(allocator, path, 1024 * 1024);
     defer if (existing) |e| allocator.free(e);
+    if (existing == null and fileExists(path)) return false;
     // Uninstall on a file that was never written is already done.
     if (existing == null and !install) return true;
     if (!backupOnce(allocator, path)) return false;
@@ -1814,10 +1998,16 @@ fn uninstallHermes(allocator: std.mem.Allocator, home: []const u8) bool {
 const opencode_plugin = @embedFile("assets/opencode-plugin.js");
 
 pub fn installOpencode(allocator: std.mem.Allocator, home: []const u8) bool {
+    var dir_buf: [512]u8 = undefined;
+    const dir = agent_mcp.presenceDir(&dir_buf, home, .opencode) orelse return false;
+    return installOpencodeAt(allocator, dir);
+}
+
+/// Explicit root for remote staging; never consult local environment overrides.
+pub fn installOpencodeAt(allocator: std.mem.Allocator, dir: []const u8) bool {
     var path_buf: [512]u8 = undefined;
-    const dir = std.fmt.bufPrint(&path_buf, "{s}/.config/opencode/plugins", .{home}) catch return false;
-    plat.makeDir(dir);
-    const path = std.fmt.bufPrint(&path_buf, "{s}/.config/opencode/plugins/petdex.js", .{home}) catch return false;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/plugins/petdex.js", .{dir}) catch return false;
+    plat.makeDir(std.fs.path.dirname(path) orelse return false);
     if (!backupOnce(allocator, path)) return false;
     return writeFile(path, opencode_plugin);
 }
@@ -1935,6 +2125,7 @@ fn entryIsPetdex(entry: std.json.Value) bool {
 /// carries a user-owned command.
 fn stripManagedHooks(entry: *std.json.Value) bool {
     if (entry.* != .object) return false;
+    if (hookGeneration(entry.*) != .none) return true;
     const hooks = entry.object.getPtr("hooks") orelse return false;
     if (hooks.* != .array) return false;
     var removed = false;
@@ -1966,13 +2157,20 @@ fn removeManagedHooks(hooks_obj: *std.json.ObjectMap) void {
     }
 }
 
-/// Install/refresh Codex hooks, preserving non-Petdex hooks in hooks.json
-/// and enabling the required feature flag in config.toml.
+/// Install native lifecycle hooks and enable the Codex hooks feature.
 pub fn installCodex(allocator: std.mem.Allocator, home: []const u8) bool {
+    var dir_buf: [512]u8 = undefined;
+    const dir = agent_mcp.presenceDir(&dir_buf, home, .codex) orelse return false;
+    return installCodexAt(allocator, dir);
+}
+
+/// Explicit root for remote staging; never consult CODEX_HOME.
+pub fn installCodexAt(allocator: std.mem.Allocator, dir: []const u8) bool {
+    plat.makeDir(dir);
     var hooks_path_buf: [512]u8 = undefined;
-    const hooks_path = std.fmt.bufPrint(&hooks_path_buf, "{s}/.codex/hooks.json", .{home}) catch return false;
+    const hooks_path = std.fmt.bufPrint(&hooks_path_buf, "{s}/hooks.json", .{dir}) catch return false;
     var toml_path_buf: [512]u8 = undefined;
-    const toml_path = std.fmt.bufPrint(&toml_path_buf, "{s}/.codex/config.toml", .{home}) catch return false;
+    const toml_path = std.fmt.bufPrint(&toml_path_buf, "{s}/config.toml", .{dir}) catch return false;
     const toml = readFileAlloc(allocator, toml_path, 1024 * 1024);
     defer if (toml) |tm| allocator.free(tm);
     if (toml) |content| {
@@ -2020,6 +2218,11 @@ fn inspectFeatureHooks(toml: []const u8) FeatureHooksInspection {
         const trimmed = std.mem.trim(u8, line, " \t\r\n");
         if (trimmed.len > 0 and trimmed[0] == '[') {
             const name = sectionName(trimmed) orelse return .{ .state = .unsafe };
+            // Codex also accepts inline lifecycle hooks in arrays of tables,
+            // e.g. [[hooks.SessionStart.hooks]]. They are unrelated to the
+            // feature flag and must not prevent installing our hooks.json.
+            if (std.mem.startsWith(u8, trimmed, "[[") and
+                (std.mem.eql(u8, name, "features") or std.mem.startsWith(u8, name, "features."))) return .{ .state = .unsafe };
             if (std.mem.eql(u8, name, "features")) {
                 // A child table before its parent makes an insertion at the
                 // end ambiguous, so keep that layout conservative. Once the
@@ -2077,12 +2280,17 @@ fn isFeaturesNamespaceAssignment(line: []const u8) bool {
 }
 
 fn sectionName(line: []const u8) ?[]const u8 {
-    if (line.len < 3 or line[0] != '[' or line[1] == '[') return null;
-    const close = std.mem.indexOfScalar(u8, line[1..], ']') orelse return null;
-    const close_index = close + 1;
-    const suffix = std.mem.trim(u8, line[close_index + 1 ..], " \t");
+    if (line.len < 3 or line[0] != '[') return null;
+    const array = line[1] == '[';
+    const start: usize = if (array) 2 else 1;
+    const close = std.mem.indexOfScalar(u8, line[start..], ']') orelse return null;
+    const close_index = close + start;
+    const end = close_index + @as(usize, if (array) 2 else 1);
+    if (end > line.len or (array and line[end - 1] != ']')) return null;
+    const suffix = std.mem.trim(u8, line[end..], " \t");
     if (suffix.len > 0 and suffix[0] != '#') return null;
-    return std.mem.trim(u8, line[1..close_index], " \t");
+    const name = std.mem.trim(u8, line[start..close_index], " \t");
+    return if (name.len == 0) null else name;
 }
 
 const HooksAssignment = union(enum) {
@@ -2147,7 +2355,7 @@ fn ensureFeatureHooks(allocator: std.mem.Allocator, path: []const u8, content: [
 /// Disconnect a JSON-hook agent: filter our entries out of every
 /// event, leave everything else exactly as found.
 fn uninstallJsonHooks(allocator: std.mem.Allocator, path: []const u8) bool {
-    const existing = readFileAlloc(allocator, path, 1024 * 1024) orelse return true;
+    const existing = readFileAlloc(allocator, path, 1024 * 1024) orelse return !fileExists(path);
     defer allocator.free(existing);
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -2179,10 +2387,8 @@ pub fn migrateLegacyHooks(allocator: std.mem.Allocator, home: []const u8) Legacy
             .claude_code => installClaude(allocator, home),
             .codex => installCodex(allocator, home),
             .gemini => installGemini(allocator, home),
-            // An outdated OpenCode plugin has no subprocess stdin path.
-            // Keep its existing explicit Update action rather than changing
-            // it as part of this bubble-runner migration.
-            .opencode => continue,
+            // Refresh the event plugin when the bundled implementation changes.
+            .opencode => installOpencode(allocator, home),
             // Unreachable: no legacy runner ever wrote these hooks, so this
             // cannot scan as .node. Install is the consistent answer anyway.
             .qoder => installQoder(allocator, home),
@@ -2191,6 +2397,8 @@ pub fn migrateLegacyHooks(allocator: std.mem.Allocator, home: []const u8) Legacy
             .omp => installOmp(allocator, home),
             .hermes => continue,
             .dsh => continue,
+            // Host-specific lifecycle schemas use the native runner too.
+            .cursor, .junie, .antigravity, .devin, .grok, .copilot, .windsurf, .amp, .droid => installLifecycle(allocator, home, info.kind),
         };
         if (migrated) result.migrated += 1 else result.failed += 1;
     }
@@ -2203,21 +2411,63 @@ pub fn uninstall(allocator: std.mem.Allocator, home: []const u8, kind: AgentKind
         .claude_code => {
             const path = claudeSettingsPath(&path_buf, home) orelse return false;
             // Leaving Claude Code takes the usage relay along.
-            return uninstallClaudeStatusline(allocator, home) and uninstallJsonHooks(allocator, path);
+            const hooks_ok = uninstallClaudeStatusline(allocator, home) and uninstallJsonHooks(allocator, path);
+            const mcp_ok = agent_mcp.uninstall(allocator, home, .claude_code);
+            return hooks_ok and mcp_ok;
         },
         .gemini => {
-            const path = std.fmt.bufPrint(&path_buf, "{s}/.gemini/settings.json", .{home}) catch return false;
-            return uninstallJsonHooks(allocator, path);
+            var dir_buf: [512]u8 = undefined;
+            const dir = agent_mcp.presenceDir(&dir_buf, home, .gemini) orelse return false;
+            const path = std.fmt.bufPrint(&path_buf, "{s}/settings.json", .{dir}) catch return false;
+            const hooks_ok = uninstallJsonHooks(allocator, path);
+            const mcp_ok = agent_mcp.uninstall(allocator, home, .gemini);
+            return hooks_ok and mcp_ok;
         },
         .codex => {
-            // The config.toml feature flag stays harmless without the file.
-            const p = std.fmt.bufPrint(&path_buf, "{s}/.codex/hooks.json", .{home}) catch return false;
-            return uninstallJsonHooks(allocator, p);
+            var dir_buf: [512]u8 = undefined;
+            const dir = agent_mcp.presenceDir(&dir_buf, home, .codex) orelse return false;
+            const p = std.fmt.bufPrint(&path_buf, "{s}/hooks.json", .{dir}) catch return false;
+            const hooks_ok = uninstallJsonHooks(allocator, p);
+            const mcp_ok = agent_mcp.uninstall(allocator, home, .codex);
+            return hooks_ok and mcp_ok;
+        },
+        .copilot, .windsurf, .amp, .droid => {
+            const hooks_ok = uninstallLifecycle(allocator, home, kind);
+            const mcp_ok = agent_mcp.uninstall(allocator, home, kind.mcpKind().?);
+            return hooks_ok and mcp_ok;
+        },
+        .cursor => {
+            const hooks_ok = uninstallLifecycle(allocator, home, kind);
+            const mcp_ok = agent_mcp.uninstall(allocator, home, .cursor);
+            return hooks_ok and mcp_ok;
+        },
+        .junie => {
+            const hooks_ok = uninstallLifecycle(allocator, home, kind);
+            const mcp_ok = agent_mcp.uninstall(allocator, home, .junie);
+            return hooks_ok and mcp_ok;
+        },
+        .antigravity => {
+            const hooks_ok = uninstallLifecycle(allocator, home, kind);
+            const mcp_ok = agent_mcp.uninstall(allocator, home, .antigravity);
+            return hooks_ok and mcp_ok;
+        },
+        .devin => {
+            const hooks_ok = uninstallLifecycle(allocator, home, kind);
+            const mcp_ok = agent_mcp.uninstall(allocator, home, .devin);
+            return hooks_ok and mcp_ok;
+        },
+        .grok => {
+            const hooks_ok = uninstallLifecycle(allocator, home, kind);
+            const mcp_ok = agent_mcp.uninstall(allocator, home, .grok);
+            return hooks_ok and mcp_ok;
         },
         .opencode => {
-            const p = std.fmt.bufPrint(&path_buf, "{s}/.config/opencode/plugins/petdex.js", .{home}) catch return false;
+            const mcp_ok = agent_mcp.uninstall(allocator, home, .opencode);
+            var dir_buf: [512]u8 = undefined;
+            const dir = agent_mcp.presenceDir(&dir_buf, home, .opencode) orelse return mcp_ok;
+            const p = std.fmt.bufPrint(&path_buf, "{s}/plugins/petdex.js", .{dir}) catch return mcp_ok;
             plat.deleteFile(p);
-            return true;
+            return mcp_ok;
         },
         .qoder => return uninstallQoder(allocator, home),
         .kimi_code => {
@@ -2237,6 +2487,314 @@ pub fn uninstall(allocator: std.mem.Allocator, home: []const u8, kind: AgentKind
         // DSH removal is an async official CLI operation owned by main.zig.
         .dsh => return false,
     }
+}
+
+// Event names and layouts follow each host's hook contract. These commands
+// only observe: in particular Junie PermissionRequest is NOT installed because
+// a successful synchronous hook there approves the pending action.
+const cursor_events = [_]HookEvent{
+    .{ .event = "beforeSubmitPrompt", .phase = "user-prompt" },
+    .{ .event = "postToolUse", .phase = "post" },
+    .{ .event = "postToolUseFailure", .phase = "tool-failure" },
+    .{ .event = "stop", .phase = "stop" },
+    .{ .event = "sessionEnd", .phase = "stop" },
+};
+const junie_events = [_]HookEvent{
+    .{ .event = "UserPromptSubmit", .phase = "user-prompt" },
+    .{ .event = "PreToolUse", .phase = "pre" },
+    .{ .event = "Stop", .phase = "stop" },
+    .{ .event = "StopFailure", .phase = "stop-failure" },
+    .{ .event = "SessionEnd", .phase = "stop" },
+};
+const antigravity_events = [_]HookEvent{
+    .{ .event = "PreInvocation", .phase = "user-prompt" },
+    .{ .event = "PreToolUse", .phase = "pre" },
+    .{ .event = "PostToolUse", .phase = "post" },
+    .{ .event = "Stop", .phase = "stop" },
+};
+const devin_events = [_]HookEvent{
+    .{ .event = "UserPromptSubmit", .phase = "user-prompt" },
+    .{ .event = "PreToolUse", .phase = "pre" },
+    .{ .event = "PostToolUse", .phase = "post" },
+    .{ .event = "PermissionRequest", .phase = "notification" },
+    .{ .event = "Stop", .phase = "stop" },
+    .{ .event = "SessionEnd", .phase = "stop" },
+};
+
+const copilot_events = [_]HookEvent{
+    .{ .event = "userPromptSubmitted", .phase = "user-prompt" },
+    .{ .event = "preToolUse", .phase = "pre" },
+    .{ .event = "postToolUse", .phase = "post" },
+    .{ .event = "postToolUseFailure", .phase = "tool-failure" },
+    .{ .event = "notification", .phase = "notification" },
+    .{ .event = "agentStop", .phase = "stop" },
+    .{ .event = "errorOccurred", .phase = "agent-error" },
+    .{ .event = "sessionEnd", .phase = "session-end" },
+};
+const windsurf_events = [_]HookEvent{
+    .{ .event = "pre_user_prompt", .phase = "user-prompt" },
+    .{ .event = "pre_read_code", .phase = "pre" },
+    .{ .event = "post_read_code", .phase = "post" },
+    .{ .event = "pre_write_code", .phase = "pre" },
+    .{ .event = "post_write_code", .phase = "post" },
+    .{ .event = "pre_run_command", .phase = "pre" },
+    .{ .event = "post_run_command", .phase = "post" },
+    .{ .event = "pre_mcp_tool_use", .phase = "pre" },
+    .{ .event = "post_mcp_tool_use", .phase = "post" },
+    .{ .event = "post_cascade_response", .phase = "stop" },
+};
+const droid_events = [_]HookEvent{
+    .{ .event = "UserPromptSubmit", .phase = "user-prompt" },
+    .{ .event = "PreToolUse", .phase = "pre" },
+    .{ .event = "PostToolUse", .phase = "post" },
+    .{ .event = "Notification", .phase = "notification" },
+    .{ .event = "Stop", .phase = "stop" },
+    .{ .event = "SessionEnd", .phase = "session-end" },
+};
+
+fn ampPlugin(allocator: std.mem.Allocator) ?[]u8 {
+    return std.mem.replaceOwned(u8, allocator, @embedFile("assets/amp-plugin.js"), "/*PETDEX_WINDOWS*/ false", if (builtin.os.tag == .windows) "/*PETDEX_WINDOWS*/ true" else "/*PETDEX_WINDOWS*/ false") catch null;
+}
+
+fn lifecycleEvents(kind: AgentKind) []const HookEvent {
+    return switch (kind) {
+        .claude_code => &claude_events,
+        .codex => &codex_events,
+        .gemini => &gemini_events,
+        .qoder => &qoder_events,
+        .codebuddy => &codebuddy_events,
+        .cursor => &cursor_events,
+        .junie => &junie_events,
+        .antigravity => &antigravity_events,
+        .devin => &devin_events,
+        .grok => &claude_events,
+        .copilot => &copilot_events,
+        .windsurf => &windsurf_events,
+        .droid => &droid_events,
+        else => &.{},
+    };
+}
+
+fn lifecyclePath(buf: []u8, home: []const u8, kind: AgentKind) ?[]const u8 {
+    var root_buf: [512]u8 = undefined;
+    const root = agent_mcp.presenceDir(&root_buf, home, kind.mcpKind() orelse return null) orelse return null;
+    const suffix: []const u8 = switch (kind) {
+        .cursor => "hooks.json",
+        .junie, .devin => "config.json",
+        .antigravity => "config/hooks.json",
+        .grok, .copilot => "hooks/petdex.json",
+        .windsurf, .droid => "hooks.json",
+        .amp => "plugins/petdex.js",
+        else => return null,
+    };
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ root, suffix }) catch null;
+}
+
+fn lifecycleUsesGroups(kind: AgentKind, event: HookEvent) bool {
+    return switch (kind) {
+        .cursor, .copilot, .windsurf => false,
+        .antigravity => std.mem.eql(u8, event.phase, "pre") or std.mem.eql(u8, event.phase, "post"),
+        else => true,
+    };
+}
+
+fn unrestrictedHookMatcher(entry: std.json.Value, kind: AgentKind, event: HookEvent) bool {
+    if (entry != .object) return false;
+    if (entry.object.get("commandRegex")) |_| return false;
+    const matcher = entry.object.get("matcher") orelse return true;
+    if (matcher != .string) return false;
+    if (std.mem.eql(u8, matcher.string, ".*") or matcher.string.len == 0) return true;
+    if (kind == .copilot) return std.mem.eql(u8, event.event, "notification") and
+        std.mem.eql(u8, matcher.string, "permission_prompt|elicitation_dialog");
+    return std.mem.eql(u8, matcher.string, "*");
+}
+
+fn lifecycleConfigStatus(allocator: std.mem.Allocator, content: []const u8, kind: AgentKind) HookStatus {
+    if (lifecycleEvents(kind).len == 0) return classifyConfig(allocator, content);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), content, .{}) catch return .none;
+    if (root != .object) return .none;
+    if (root.object.get("disableAllHooks")) |disabled| {
+        if (disabled == .bool and disabled.bool) return .none;
+    }
+    if (root.object.get("hooksConfig")) |config| {
+        if (config == .object) if (config.object.get("enabled")) |enabled| {
+            if (enabled == .bool and !enabled.bool) return .none;
+        };
+    }
+    const hooks = if (kind == .droid) root else root.object.get(if (kind == .antigravity) "petdex" else "hooks") orelse return .none;
+    if (hooks != .object) return .none;
+    if (hooks.object.get("enabled")) |enabled| {
+        if (enabled == .bool and !enabled.bool) return .none;
+    }
+    var complete = true;
+    var any = false;
+    for (lifecycleEvents(kind)) |ev| {
+        var found = false;
+        const entries = hooks.object.get(ev.event) orelse {
+            complete = false;
+            continue;
+        };
+        if (entries != .array) return .none;
+        var cmd_buf: [512]u8 = undefined;
+        const command = canonicalCommand(&cmd_buf, ev.phase, kind.hookAgentName()) orelse return .none;
+        for (entries.array.items) |entry| {
+            if (entry != .object) continue;
+            const inner = entry.object.get("hooks");
+            const commands = if (inner != null and inner.? == .array) inner.?.array.items else &[_]std.json.Value{entry};
+            for (commands) |hook| {
+                if (hookGeneration(hook) != .none) any = true;
+                if (hook != .object) continue;
+                // The same command under a Bash-only matcher or in the wrong
+                // host schema does not cover this lifecycle event. Do not
+                // advertise a complete installation just because text matches.
+                if (lifecycleUsesGroups(kind, ev) != (inner != null and inner.? == .array)) continue;
+                if (!unrestrictedHookMatcher(entry, kind, ev) or !unrestrictedHookMatcher(hook, kind, ev)) continue;
+                if (kind != .windsurf) {
+                    const hook_type = hook.object.get("type") orelse continue;
+                    if (hook_type != .string or !std.mem.eql(u8, hook_type.string, "command")) continue;
+                }
+                const cmd = hook.object.get("command") orelse continue;
+                if (cmd == .string and std.mem.eql(u8, cmd.string, command)) found = true;
+            }
+        }
+        if (!found) complete = false;
+    }
+    return if (complete) .current else if (any) .node else .none;
+}
+
+fn lifecycleStatus(allocator: std.mem.Allocator, home: []const u8, kind: AgentKind) HookStatus {
+    var buf: [512]u8 = undefined;
+    var root_buf: [512]u8 = undefined;
+    const root = agent_mcp.presenceDir(&root_buf, home, kind.mcpKind().?) orelse return .absent;
+    if (kind == .antigravity) {
+        if (!agent_mcp.antigravityPresent(home)) return .absent;
+    } else if (!dirExists(root)) return .absent;
+    const path = lifecyclePath(&buf, home, kind) orelse return .none;
+    const content = readFileAlloc(allocator, path, 1024 * 1024) orelse return .none;
+    defer allocator.free(content);
+    if (kind == .amp) {
+        const expected = ampPlugin(allocator) orelse return .none;
+        defer allocator.free(expected);
+        return if (std.mem.eql(u8, expected, content)) .current else .node;
+    }
+    if (kind == .copilot or kind == .droid) {
+        var setting_buf: [512]u8 = undefined;
+        const setting = std.fmt.bufPrint(&setting_buf, "{s}/settings.json", .{root}) catch return .none;
+        if (readFileAlloc(allocator, setting, 1024 * 1024)) |bytes| {
+            defer allocator.free(bytes);
+            var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return .none;
+            defer parsed.deinit();
+            if (parsed.value == .object) for ([_][]const u8{ "disableAllHooks", "hooksDisabled", "allowManagedHooksOnly" }) |key| {
+                if (parsed.value.object.get(key)) |disabled| if (disabled == .bool and disabled.bool) return .none;
+            };
+        }
+    }
+    return lifecycleConfigStatus(allocator, content, kind);
+}
+
+pub fn installLifecycle(allocator: std.mem.Allocator, home: []const u8, kind: AgentKind) bool {
+    var path_buf: [512]u8 = undefined;
+    const path = lifecyclePath(&path_buf, home, kind) orelse return false;
+    plat.makeDir(std.fs.path.dirname(path) orelse return false);
+    if (kind == .amp) {
+        const plugin = ampPlugin(allocator) orelse return false;
+        defer allocator.free(plugin);
+        if (readFileAlloc(allocator, path, 1024 * 1024)) |existing| {
+            defer allocator.free(existing);
+            if (!std.mem.startsWith(u8, existing, "// Petdex Amp integration ")) return false;
+        } else if (fileExists(path)) return false;
+        return backupOnce(allocator, path) and writeFile(path, plugin);
+    }
+    // Nested Claude-style schemas can use the existing non-destructive merger.
+    if (kind != .cursor and kind != .antigravity and kind != .copilot and kind != .windsurf and kind != .droid)
+        return installJsonHooks(allocator, path, lifecycleEvents(kind), kind.hookAgentName(), 2, false);
+    const existing = readFileAlloc(allocator, path, 1024 * 1024);
+    defer if (existing) |bytes| allocator.free(bytes);
+    if (existing == null and fileExists(path)) return false;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var root = if (existing) |bytes| std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return false else emptyObject(a);
+    if (kind == .droid and existing == null) {
+        // A new hooks.json shadows legacy settings.json hooks in Droid. Carry
+        // them across before adding ours so user hooks keep firing.
+        var dir_buf: [512]u8 = undefined;
+        var legacy_buf: [512]u8 = undefined;
+        const dir = agent_mcp.presenceDir(&dir_buf, home, .droid) orelse return false;
+        const legacy_path = std.fmt.bufPrint(&legacy_buf, "{s}/settings.json", .{dir}) catch return false;
+        const legacy = readFileAlloc(a, legacy_path, 1024 * 1024);
+        if (legacy == null and fileExists(legacy_path)) return false;
+        if (legacy) |bytes| {
+            const settings = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return false;
+            if (settings != .object) return false;
+            root = settings.object.get("hooks") orelse emptyObject(a);
+        }
+    }
+    if (root != .object or !backupOnce(allocator, path)) return false;
+    const key = if (kind == .antigravity) "petdex" else "hooks";
+    const hooks = blk: {
+        if (kind == .droid) break :blk &root.object;
+        const group = root.object.getOrPut(a, key) catch return false;
+        if (!group.found_existing) group.value_ptr.* = emptyObject(a);
+        if (group.value_ptr.* != .object) return false;
+        break :blk &group.value_ptr.object;
+    };
+    removeManagedHooks(hooks);
+    for (lifecycleEvents(kind)) |ev| {
+        const entry = hooks.getOrPut(a, ev.event) catch return false;
+        if (!entry.found_existing) entry.value_ptr.* = .{ .array = std.json.Array.init(a) };
+        if (entry.value_ptr.* != .array) return false;
+        var cmd_buf: [512]u8 = undefined;
+        const command = canonicalCommand(&cmd_buf, ev.phase, kind.hookAgentName()) orelse return false;
+        var hook = emptyObject(a);
+        if (kind != .windsurf) hook.object.put(a, "type", .{ .string = "command" }) catch return false;
+        hook.object.put(a, "command", .{ .string = a.dupe(u8, command) catch return false }) catch return false;
+        if (kind == .windsurf) {
+            hook.object.put(a, "show_output", .{ .bool = false }) catch return false;
+        } else hook.object.put(a, if (kind == .copilot) "timeoutSec" else "timeout", .{ .integer = 2 }) catch return false;
+        if (kind == .copilot and std.mem.eql(u8, ev.event, "notification"))
+            hook.object.put(a, "matcher", .{ .string = "permission_prompt|elicitation_dialog" }) catch return false;
+        if (lifecycleUsesGroups(kind, ev)) {
+            var inner = std.json.Array.init(a);
+            inner.append(hook) catch return false;
+            hook = emptyObject(a);
+            hook.object.put(a, "hooks", .{ .array = inner }) catch return false;
+        }
+        entry.value_ptr.array.append(hook) catch return false;
+    }
+    if (kind == .cursor or kind == .copilot) root.object.put(a, "version", .{ .integer = 1 }) catch return false;
+    const serialized = std.json.Stringify.valueAlloc(a, root, .{ .whitespace = .indent_2 }) catch return false;
+    return writeFile(path, serialized);
+}
+
+fn uninstallLifecycle(allocator: std.mem.Allocator, home: []const u8, kind: AgentKind) bool {
+    var path_buf: [512]u8 = undefined;
+    const path = lifecyclePath(&path_buf, home, kind) orelse return false;
+    if (kind == .amp) {
+        const content = readFileAlloc(allocator, path, 1024 * 1024) orelse return !fileExists(path);
+        defer allocator.free(content);
+        if (!std.mem.startsWith(u8, content, "// Petdex Amp integration ")) return false;
+        plat.deleteFile(path);
+        return !fileExists(path);
+    }
+    if (kind != .antigravity and kind != .droid) return uninstallJsonHooks(allocator, path);
+    const bytes = readFileAlloc(allocator, path, 1024 * 1024) orelse return !fileExists(path);
+    defer allocator.free(bytes);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var root = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return false;
+    if (root != .object) return false;
+    if (kind == .droid) {
+        removeManagedHooks(&root.object);
+    } else if (root.object.getPtr("petdex")) |group| {
+        if (group.* != .object) return false;
+        removeManagedHooks(&group.object);
+    }
+    const serialized = std.json.Stringify.valueAlloc(a, root, .{ .whitespace = .indent_2 }) catch return false;
+    return writeFile(path, serialized);
 }
 
 // -------------------------------------------------------------- tests
@@ -2404,12 +2962,14 @@ test "installCodex migrates legacy hooks without dropping a foreign hook" {
 }
 
 test "CLAUDE_CONFIG_DIR redirects install, scan and uninstall" {
-    const saved = env_claude_config_dir;
-    defer env_claude_config_dir = saved;
+    const saved = agent_mcp.env_claude_config_dir;
+    defer agent_mcp.env_claude_config_dir = saved;
 
     // A home with NO ~/.claude at all: only the override dir exists,
     // exactly the machine #601 describes.
-    const home = ".zig-cache/petdex-claude-cfgdir-home";
+    const home = ".zig-cache/petdex-claude-hooks-cfgdir-home";
+    _ = plat.deleteTree(home);
+    defer _ = plat.deleteTree(home);
     const alt = ".zig-cache/petdex-claude-cfgdir-alt";
     plat.makeDir(home);
     plat.makeDir(alt);
@@ -2417,7 +2977,7 @@ test "CLAUDE_CONFIG_DIR redirects install, scan and uninstall" {
     const alt_cfg = std.fmt.bufPrint(&pb, "{s}/settings.json", .{alt}) catch unreachable;
     plat.deleteFile(alt_cfg);
 
-    env_claude_config_dir = alt;
+    agent_mcp.env_claude_config_dir = alt;
     try t.expect(installClaude(t.allocator, home));
     const written = readFileAlloc(t.allocator, alt_cfg, 1024 * 1024).?;
     defer t.allocator.free(written);
@@ -2440,10 +3000,10 @@ test "CLAUDE_CONFIG_DIR redirects install, scan and uninstall" {
 
     // Unset (and empty, the "set but blank" shell case) falls back to
     // ~/.claude: without the dir the agent scans as absent.
-    env_claude_config_dir = null;
+    agent_mcp.env_claude_config_dir = null;
     const fallback = scan(t.allocator, home);
     try t.expectEqual(HookStatus.absent, fallback[0].status);
-    env_claude_config_dir = "";
+    agent_mcp.env_claude_config_dir = "";
     const blank = scan(t.allocator, home);
     try t.expectEqual(HookStatus.absent, blank[0].status);
 }
@@ -2846,12 +3406,72 @@ test "installJsonHooks refuses malformed configs without overwriting them" {
     try t.expectEqualStrings(invalid, after);
 }
 
+test "hook editors refuse oversized config prefixes and backups preserve the full file" {
+    const home = ".zig-cache/petdex-hooks-config-limit";
+    _ = plat.deleteTree(home);
+    defer _ = plat.deleteTree(home);
+    const limit = 1024 * 1024;
+    const bytes = try t.allocator.alloc(u8, limit + 32);
+    defer t.allocator.free(bytes);
+    // The prefix is valid JSON. A prefix-only reader used to accept it and
+    // overwrite the tail, so this must fail before parsing or creating backup.
+    @memset(bytes, ' ');
+    @memcpy(bytes[0..2], "{}");
+    @memcpy(bytes[limit..][0..8], "trailing");
+    const config = home ++ "/.claude/settings.json";
+    try t.expect(writeFile(config, bytes));
+    try t.expect(!installClaude(t.allocator, home));
+    try t.expect(!uninstallJsonHooks(t.allocator, config));
+    try t.expect(!backupOnce(t.allocator, config));
+    try t.expect(!fileExists(config ++ ".pre-petdex-backup"));
+    const after = readFileAlloc(t.allocator, config, bytes.len).?;
+    defer t.allocator.free(after);
+    try t.expectEqualSlices(u8, bytes, after);
+    // Exactly at the cap is valid and the backup includes every byte.
+    try t.expect(writeFile(config, bytes[0..limit]));
+    try t.expect(installClaude(t.allocator, home));
+    const backup = readFileAlloc(t.allocator, config ++ ".pre-petdex-backup", limit).?;
+    defer t.allocator.free(backup);
+    try t.expectEqualSlices(u8, bytes[0..limit], backup);
+    const toml = home ++ "/.kimi-code/config.toml";
+    try t.expect(writeFile(toml, bytes));
+    try t.expect(!installKimiCode(t.allocator, home));
+    try t.expect(!uninstall(t.allocator, home, .kimi_code));
+    const unchanged = readFileAlloc(t.allocator, toml, bytes.len).?;
+    defer t.allocator.free(unchanged);
+    try t.expectEqualSlices(u8, bytes, unchanged);
+}
+
+test "statusline restore refuses an unreadable or oversized saved original" {
+    const home = ".zig-cache/petdex-statusline-limit";
+    _ = plat.deleteTree(home);
+    defer _ = plat.deleteTree(home);
+    const config = home ++ "/.claude/settings.json";
+    try t.expect(writeFile(config, "{}"));
+    try t.expect(installClaudeStatusline(t.allocator, home));
+    const wrapped = readFileAlloc(t.allocator, config, 1024 * 1024).?;
+    defer t.allocator.free(wrapped);
+    const bytes = try t.allocator.alloc(u8, 1024 * 1024 + 1);
+    defer t.allocator.free(bytes);
+    @memset(bytes, ' ');
+    @memcpy(bytes[0..4], "null");
+    var saved_buf: [512]u8 = undefined;
+    const saved = savedStatuslinePath(&saved_buf, home).?;
+    try t.expect(writeFile(saved, bytes));
+    try t.expect(!uninstallClaudeStatusline(t.allocator, home));
+    const after = readFileAlloc(t.allocator, config, 1024 * 1024).?;
+    defer t.allocator.free(after);
+    try t.expectEqualSlices(u8, wrapped, after);
+    try t.expectEqual(@as(?u64, bytes.len), plat.fileSize(saved));
+}
+
 test "canonical commands match the host shell contract" {
     var unix_buf: [512]u8 = undefined;
     const unix = canonicalCommandForTarget(&unix_buf, "pre", "claude-code", false).?;
-    try t.expect(std.mem.indexOf(u8, unix, "hooks-disabled") != null);
+    try t.expect(std.mem.indexOf(u8, unix, "hooks-disabled") == null);
     try t.expect(std.mem.indexOf(u8, unix, "petdex-hook\" bubble pre claude-code") != null);
-    try t.expectEqual(@as(usize, 2), std.mem.count(u8, unix, "cat >/dev/null"));
+    try t.expect(std.mem.indexOf(u8, unix, "cat >/dev/null") == null);
+    try t.expect(std.mem.indexOf(u8, unix, "exec ") == null);
 
     var windows_buf: [512]u8 = undefined;
     const windows = canonicalCommandForTarget(&windows_buf, "pre", "claude-code", true).?;
@@ -2860,6 +3480,33 @@ test "canonical commands match the host shell contract" {
     try t.expect(std.mem.indexOf(u8, windows, "hooks-disabled") == null);
     try t.expect(std.mem.indexOf(u8, windows, "cat >/dev/null") == null);
     try t.expect(std.mem.indexOf(u8, windows, "exec ") == null);
+}
+
+test "notification hook failures cannot deny host tools or emit decisions" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const home = ".zig-cache/petdex-hook-failure-isolation";
+    _ = plat.deleteTree(home);
+    defer _ = plat.deleteTree(home);
+    // Reproduce a failed/stale runner which exits before consuming stdin and
+    // accidentally prints a host decision. Copilot preToolUse is fail-closed
+    // on a non-zero command exit; notifications must never affect that flow.
+    try t.expect(plat.writeFileMode(home ++ "/.petdex/bin/petdex-hook", "#!/bin/sh\nprintf '%s\\n' '{\"permissionDecision\":\"deny\"}'\nprintf failure >&2\nexit 2\n", 0o700));
+    var scope = plat.Scope.init();
+    defer scope.deinit();
+    const abs_home = try std.Io.Dir.cwd().realPathFileAlloc(scope.io(), home, t.allocator);
+    defer t.allocator.free(abs_home);
+    for ([_][]const u8{ "copilot", "windsurf", "claude-code", "cursor" }) |agent| {
+        var command_buf: [512]u8 = undefined;
+        const command = canonicalCommand(&command_buf, "pre", agent).?;
+        const result = try std.process.run(t.allocator, scope.io(), .{
+            .argv = &.{ "/bin/sh", "-c", "HOME=\"$1\"; export HOME; printf '%s' '{\"sessionId\":\"test\"}' | /bin/sh -e -c \"$2\"", "petdex-hook-test", abs_home, command },
+        });
+        defer t.allocator.free(result.stdout);
+        defer t.allocator.free(result.stderr);
+        try t.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+        try t.expectEqualStrings(if (std.mem.eql(u8, agent, "cursor")) "{}\n" else "", result.stdout);
+        try t.expectEqualStrings("", result.stderr);
+    }
 }
 
 test "installGemini enables hooks and uses a millisecond timeout" {
@@ -2959,6 +3606,40 @@ test "installCodex replaces a false feature flag without duplicating it" {
     defer t.allocator.free(after);
     try t.expectEqual(@as(usize, 1), std.mem.count(u8, after, "hooks ="));
     try t.expect(std.mem.indexOf(u8, after, "hooks = true # previous value") != null);
+}
+
+test "installCodex preserves foreign inline hook arrays while adding native hooks" {
+    const home = ".zig-cache/petdex-agenthooks-codex-inline-arrays";
+    _ = plat.deleteTree(home);
+    defer _ = plat.deleteTree(home);
+    const toml = home ++ "/.codex/config.toml";
+    const hooks = home ++ "/.codex/hooks.json";
+    const original =
+        \\[features]
+        \\hooks = true
+        \\[[hooks.SessionStart]]
+        \\matcher = "startup|resume"
+        \\[[hooks.SessionStart.hooks]] # foreign managed hook
+        \\type = "command"
+        \\command = "echo foreign-hook"
+        \\[hooks.state."fixture:session_start:0:0"]
+        \\enabled = true
+        \\
+    ;
+    try t.expect(writeFile(toml, original));
+    try t.expect(writeFile(hooks, "{\"hooks\":{\"SessionStart\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"echo foreign-hook\"}]}],\"PermissionRequest\":[],\"PostToolUse\":[],\"PreToolUse\":[],\"Stop\":[],\"UserPromptSubmit\":[]}}"));
+    try t.expect(installCodex(t.allocator, home));
+    const after = readFileAlloc(t.allocator, toml, 64 * 1024).?;
+    defer t.allocator.free(after);
+    try t.expectEqualStrings(original, after);
+    const installed = readFileAlloc(t.allocator, hooks, 64 * 1024).?;
+    defer t.allocator.free(installed);
+    try t.expect(std.mem.indexOf(u8, installed, "echo foreign-hook") != null);
+    try t.expect(std.mem.indexOf(u8, installed, "bubble stop codex") != null);
+    try t.expectEqual(HookStatus.current, scan(t.allocator, home)[@intFromEnum(AgentKind.codex)].status);
+    try t.expectEqual(FeatureHooksState.append_features, inspectFeatureHooks("[[hooks.SessionStart]]\nmatcher = \"startup\"\n").state);
+    try t.expectEqual(FeatureHooksState.unsafe, inspectFeatureHooks("[[features]]\nhooks = true\n").state);
+    try t.expectEqual(FeatureHooksState.unsafe, inspectFeatureHooks("[[hooks.SessionStart]\nmatcher = \"startup\"\n").state);
 }
 
 test "installCodex does not update hooks when its feature config is unsafe" {
@@ -3094,6 +3775,61 @@ test "kimi hook headers tolerate TOML whitespace" {
     try t.expect(!isKimiHookHeader("command = \"[[hooks]]\""));
 }
 
+test "Kimi preserves similarly named user hooks and detects incomplete managed hooks" {
+    const home = ".zig-cache/petdex-kimi-ownership";
+    _ = plat.deleteTree(home);
+    defer _ = plat.deleteTree(home);
+    const config = home ++ "/.kimi-code/config.toml";
+    const foreign =
+        \\model = "kimi-k2"
+        \\[[hooks]]
+        \\event = "PreToolUse"
+        \\command = "./petdex-linter.sh"
+        \\[[hooks]]
+        \\event = 'Stop'
+        \\# petdex is a project name, not the owner of this hook.
+        \\command = 'echo petdex' # Keep this user hook.
+        \\
+    ;
+    try t.expectEqual(HookStatus.none, kimiConfigStatus(t.allocator, foreign));
+    try t.expect(writeFile(config, foreign));
+    try t.expect(installKimiCode(t.allocator, home));
+    const installed = readFileAlloc(t.allocator, config, 1024 * 1024).?;
+    defer t.allocator.free(installed);
+    try t.expectEqual(HookStatus.current, kimiConfigStatus(t.allocator, installed));
+    try t.expect(std.mem.startsWith(u8, installed, foreign));
+    // One expected phase missing must offer repair, not claim full coverage.
+    const partial = try std.mem.replaceOwned(u8, t.allocator, installed, "PostToolUseFailure", "UnrelatedEvent");
+    defer t.allocator.free(partial);
+    try t.expectEqual(HookStatus.node, kimiConfigStatus(t.allocator, partial));
+    try t.expect(uninstall(t.allocator, home, .kimi_code));
+    const removed = readFileAlloc(t.allocator, config, 1024 * 1024).?;
+    defer t.allocator.free(removed);
+    try t.expectEqualStrings(foreign, removed);
+}
+
+test "Qoder and CodeBuddy require every event and honor disabled hooks" {
+    const home = ".zig-cache/petdex-additional-hook-coverage";
+    _ = plat.deleteTree(home);
+    defer _ = plat.deleteTree(home);
+    for ([_]AgentKind{ .qoder, .codebuddy }) |kind| {
+        var path_buf: [512]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.json", .{ home, kind.hookAgentName() });
+        try t.expect(installJsonHooks(t.allocator, path, lifecycleEvents(kind), kind.hookAgentName(), 2, false));
+        const bytes = readFileAlloc(t.allocator, path, 1024 * 1024).?;
+        defer t.allocator.free(bytes);
+        const partial = try std.mem.replaceOwned(u8, t.allocator, bytes, "UserPromptSubmit", "UnrelatedEvent");
+        defer t.allocator.free(partial);
+        try t.expectEqual(HookStatus.node, lifecycleConfigStatus(t.allocator, partial, kind));
+        var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, bytes, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        try parsed.value.object.put(parsed.arena.allocator(), "disableAllHooks", .{ .bool = true });
+        const disabled = try std.json.Stringify.valueAlloc(t.allocator, parsed.value, .{});
+        defer t.allocator.free(disabled);
+        try t.expectEqual(HookStatus.none, lifecycleConfigStatus(t.allocator, disabled, kind));
+    }
+}
+
 test "codebuddy merges into its own config and leaves Claude's alone" {
     const home = ".zig-cache/petdex-codebuddy-home";
     plat.makeDir(home);
@@ -3223,7 +3959,7 @@ test "omp extension maps every state the sprite sheet has" {
 
 test "opencode plugin carries session ids for tools and lifecycle events" {
     try t.expect(std.mem.indexOf(u8, opencode_plugin, "input.sessionID") != null);
-    try t.expect(std.mem.indexOf(u8, opencode_plugin, "event?.properties?.sessionID") != null);
+    try t.expect(std.mem.indexOf(u8, opencode_plugin, "properties?.sessionID") != null);
     try t.expect(std.mem.indexOf(u8, opencode_plugin, "session_id") != null);
     try t.expect(std.mem.indexOf(u8, opencode_plugin, "const titleCache = new Map") != null);
 }
@@ -3553,4 +4289,165 @@ test "Hermes uninstall preserves a user-modified plugin" {
     const plugin_after = readFileAlloc(t.allocator, init_file, 1024 * 1024).?;
     defer t.allocator.free(plugin_after);
     try t.expectEqualStrings("user-owned plugin\n", plugin_after);
+}
+
+test "MCP alone never claims automatic notifications are configured" {
+    const home = ".zig-cache/petdex-mcp-only-notifications";
+    _ = plat.deleteTree(home);
+    defer _ = plat.deleteTree(home);
+    for ([_]AgentKind{ .claude_code, .codex, .gemini, .opencode, .cursor, .junie, .antigravity, .devin, .grok, .copilot, .windsurf, .amp, .droid }) |kind| {
+        var dir_buf: [512]u8 = undefined;
+        plat.makeDir(agent_mcp.presenceDir(&dir_buf, home, kind.mcpKind().?).?);
+        try t.expect(agent_mcp.install(t.allocator, home, kind.mcpKind().?));
+        const info = scan(t.allocator, home)[@intFromEnum(kind)];
+        try t.expect(info.status != .current);
+        try t.expectEqual(agent_mcp.Status.current, info.mcp_status.?);
+    }
+}
+
+test "host lifecycle schemas preserve foreign hooks and require all events" {
+    const home = ".zig-cache/petdex-lifecycle-contracts";
+    _ = plat.deleteTree(home);
+    defer _ = plat.deleteTree(home);
+    for ([_]AgentKind{ .cursor, .junie, .antigravity, .devin, .grok }) |kind| {
+        var path_buf: [512]u8 = undefined;
+        const path = lifecyclePath(&path_buf, home, kind).?;
+        plat.makeDir(std.fs.path.dirname(path).?);
+        try t.expect(writeFile(path, if (kind == .antigravity) "{\"foreign\":{\"Stop\":[{\"command\":\"user-hook\"}]}}" else "{\"hooks\":{\"Stop\":[{\"hooks\":[{\"command\":\"user-hook\"}]}]}}"));
+        try t.expect(installLifecycle(t.allocator, home, kind));
+        try t.expect(installLifecycle(t.allocator, home, kind));
+        const bytes = readFileAlloc(t.allocator, path, 1024 * 1024).?;
+        defer t.allocator.free(bytes);
+        try t.expectEqual(HookStatus.current, lifecycleConfigStatus(t.allocator, bytes, kind));
+        try t.expect(std.mem.indexOf(u8, bytes, "user-hook") != null);
+        if (kind == .junie) try t.expect(std.mem.indexOf(u8, bytes, "PermissionRequest") == null);
+        if (kind == .cursor) {
+            try t.expect(std.mem.indexOf(u8, bytes, "permission") == null);
+            try t.expect(std.mem.indexOf(u8, bytes, "preToolUse") == null);
+            try t.expect(std.mem.indexOf(u8, bytes, "continue") != null);
+        }
+        try t.expect(uninstallLifecycle(t.allocator, home, kind));
+        const removed = readFileAlloc(t.allocator, path, 1024 * 1024).?;
+        defer t.allocator.free(removed);
+        try t.expect(std.mem.indexOf(u8, removed, "petdex-hook") == null);
+        try t.expect(std.mem.indexOf(u8, removed, "user-hook") != null);
+    }
+    try t.expectEqual(HookStatus.none, lifecycleConfigStatus(t.allocator, "{\"disableAllHooks\":true,\"hooks\":{}}", .claude_code));
+}
+test "Copilot Cascade Amp and Droid install update scan and remove" {
+    const home = ".zig-cache/petdex-expanded-integrations";
+    _ = plat.deleteTree(home);
+    defer _ = plat.deleteTree(home);
+    for ([_]AgentKind{ .copilot, .windsurf, .amp, .droid }) |kind| {
+        try t.expect(installLifecycle(t.allocator, home, kind));
+        try t.expectEqual(HookStatus.current, lifecycleStatus(t.allocator, home, kind));
+        try t.expect(scan(t.allocator, home)[@intFromEnum(kind)].needsMcpSetup());
+        var buf: [512]u8 = undefined;
+        const path = lifecyclePath(&buf, home, kind).?;
+        const first = readFileAlloc(t.allocator, path, 1024 * 1024).?;
+        defer t.allocator.free(first);
+        try t.expect(installLifecycle(t.allocator, home, kind));
+        const second = readFileAlloc(t.allocator, path, 1024 * 1024).?;
+        defer t.allocator.free(second);
+        try t.expectEqualStrings(first, second);
+        if (kind != .amp) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, second, .{});
+            defer parsed.deinit();
+            const events = if (kind == .droid) parsed.value else parsed.value.object.get("hooks").?;
+            for (lifecycleEvents(kind)) |ev| {
+                const entries = events.object.get(ev.event).?.array.items;
+                try t.expectEqual(@as(usize, 1), entries.len);
+                if (kind == .copilot) try t.expectEqual(@as(i64, 2), entries[0].object.get("timeoutSec").?.integer);
+                if (kind == .windsurf) try t.expect(!entries[0].object.get("show_output").?.bool);
+                if (kind == .droid) try t.expect(entries[0].object.get("hooks").? == .array);
+            }
+        }
+        try t.expect(uninstallLifecycle(t.allocator, home, kind));
+        try t.expect(lifecycleStatus(t.allocator, home, kind) != .current);
+    }
+}
+
+test "Droid migrates legacy hooks without disabling or dropping user hooks" {
+    const home = ".zig-cache/petdex-droid-legacy";
+    _ = plat.deleteTree(home);
+    defer _ = plat.deleteTree(home);
+    plat.makeDir(home ++ "/.factory");
+    try t.expect(writeFile(home ++ "/.factory/settings.json",
+        \\{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"user-hook"}]}]},"hooksDisabled":true}
+    ));
+    try t.expect(installLifecycle(t.allocator, home, .droid));
+    try t.expectEqual(HookStatus.none, lifecycleStatus(t.allocator, home, .droid));
+    const content = readFileAlloc(t.allocator, home ++ "/.factory/hooks.json", 1024 * 1024).?;
+    defer t.allocator.free(content);
+    try t.expect(std.mem.indexOf(u8, content, "user-hook") != null);
+    try t.expect(uninstallLifecycle(t.allocator, home, .droid));
+    const removed = readFileAlloc(t.allocator, home ++ "/.factory/hooks.json", 1024 * 1024).?;
+    defer t.allocator.free(removed);
+    try t.expect(std.mem.indexOf(u8, removed, "user-hook") != null);
+}
+
+test "Copilot disabled settings and malformed expanded configs are preserved" {
+    const home = ".zig-cache/petdex-expanded-disabled";
+    _ = plat.deleteTree(home);
+    defer _ = plat.deleteTree(home);
+    try t.expect(installLifecycle(t.allocator, home, .copilot));
+    try t.expect(writeFile(home ++ "/.copilot/settings.json", "{\"disableAllHooks\":true}"));
+    try t.expectEqual(HookStatus.none, lifecycleStatus(t.allocator, home, .copilot));
+    for ([_]AgentKind{ .copilot, .windsurf, .droid }) |kind| {
+        var buf: [512]u8 = undefined;
+        const path = lifecyclePath(&buf, home, kind).?;
+        plat.makeDir(std.fs.path.dirname(path).?);
+        try t.expect(writeFile(path, "{broken"));
+        try t.expect(!installLifecycle(t.allocator, home, kind));
+        const unchanged = readFileAlloc(t.allocator, path, 1024).?;
+        defer t.allocator.free(unchanged);
+        try t.expectEqualStrings("{broken", unchanged);
+    }
+}
+
+test "restricted matchers and wrong schemas cannot claim complete lifecycle coverage" {
+    const home = ".zig-cache/petdex-restricted-lifecycle";
+    _ = plat.deleteTree(home);
+    defer _ = plat.deleteTree(home);
+    for ([_]AgentKind{ .copilot, .windsurf, .droid, .junie }) |kind| {
+        try t.expect(installLifecycle(t.allocator, home, kind));
+        var path_buf: [512]u8 = undefined;
+        const bytes = readFileAlloc(t.allocator, lifecyclePath(&path_buf, home, kind).?, 1024 * 1024).?;
+        defer t.allocator.free(bytes);
+        var arena = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var root = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+        const hooks = if (kind == .droid) &root else root.object.getPtr("hooks").?;
+        const event = lifecycleEvents(kind)[1];
+        const entry = &hooks.object.getPtr(event.event).?.array.items[0];
+        try entry.object.put(a, "matcher", .{ .string = "NeverMatchPetdexTools" });
+        const restricted = try std.json.Stringify.valueAlloc(a, root, .{});
+        try t.expectEqual(HookStatus.node, lifecycleConfigStatus(t.allocator, restricted, kind));
+        _ = entry.object.orderedRemove("matcher");
+        if (lifecycleUsesGroups(kind, event)) {
+            entry.* = entry.object.get("hooks").?.array.items[0];
+        } else {
+            const original = entry.*;
+            entry.* = emptyObject(a);
+            var commands = std.json.Array.init(a);
+            try commands.append(original);
+            try entry.object.put(a, "hooks", .{ .array = commands });
+        }
+        const malformed = try std.json.Stringify.valueAlloc(a, root, .{});
+        try t.expectEqual(HookStatus.node, lifecycleConfigStatus(t.allocator, malformed, kind));
+    }
+}
+
+test "PowerShell observer commands are recognized without approving tools" {
+    var buf: [512]u8 = undefined;
+    const command = powershellCommand(&buf, "pre", "copilot").?;
+    try t.expect(std.mem.endsWith(u8, command, "catch {}; exit 0"));
+    try t.expect(std.mem.indexOf(u8, command, "ReadToEnd") == null);
+    try t.expect(std.mem.indexOf(u8, command, " | ") == null);
+    try t.expectEqual(@as(usize, 2), std.mem.count(u8, command, "*> $null"));
+    try t.expect(std.mem.indexOf(u8, command, "$env:HOME/.petdex/bin/petdex-hook.cmd") != null);
+    try t.expectEqual(ManagedHookGeneration.current, commandGenerationForTarget(command, true));
+    try t.expectEqual(ManagedHookGeneration.legacy, commandGenerationForTarget(command, false));
+    for (copilot_events) |event| try t.expect(!std.mem.eql(u8, event.event, "permissionRequest"));
 }

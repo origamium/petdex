@@ -1,5 +1,10 @@
 # Agent usage limits: acquisition audit
 
+For the latest implementation and live verification results, see
+[the September 19 integration verification](integration-verification-2026-09-19.md),
+which supersedes [the earlier usage report](usage-verification-2026-09-19.md).
+The implementation-status column below is a historical September 14 snapshot.
+
 Verified on 2026-09-14 for the native desktop usage column. This is an
 acquisition report, not a claim that the additional providers are implemented.
 Account identifiers, credentials, balances and personal usage measurements are

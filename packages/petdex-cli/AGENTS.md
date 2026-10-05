@@ -28,7 +28,7 @@ The published name is plain `petdex` (unscoped, no `@crafter/` prefix). Requires
 | `petdex telemetry [on\|off\|status]` | Manage anonymous usage telemetry |
 | `petdex version` (or `--version`, `-v`) | Print the CLI version |
 
-Internal commands (invoked by tooling, not by hand): `petdex bubble <pre|post|stop>` is the hot-path hook runner agents call on tool events, and `petdex mcp-server` is the MCP server subprocess for Antigravity. Both bypass help/telemetry output on purpose.
+Internal commands (invoked by tooling, not by hand): `petdex bubble <pre|post|stop>` is the hot-path hook runner agents call on tool events, and `petdex mcp-server` is the MCP server subprocess for MCP-capable agents (Codex, Claude Code, Cursor, Gemini, Junie, Antigravity, OpenCode, Devin CLI, Grok CLI, …). Set `PETDEX_MCP_AGENT` so bubbles and usage land under the right logo. Both bypass help/telemetry output on purpose.
 
 Removed in v1.0.0: `init`, `up`, `down`, `toggle`, `desktop`, `update`, `doctor`, `hooks`, and `install desktop`. Running them prints a pointer to the Petdex Desktop app, which now owns hooks, lifecycle, and updates. `select` is gone too (pick the active mascot in the desktop app's Settings).
 

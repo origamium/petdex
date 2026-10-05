@@ -181,6 +181,7 @@ const PetdexPlugin = async ({ client }) => {
   // The model each session's assistant last answered with, from its
   // message.updated events.
   const modelCache = new Map();
+  const failedSessions = new Set();
   async function sessionTitle(sessionID) {
     if (!sessionID || !client) return titleCache.get(sessionID) || null;
     try {
@@ -212,18 +213,56 @@ const PetdexPlugin = async ({ client }) => {
       model: modelCache.get(input.sessionID),
     }),
     event: async ({ event }) => {
+      // The host's bus has shipped both properties and data envelopes.
+      const properties = event?.properties ?? event?.data;
       // A message event carries its session inside `info`, not as
       // properties.sessionID, so it is handled before that check.
       if (event?.type === "message.updated") {
-        const info = event.properties?.info;
+        const info = properties?.info;
+        if (info?.role === "user" && typeof info.sessionID === "string") failedSessions.delete(info.sessionID);
         if (info?.role === "assistant" && typeof info.sessionID === "string" && typeof info.modelID === "string") {
           modelCache.set(info.sessionID, info.modelID);
         }
         return;
       }
-      const sessionId = event?.properties?.sessionID;
+      const sessionId = properties?.sessionID;
       if (typeof sessionId !== "string" || sessionId.length === 0) return;
-      if (event.type === "session.idle") {
+      if (event.type === "session.deleted") {
+        failedSessions.delete(sessionId);
+        titleCache.delete(sessionId);
+        modelCache.delete(sessionId);
+        return;
+      }
+      if (event.type === "session.status" && properties.status?.type === "busy") {
+        failedSessions.delete(sessionId);
+        return;
+      }
+      if (["permission.asked", "permission.v2.asked", "question.asked", "question.v2.asked"].includes(event.type)) {
+        await notify({
+          state: "waiting",
+          text: event.type.startsWith("permission.") ? "Waiting for approval…" : "Waiting for your answer…",
+          title: await sessionTitle(sessionId),
+          busy: false,
+          sessionId,
+          model: modelCache.get(sessionId),
+          agentState: "waiting",
+        });
+      } else if (["permission.replied", "permission.v2.replied", "question.replied", "question.v2.replied", "question.rejected", "question.v2.rejected"].includes(event.type)) {
+        // Observe the resolved prompt; never return a permission decision.
+        // A denial/rejection still resumes the agent so it can react.
+        await notify({
+          state: "running",
+          text: "Continuing…",
+          title: await sessionTitle(sessionId),
+          busy: true,
+          sessionId,
+          model: modelCache.get(sessionId),
+          agentState: "running",
+        });
+      } else if (event.type === "session.idle") {
+        // An error also settles the host to idle. That is not a successful
+        // completion; retain the failure until a new turn actually starts.
+        if (failedSessions.has(sessionId)) return;
         await notify({
           state: "waving",
           duration: 1500,
@@ -234,6 +273,7 @@ const PetdexPlugin = async ({ client }) => {
           model: modelCache.get(sessionId),
         });
       } else if (event.type === "session.error") {
+        failedSessions.add(sessionId);
         await notify({
           state: "failed",
           duration: 2500,

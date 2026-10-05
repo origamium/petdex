@@ -48,7 +48,7 @@ pub const remote_host_file = "~/.petdex/runtime/remote-host";
 pub const remote_hermes_home_file = "~/.petdex/runtime/hermes-home";
 pub const remote_lease_file = "~/.petdex/runtime/tunnel-lease";
 pub const missing_file_exit_code: i32 = 44;
-pub const remote_opencode_plugin = "~/.config/opencode/plugins/petdex.js";
+pub const remote_opencode_config = "~/.config/opencode/opencode.json";
 pub const remote_codex_hooks = "~/.codex/hooks.json";
 pub const remote_hermes_config = "~/.hermes/config.yaml";
 pub const remote_hermes_allowlist = "~/.hermes/shell-hooks-allowlist.json";
@@ -498,13 +498,13 @@ test "read and write quote remote paths for the remote shell" {
     try t.expect(std.mem.indexOf(u8, rd[rd.len - 1], "cat -- \"$target\"") != null);
 
     var scratch2: Scratch = .{};
-    const wr = writeArgv(&buf, &scratch2, &test_remote, remote_opencode_plugin, true, false, false).?;
+    const wr = writeArgv(&buf, &scratch2, &test_remote, remote_opencode_config, true, false, false).?;
     try t.expect(std.mem.indexOf(u8, wr[wr.len - 1], "cat > \"$tmp\"") != null);
     try t.expect(std.mem.indexOf(u8, wr[wr.len - 1], ".petdex-tmp-${remote_name}") != null);
     try t.expect(std.mem.indexOf(u8, wr[wr.len - 1], "mv -f") == null);
 
     var scratch3: Scratch = .{};
-    const app = writeArgv(&buf, &scratch3, &test_remote, remote_opencode_plugin, false, true, false).?;
+    const app = writeArgv(&buf, &scratch3, &test_remote, remote_opencode_config, false, true, false).?;
     try t.expect(std.mem.indexOf(u8, app[app.len - 1], "cat >> \"$tmp\"") != null);
     try t.expect(std.mem.indexOf(u8, app[app.len - 1], "chmod 600 \"$tmp\" && mv -f") != null);
 
