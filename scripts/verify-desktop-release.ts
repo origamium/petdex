@@ -19,7 +19,7 @@ export function verifyDesktopAssets(directory: string) {
     )
   ) {
     throw new Error(
-      "Release must contain exactly the expected macOS, Linux and Windows assets",
+      "Release must contain exactly the expected macOS assets",
     );
   }
   const checksums = desktopAssets

@@ -49,7 +49,7 @@ deletes that file once it passes 32 MB.
 See [Desktop releases](../../docs/desktop-releases.md) for GitHub Actions setup,
 Apple signing secrets, DMG/ZIP packaging checks, and tag-driven publication.
 `bun run release:desktop <version> --dry-run` validates a release before tagging;
-Actions builds and publishes macOS (Apple Silicon/Intel), Linux and Windows.
+Actions builds and publishes macOS (Apple Silicon/Intel).
 
 ## Navigation
 

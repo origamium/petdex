@@ -198,18 +198,18 @@ describe("complete release before publication", () => {
       writeFileSync(path.join(dir, name), "abc");
     return dir;
   }
-  test("checksums all platforms, including compatibility asset names", () => {
+  test("checksums every macOS asset, including compatibility asset names", () => {
     const dir = stage();
     verifyDesktopAssets(dir);
     const sums = readFileSync(path.join(dir, "SHA256SUMS"), "utf8");
-    expect(sums.trim().split("\n")).toHaveLength(11);
+    expect(sums.trim().split("\n")).toHaveLength(desktopAssets.length);
     expect(sums).toContain(
       "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  Petdex-arm64.dmg",
     );
     verifyDesktopAssets(dir); // A retry regenerates the checksum file.
     expect(readFileSync(path.join(dir, "SHA256SUMS"), "utf8")).toBe(sums);
   });
-  test("missing or empty platform files cannot publish", () => {
+  test("missing or empty asset files cannot publish", () => {
     for (const missing of desktopAssets) {
       const dir = stage();
       rmSync(path.join(dir, missing));

@@ -56,9 +56,4 @@ export const desktopAssets = [
   "petdex-desktop-native-darwin-x64.zip",
   "petdex-desktop-darwin-arm64.zip",
   "petdex-desktop-darwin-x64.zip",
-  "petdex-desktop-native-linux-x64",
-  "petdex-desktop-linux-x64",
-  "petdex-desktop-native-linux-x64.tar.gz",
-  "petdex-desktop-native-win32-x64.exe",
-  "petdex-desktop-win32-x64.exe",
 ] as const;
