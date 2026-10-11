@@ -7,65 +7,109 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to release (e.g. desktop-v0.1.0)"
+        description: "Tag (new: created at selected ref; existing: rebuild that tag)"
         required: true
+        type: string
+      draft:
+        description: "Keep the completed release as a draft"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+# Must match desktop-native-ci.yml (checked before any build starts).
+env:
+  NATIVE_SDK_REMOTE: "https://github.com/Railly/native.git"
+  NATIVE_SDK_BRANCH: "feat/floating-window-0.5.3"
+  NATIVE_SDK_REF: "c0b10d027efa490fc99a3bc7f1cf88b015999d45"
 
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write # Manual runs may create a tag; GITHUB_TOKEN does not retrigger this workflow.
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      commit: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref }}
+      - uses: oven-sh/setup-bun@v2
+      - name: Resolve existing tag or select source for a new manual release
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          bun -e 'import {parseDesktopTag} from "./scripts/desktop-release-config.ts"; parseDesktopTag(process.env.RELEASE_TAG)'
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG"; then
+            git fetch --depth 1 origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+            git checkout --detach "refs/tags/$RELEASE_TAG"
+          else
+            STATUS=$?
+            [[ "$STATUS" == 2 && "$EVENT_NAME" == workflow_dispatch ]] || exit "$STATUS"
+          fi
+      - name: Validate tag, manifest versions and SDK pins
+        id: version
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: bun scripts/verify-desktop-release.ts "$RELEASE_TAG"
+      - name: Resolve immutable build source
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Check signing configuration before building
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          for name in MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD MACOS_SIGN_IDENTITY APPLE_API_KEY_P8_BASE64 APPLE_API_KEY_ID APPLE_API_ISSUER; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing repository secret: $name (see docs/desktop-releases.md)"
+              exit 1
+            fi
+          done
+      - name: Create the tag for a new manual release
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            git tag "$RELEASE_TAG"
+            git push origin "refs/tags/$RELEASE_TAG"
+          fi
+
   build-native:
-    name: build native ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
+    name: build macos ${{ matrix.arch }}
+    needs: validate
+    timeout-minutes: 90
+    runs-on: macos-14
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # No macOS leg. Its bundle is signed and notarized from a
-          # workstation with the Developer ID in its keychain, and an
-          # adhoc-signed one is rejected by Gatekeeper on every Mac but
-          # the builder -- which is how v0.3.0 first shipped. A job that
-          # only ever fails on purpose is worse than no job: `needs`
-          # treats the failure as real and skips publishing, so 0.3.1
-          # built both other targets and released nothing.
-          # Run scripts/sign-macos.sh, then upload its output to the tag.
-          - target: linux-x64
-            runner: ubuntu-latest
-          - target: win32-x64
-            runner: windows-2022
+        arch: [arm64]
 
     steps:
       - name: Checkout petdex
         uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.tag || github.ref }}
-
-      - name: Install Linux GUI libraries
-        # gtk4 is the host toolkit and libX11 carries the floating flag
-        # (GTK4 dropped gtk_window_set_keep_above, so the window manager
-        # is told through _NET_WM_STATE_ABOVE). webp-pixbuf-loader is
-        # what lets gdk-pixbuf read a pet at all: 60 of the 63 sheets in
-        # the catalog are webp and Ubuntu ships no loader for them.
-        if: matrix.target == 'linux-x64'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libx11-dev pkg-config webp-pixbuf-loader
+          ref: ${{ needs.validate.outputs.commit }}
 
       - name: Clone the Native SDK
-        # petdex-desktop-native needs the floating/transparent/click_through
-        # window options and fx.focusWindow, none of which are in
-        # vercel-labs/main yet. Pinned by commit for the same reason the
-        # zero-native clone above is: a mutable fork branch must not be able
-        # to change what a tagged release contains. Point NATIVE_SDK_REMOTE
-        # and NATIVE_SDK_REF at vercel-labs/main once those land upstream.
-        # Kept identical to desktop-native-ci.yml's pin on purpose: that
-        # workflow is the only thing that runs these binaries, so a
-        # release built from a different SDK commit is untested by
-        # construction. Moving one pin without the other is the bug.
-        env:
-          NATIVE_SDK_REMOTE: "https://github.com/Railly/native.git"
-          NATIVE_SDK_BRANCH: "feat/floating-window-0.5.3"
-          NATIVE_SDK_REF: "c0b10d027efa490fc99a3bc7f1cf88b015999d45"
-        # Explicit bash: this job now runs on a Windows runner too, where
-        # the default shell is PowerShell and `set -euo pipefail` fails
-        # as an unknown parameter before git is ever reached.
         shell: bash
         run: |
           set -euo pipefail
@@ -94,126 +138,118 @@ jobs:
           zig build cli
           echo "NATIVE_CLI=$NATIVE_SDK_PATH/zig-out/bin/native" >> "$GITHUB_ENV"
 
-      - name: Build petdex-desktop-native
-        working-directory: packages/petdex-desktop-native
-        shell: bash
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Build macOS packager
+        run: scripts/setup-native-packager.sh
+
+      - name: Install Apple signing credentials
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: |
-          # Released binaries must run on every x86-64 CPU, not just the
-          # runner's. Without -Dcpu=baseline Zig targets the host, and
-          # the GitHub runner is new enough to emit AVX-512: the
-          # desktop-v0.3.1 Windows exe carries 862 kmovd and 199
-          # vpternlogd, which no Zen 3 chip decodes. That is the
-          # 0xC000001D illegal-instruction crash in #604 and #618.
-          "$NATIVE_CLI" build -Dcpu=baseline -Dtrace=off
-          ls -lh zig-out/bin/
+          set -euo pipefail
+          umask 077
+          KEYCHAIN="$RUNNER_TEMP/petdex-signing.keychain-db"
+          PASSWORD=$(openssl rand -hex 32)
+          echo "::add-mask::$PASSWORD"
+          security default-keychain -d user > "$RUNNER_TEMP/petdex-default-keychain.txt"
+          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/petdex-certificate.p12"
+          printf '%s' "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/petdex-notary.p8"
+          security create-keychain -p "$PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/petdex-certificate.p12" -P "$MACOS_CERTIFICATE_PASSWORD" -k "$KEYCHAIN" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -k "$PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          security default-keychain -d user -s "$KEYCHAIN"
+          xcrun notarytool store-credentials petdex-ci \
+            --key "$RUNNER_TEMP/petdex-notary.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER"
+          rm -f "$RUNNER_TEMP/petdex-certificate.p12" "$RUNNER_TEMP/petdex-notary.p8"
 
-      - name: Stage the binary (Linux)
-        if: matrix.target == 'linux-x64'
-        working-directory: packages/petdex-desktop-native
-        shell: bash
+      - name: Build, sign, notarize and package macOS
+        env:
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_NOTARY_PROFILE: petdex-ci
+        run: scripts/sign-macos.sh "$RUNNER_TEMP/macos" "${{ matrix.arch }}"
+
+      - name: Remove Apple signing credentials
+        if: always()
         run: |
-          cp zig-out/bin/petdex-desktop-native "petdex-desktop-native-${{ matrix.target }}"
-          chmod +x "petdex-desktop-native-${{ matrix.target }}"
-          # Same upgrade bridge as macOS, though no Linux build ever
-          # shipped under the old name: publishing it keeps the asset
-          # table uniform across targets.
-          cp zig-out/bin/petdex-desktop-native "petdex-desktop-${{ matrix.target }}"
-          chmod +x "petdex-desktop-${{ matrix.target }}"
+          if [[ -f "$RUNNER_TEMP/petdex-default-keychain.txt" ]]; then
+            DEFAULT_KEYCHAIN=$(tr -d '"' < "$RUNNER_TEMP/petdex-default-keychain.txt" | xargs)
+            security default-keychain -d user -s "$DEFAULT_KEYCHAIN"
+          fi
+          if [[ -f "$RUNNER_TEMP/petdex-signing.keychain-db" ]]; then
+            security delete-keychain "$RUNNER_TEMP/petdex-signing.keychain-db"
+          fi
+          rm -f "$RUNNER_TEMP/petdex-certificate.p12" "$RUNNER_TEMP/petdex-notary.p8" "$RUNNER_TEMP/petdex-default-keychain.txt"
 
-          # A bare binary cannot answer petdex:// links. The scheme is
-          # resolved on Linux through a .desktop entry carrying
-          # MimeType=x-scheme-handler/petdex, which `native package`
-          # generates from app.zon alongside the icon set, and which the
-          # two copies above throw away. The tarball ships that tree so a
-          # real install has something to register; the loose binaries
-          # stay for existing installs that update by replacing a file.
-          "$NATIVE_CLI" package --target linux \
-            --binary zig-out/bin/petdex-desktop-native \
-            --output "$RUNNER_TEMP/pkg-linux"
-          DESKTOP=$(ls "$RUNNER_TEMP"/pkg-linux/share/applications/*.desktop 2>/dev/null | head -1)
-          test -n "$DESKTOP" || { echo "package wrote no .desktop entry"; exit 1; }
-          grep -q "x-scheme-handler/petdex" "$DESKTOP" || {
-            echo "packaged .desktop does not claim the petdex scheme:"; cat "$DESKTOP"; exit 1; }
-          # --exclude because packaging copies the assets directory
-          # verbatim, and a .DS_Store authored on a maintainer's Mac has
-          # no business inside a Linux release.
-          tar -czf "petdex-desktop-native-${{ matrix.target }}.tar.gz" \
-            --exclude='.DS_Store' -C "$RUNNER_TEMP/pkg-linux" .
-
-          ls -lh "petdex-desktop-native-${{ matrix.target }}" "petdex-desktop-${{ matrix.target }}" \
-            "petdex-desktop-native-${{ matrix.target }}.tar.gz"
-
-      - name: Stage the binary (Windows)
-        if: matrix.target == 'win32-x64'
-        working-directory: packages/petdex-desktop-native
-        shell: bash
+      - name: Stage artifact directory
         run: |
-          cp zig-out/bin/petdex-desktop-native.exe "petdex-desktop-native-${{ matrix.target }}.exe"
-          # Upgrade bridge, as on macOS: 474 people downloaded
-          # petdex-desktop-win32-x64.exe from 0.2.3 alone.
-          cp zig-out/bin/petdex-desktop-native.exe "petdex-desktop-${{ matrix.target }}.exe"
-          ls -lh "petdex-desktop-native-${{ matrix.target }}.exe" "petdex-desktop-${{ matrix.target }}.exe"
+          mkdir -p "$RUNNER_TEMP/release-assets"
+          cp "$RUNNER_TEMP/macos/"*.zip "$RUNNER_TEMP/macos/"*.dmg "$RUNNER_TEMP/release-assets/"
 
       - name: Upload native bundle artifact
         uses: actions/upload-artifact@v7
         with:
-          name: petdex-desktop-native-${{ matrix.target }}
-          # One glob for several shapes: a bare ELF on Linux, an .exe on
-          # Windows, plus the Linux tarball that carries the .desktop
-          # entry. Only the ones its own job produced exist per target.
-          path: |
-            packages/petdex-desktop-native/petdex-desktop-native-${{ matrix.target }}
-            packages/petdex-desktop-native/petdex-desktop-native-${{ matrix.target }}.zip
-            packages/petdex-desktop-native/petdex-desktop-native-${{ matrix.target }}.exe
-            packages/petdex-desktop-native/petdex-desktop-${{ matrix.target }}
-            packages/petdex-desktop-native/petdex-desktop-${{ matrix.target }}.exe
-            packages/petdex-desktop-native/petdex-desktop-native-${{ matrix.target }}.tar.gz
+          name: petdex-desktop-native-darwin-${{ matrix.arch }}
+          path: ${{ runner.temp }}/release-assets/*
           if-no-files-found: error
+          retention-days: 7
 
   release:
     name: publish github release
-    needs: [build-native]
+    needs: [validate, build-native]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+      KEEP_DRAFT: ${{ inputs.draft || false }}
     steps:
-      - name: Checkout petdex
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.tag || github.ref }}
-
-      - name: Download all binaries
+          ref: ${{ needs.validate.outputs.commit }}
+      - uses: oven-sh/setup-bun@v2
+      - name: Download all platform assets
         uses: actions/download-artifact@v8
         with:
-          path: artifacts
-
-      - name: Stage release assets
+          pattern: petdex-desktop-native-*
+          path: release
+          merge-multiple: true
+      - name: Verify complete release and generate checksums
+        run: bun scripts/verify-desktop-release.ts "$RELEASE_TAG" release
+      - name: Upload assets to a draft, then publish
         run: |
-          mkdir -p release
-          find artifacts -type f -name "petdex-desktop-*" -exec cp {} release/ \;
-          # macOS is absent on purpose: its bundle is signed and
-          # notarized from a workstation (scripts/sign-macos.sh) and
-          # uploaded to the release afterwards.
-          test -f release/petdex-desktop-native-linux-x64
-          test -f release/petdex-desktop-native-win32-x64.exe
-          # The compatibility names existing installs update through.
-          test -f release/petdex-desktop-linux-x64
-          test -f release/petdex-desktop-win32-x64.exe
-          # The Linux tree, without which a fresh install has no .desktop
-          # entry and petdex:// links resolve to nothing on that platform.
-          test -f release/petdex-desktop-native-linux-x64.tar.gz
-          ls -lh release/
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          # `inputs.tag` is set on workflow_dispatch (manual run); on push of
-          # a desktop-v* tag, `github.ref_name` carries the tag. The
-          # `inputs.tag || github.ref_name` order works because `inputs.tag`
-          # is null on tag pushes.
-          tag_name: ${{ inputs.tag || github.ref_name }}
-          files: release/*
-          overwrite_files: true
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          prerelease: ${{ contains(inputs.tag || github.ref_name, '-rc') }}
+          set -euo pipefail
+          # Resolve errors separately from a missing release. Never replace a
+          # published binary; an interrupted draft can safely be retried.
+          EXISTING=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+            --jq '.[] | [.tag_name, .draft] | @tsv' | awk -F '\t' -v tag="$RELEASE_TAG" '$1 == tag { print $2 }')
+          if [[ "$EXISTING" == false ]]; then
+            echo "::error::Release $RELEASE_TAG is already published; use a new version."
+            exit 1
+          fi
+          if [[ -z "$EXISTING" ]]; then
+            gh release create "$RELEASE_TAG" --verify-tag --draft \
+              --title "Petdex ${RELEASE_TAG#desktop-v}" --generate-notes \
+              --prerelease="$PRERELEASE"
+          fi
+          gh release upload "$RELEASE_TAG" release/* --clobber
+          if [[ "$KEEP_DRAFT" != true ]]; then
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease="$PRERELEASE"
+          fi
+          echo "Release: https://github.com/$GH_REPO/releases/tag/$RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"

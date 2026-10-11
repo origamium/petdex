@@ -44,6 +44,13 @@ Builds pass `-Dtrace=off`. Without it the SDK appends a trace record per frame
 and timer to `native-sdk.jsonl` in the platform log directory (#714); the app
 deletes that file once it passes 32 MB.
 
+## Packaging and releases
+
+See [Desktop releases](../../docs/desktop-releases.md) for GitHub Actions setup,
+Apple signing secrets, DMG/ZIP packaging checks, and tag-driven publication.
+`bun run release:desktop <version> --dry-run` validates a release before tagging;
+Actions builds and publishes macOS (Apple Silicon).
+
 ## Navigation
 
 The pet’s right-click menu and the menu-bar extra share live Show/Hide
