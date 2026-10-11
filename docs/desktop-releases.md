@@ -97,14 +97,11 @@ A release in a fork does not redirect petdex.dev or the app's existing upstream
 update links to that fork. Download fork releases from the fork's Releases page;
 changing the update service is a separate app configuration change.
 
-## Packaging checks without Apple credentials
+## Local packaging preview
 
-`desktop-packaging-ci.yml` tests version/tag and artifact validation and builds an
-ad-hoc-signed macOS preview when packaging code changes. Its DMG/ZIP names contain
-`-unsigned` and are excluded from the release asset set. They are for packaging
-inspection, not public distribution; they do not pass Developer ID Gatekeeper
-verification. The existing native CI continues to build and exercise platform
-runtime behavior.
+An ad-hoc-signed preview for inspecting packaging without Apple credentials. Its
+DMG/ZIP names contain `-unsigned`; it does not pass Developer ID Gatekeeper
+verification and is never published.
 
 Local preview, with Zig 0.16.0, Bun and Python 3.10+ installed:
 
