@@ -51,9 +51,6 @@ export function verifyDesktopVersion(tag: string, root = desktopRoot) {
 
 export const desktopAssets = [
   "Petdex-arm64.dmg",
-  "Petdex-x64.dmg",
   "petdex-desktop-native-darwin-arm64.zip",
-  "petdex-desktop-native-darwin-x64.zip",
   "petdex-desktop-darwin-arm64.zip",
-  "petdex-desktop-darwin-x64.zip",
 ] as const;

@@ -2,8 +2,8 @@
 
 GitHub Actions builds the tagged source and publishes a complete GitHub Release
 in **the repository running the workflow**. A maintainer's Mac is no longer
-required. The release is macOS only: signed and notarized DMGs and ZIPs for Apple
-Silicon and Intel, plus `SHA256SUMS`. Linux and Windows are not built or released.
+required. The release is Apple Silicon macOS only: a signed and notarized DMG and ZIPs,
+plus `SHA256SUMS`. Intel, Linux and Windows are not built or released.
 
 ## One-time setup
 
@@ -68,7 +68,7 @@ gh workflow run desktop-release.yml --ref main \
 A manual run creates its tag with `GITHUB_TOKEN`, so it does not start a second
 tag-triggered build. Normal tag pushes publish automatically. All build jobs
 use the resolved commit SHA. A failure on any platform prevents publication.
-After all 6 files pass validation, the publish job generates checksums,
+After all 4 files pass validation, the publish job generates checksums,
 uploads everything to a draft, and only then makes the release public. The job
 uses the current GitHub repository, never a hardcoded upstream repository.
 
@@ -115,7 +115,6 @@ export NATIVE_SDK_PATH="$HOME/.cache/petdex/native-sdk-c0b10d027efa490fc99a3bc7f
 export NATIVE_CLI="$NATIVE_SDK_PATH/zig-out/bin/native"
 export NATIVE_PACKAGER_CLI="$HOME/.cache/petdex/native-packager-064ca9890cc0cf8adc198215bd0ddaeb586c220a/zig-out/bin/native"
 scripts/sign-macos.sh dist/packaging-preview/arm64 arm64 --unsigned
-scripts/sign-macos.sh dist/packaging-preview/x64 x64 --unsigned
 ```
 
 The runtime SDK is pinned identically in native CI and the release workflow; the
