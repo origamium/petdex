@@ -73,7 +73,7 @@ npx petdex install boba
 `~/.petdex/pets/boba/` に `pet.json` とスプライトシートが入っていれば OK。
 
 2. [petdex.dev/download](https://petdex.dev/download) からデスクトップアプリを入手する。
-   macOS、Linux、Windows に対応。
+   このフォークのリリースは Apple Silicon の macOS のみ(Linux と Windows はソースからビルド。デスクトップ README を参照)。
 
 3. アプリを開き、ペットの上で <kbd>Cmd</kbd>+<kbd>,</kbd> を押して設定を開く。
    **Pets** でペットを選び、**Connections** でコーディングエージェントをそれぞれワンクリックで接続する。
@@ -120,7 +120,7 @@ petdex
 │   └── lib/db/schema.ts       Drizzle スキーマ(Postgres)
 ├── packages/
 │   ├── petdex-cli/            npm の `petdex` カタログクライアント(auth、list、install、submit)
-│   ├── petdex-desktop-native/ macOS / Linux / Windows 向けネイティブ SDK(Zig)製デスクトップペット: フック、チャット、タイマー、使用量、MCP、SSH リモート
+│   ├── petdex-desktop-native/ ネイティブ SDK(Zig)製デスクトップペット(リリースは Apple Silicon の macOS、Linux / Windows はソースから): フック、チャット、タイマー、使用量、MCP、SSH リモート
 │   └── discord-bot/           Petdex サーバー用 Discord.js ボット
 ├── docs/                      エージェント連携の対応表、検証メモ、ChatGPT ペット連携
 ├── public/built-with/         コミュニティページ用スクリーンショット

@@ -71,7 +71,7 @@ npx petdex install boba
 You should see `~/.petdex/pets/boba/` with `pet.json` and a spritesheet.
 
 2. Get the desktop app from [petdex.dev/download](https://petdex.dev/download). It
-   runs on macOS, Linux and Windows.
+   This fork's releases are Apple Silicon macOS only (Linux and Windows build from source, see the desktop README).
 
 3. Open it, then hit <kbd>Cmd</kbd>+<kbd>,</kbd> over the pet to open Settings.
    Pick your pet under **Pets**, and connect your coding agents under **Connections**
@@ -118,7 +118,7 @@ petdex
 │   └── lib/db/schema.ts       Drizzle schema (Postgres)
 ├── packages/
 │   ├── petdex-cli/            npm `petdex` catalog client (auth, list, install, submit)
-│   ├── petdex-desktop-native/ Native SDK (Zig) desktop pet for macOS, Linux and Windows: hooks, chat, timer, usage, MCP, SSH remotes
+│   ├── petdex-desktop-native/ Native SDK (Zig) desktop pet (released for Apple Silicon macOS; Linux/Windows from source): hooks, chat, timer, usage, MCP, SSH remotes
 │   └── discord-bot/           Discord.js bot for the Petdex server
 ├── docs/                      Agent integration support, verification notes, ChatGPT pet integration
 ├── public/built-with/         Screenshots for the community page
