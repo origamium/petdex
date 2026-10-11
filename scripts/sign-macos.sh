@@ -115,7 +115,7 @@ PACKAGE_VERSION="$(bun -e 'console.log((await Bun.file(process.argv[1]).json()).
 EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST")"
 MACH_ARCH=arm64
 [[ "$ARCH" != x64 ]] || MACH_ARCH=x86_64
-lipo -verify_arch "$MACH_ARCH" "$OUT/Petdex.app/Contents/MacOS/$EXECUTABLE"
+lipo "$OUT/Petdex.app/Contents/MacOS/$EXECUTABLE" -verify_arch "$MACH_ARCH"
 test -f "$OUT/Petdex.app/Contents/Resources/assets/icon.png"
 codesign --verify --deep --strict "$OUT/Petdex.app"
 if [[ "$UNSIGNED" == false ]]; then
