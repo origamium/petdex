@@ -28,12 +28,9 @@ name: petdex-desktop-native ci
 # NSApplicationDelegate application:openURLs:, which needs a real
 # LaunchServices-registered bundle, and there is no argv shortcut the way
 # Win32 has one. Registering one means packaging and `lsregister -f -R
-# -trusted`, and desktop-release.yml already refuses to build a macOS
-# bundle on CI because an adhoc-signed one is rejected by Gatekeeper
-# everywhere but the machine that built it. Adding that here would be a
-# packaging path this workflow does not otherwise exercise, mutating the
-# runner's LaunchServices database, to re-prove the one platform already
-# verified by hand. It stays out until something makes it cheap.
+# -trusted`. Packaging is exercised separately by desktop-packaging-ci.yml;
+# desktop-release.yml builds Developer ID signed and notarized bundles.
+# This runtime job still leaves macOS LaunchServices integration to manual QA.
 
 on:
   push:

@@ -2,19 +2,14 @@
 # Build, sign, notarize and staple the macOS desktop app, then stage the
 # release zips beside it.
 #
-# This runs from a workstation, not CI: the Developer ID lives in a local
-# keychain. Skipping it produces an adhoc bundle that Gatekeeper rejects
-# everywhere except the machine that built it, which is exactly how
-# v0.3.0 first shipped.
+# Runs on GitHub-hosted macOS or a workstation. Environment credentials take
+# precedence; ~/.config/petdex-apple/env remains a local fallback.
+# APPLE_NOTARY_PROFILE may name credentials already stored with notarytool.
+# Otherwise provide APPLE_API_KEY (path), APPLE_API_KEY_ID, APPLE_API_ISSUER.
+# SIGN_IDENTITY must be a Developer ID Application identity in the keychain.
 #
-# Needs ~/.config/petdex-apple/env with:
-#   APPLE_API_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER, SIGN_IDENTITY
-# And the caller must export NATIVE_CLI and NATIVE_SDK_PATH for the pinned
-# Native SDK used by the matching CI build.
-#
-# Usage:
-#   scripts/sign-macos.sh [output-dir] [arm64|x64]
-#   gh release upload desktop-vX.Y.Z <output-dir>/*.zip --clobber
+# Usage: scripts/sign-macos.sh [output-dir] [arm64|x64] [--unsigned]
+# --unsigned is packaging QA only; its files have different, non-release names.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -48,26 +43,53 @@ esac
 PKG="$REPO_ROOT/packages/petdex-desktop-native"
 CREDS="$HOME/.config/petdex-apple/env"
 
-[ -f "$CREDS" ] || { echo "missing $CREDS" >&2; exit 1; }
-# shellcheck disable=SC1090
-set -a && . "$CREDS" && set +a
-
-# The key path in env may be a bare filename; resolve it next to the env.
-KEY="$APPLE_API_KEY"
-[ -f "$KEY" ] || KEY="$(dirname "$CREDS")/$(basename "$APPLE_API_KEY")"
-[ -f "$KEY" ] || { echo "missing notarization key: $APPLE_API_KEY" >&2; exit 1; }
+UNSIGNED=false
+case "${3:-}" in
+  --unsigned) UNSIGNED=true ;;
+  "") ;;
+  *) echo "unknown option: $3" >&2; exit 1 ;;
+esac
+SUFFIX=""
+SIGNING=(--signing adhoc)
+if [[ "$UNSIGNED" == true ]]; then
+  SUFFIX="-unsigned"
+else
+  if [[ -z "${SIGN_IDENTITY:-}" || ( -z "${APPLE_NOTARY_PROFILE:-}" && -z "${APPLE_API_KEY:-}" ) ]]; then
+    [[ -f "$CREDS" ]] || { echo "Set signing/notarization environment variables or provide $CREDS" >&2; exit 1; }
+    # shellcheck disable=SC1090
+    set -a; . "$CREDS"; set +a
+  fi
+  : "${SIGN_IDENTITY:?set SIGN_IDENTITY to a Developer ID Application identity}"
+  [[ "$SIGN_IDENTITY" == "Developer ID Application: "* ]] || {
+    echo "Release signing requires a Developer ID Application identity" >&2; exit 1;
+  }
+  if [[ -z "${APPLE_NOTARY_PROFILE:-}" ]]; then
+    : "${APPLE_API_KEY:?set APPLE_API_KEY to the notarization key path}"
+    : "${APPLE_API_KEY_ID:?set APPLE_API_KEY_ID}"
+    : "${APPLE_API_ISSUER:?set APPLE_API_ISSUER}"
+    KEY="$APPLE_API_KEY"
+    [[ -f "$KEY" ]] || KEY="$(dirname "$CREDS")/$(basename "$APPLE_API_KEY")"
+    [[ -f "$KEY" ]] || { echo "missing notarization key" >&2; exit 1; }
+    APPLE_NOTARY_PROFILE=petdex-notary
+    xcrun notarytool store-credentials "$APPLE_NOTARY_PROFILE" \
+      --key "$KEY" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER"
+  fi
+  SIGNING=(--signing identity --identity "$SIGN_IDENTITY" --notarize --notary-profile "$APPLE_NOTARY_PROFILE")
+fi
 
 : "${NATIVE_CLI:?set NATIVE_CLI to the native CLI built from the pinned SDK}"
 : "${NATIVE_SDK_PATH:?set NATIVE_SDK_PATH to the pinned SDK checkout}"
-: "${NATIVE_PACKAGER_CLI:?set NATIVE_PACKAGER_CLI to the patched Native SDK 0.10.1 CLI}"
+: "${NATIVE_PACKAGER_CLI:?set NATIVE_PACKAGER_CLI to the Native SDK 0.10.1 CLI}"
+DMGBUILD="${DMGBUILD:-${XDG_CACHE_HOME:-$HOME/.cache}/petdex/dmgbuild/bin/dmgbuild}"
+[[ -x "$DMGBUILD" ]] || { echo "run scripts/setup-native-packager.sh first" >&2; exit 1; }
 
 "$(dirname "${BASH_SOURCE[0]}")/patch-native-sdk.sh"
 
 mkdir -p "$OUT"
 # Only this arch's outputs: a second run for the other arch must not
 # delete what the first one produced.
-rm -rf "$OUT/Petdex.app" "$OUT/petdex-desktop-darwin-$ARCH.zip" \
-  "$OUT/petdex-desktop-native-darwin-$ARCH.zip" "$OUT/Petdex-$ARCH.dmg"
+rm -rf "$OUT/Petdex.app" "$OUT/petdex-desktop-darwin-$ARCH$SUFFIX.zip" \
+  "$OUT/petdex-desktop-native-darwin-$ARCH$SUFFIX.zip" "$OUT/Petdex-$ARCH$SUFFIX.dmg"
 
 echo "==> build ($ARCH)"
 # -Dcpu=baseline for the same reason the release workflow uses it: Zig
@@ -79,86 +101,83 @@ echo "==> build ($ARCH)"
 echo "==> package + sign"
 # The bundle must be named Petdex.app: the name is baked into the
 # signature, so renaming it afterwards breaks the seal.
-ALIAS_PATH="$PKG/packaging/dmg/Applications"
-rm -f "$ALIAS_PATH"
-osascript - "$PKG/packaging/dmg" <<'APPLESCRIPT'
-on run argv
-  set outputFolder to POSIX file (item 1 of argv) as alias
-  tell application "Finder"
-    set createdAlias to make new alias file at outputFolder to folder "Applications" of startup disk
-    set name of createdAlias to "Applications"
-  end tell
-end run
-APPLESCRIPT
-swift - "$ALIAS_PATH" <<'SWIFT'
-import AppKit
-import Foundation
-
-let path = CommandLine.arguments[1]
-let workspace = NSWorkspace.shared
-let icon = workspace.icon(forFile: "/Applications")
-icon.size = NSSize(width: 512, height: 512)
-if !workspace.setIcon(icon, forFile: path, options: []) {
-  exit(1)
-}
-SWIFT
-
 (cd "$PKG" && "$NATIVE_PACKAGER_CLI" package \
   --target macos \
   --manifest app.package.json \
   --binary zig-out/bin/petdex-desktop-native \
   --output "$OUT/Petdex.app" \
-  --signing identity \
-  --identity "$SIGN_IDENTITY" \
-  --archive)
+  "${SIGNING[@]}")
 
-PACKAGE_VERSION="$(bun -e 'const value = await Bun.file(process.argv[1]).json(); console.log(value.version)' "$PKG/app.package.json")"
-PACKAGED_DMG="$OUT/petdex-desktop-native-$PACKAGE_VERSION-macos-ReleaseFast.dmg"
-DMG="$OUT/Petdex-$ARCH.dmg"
-mv "$PACKAGED_DMG" "$DMG"
-
-# Agent logos are compiled into the binary, so only the app icon still
-# has to survive packaging.
+PLIST="$OUT/Petdex.app/Contents/Info.plist"
+PACKAGE_VERSION="$(bun -e 'console.log((await Bun.file(process.argv[1]).json()).version)' "$PKG/app.package.json")"
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")" == "$PACKAGE_VERSION" ]]
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleURLTypes:0:CFBundleURLSchemes:0' "$PLIST")" == petdex ]]
+EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST")"
+MACH_ARCH=arm64
+[[ "$ARCH" != x64 ]] || MACH_ARCH=x86_64
+lipo -verify_arch "$MACH_ARCH" "$OUT/Petdex.app/Contents/MacOS/$EXECUTABLE"
 test -f "$OUT/Petdex.app/Contents/Resources/assets/icon.png"
-
-echo "==> notarize"
-ditto -c -k --keepParent "$OUT/Petdex.app" "$OUT/notarize.zip"
-xcrun notarytool submit "$OUT/notarize.zip" \
-  --key "$KEY" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" --wait
-rm -f "$OUT/notarize.zip"
-
-echo "==> staple"
-# Stapling embeds the ticket so the app opens without a network round
-# trip on first launch.
-xcrun stapler staple "$OUT/Petdex.app"
-
-echo "==> verify"
-spctl -a -vvv "$OUT/Petdex.app"
+codesign --verify --deep --strict "$OUT/Petdex.app"
+if [[ "$UNSIGNED" == false ]]; then
+  xcrun stapler validate "$OUT/Petdex.app"
+  spctl -a -vvv "$OUT/Petdex.app"
+fi
 
 echo "==> dmg"
-# The DMG exists to make people drag the app to Applications before
-# opening it. Launching a .app straight out of Downloads triggers
-# macOS App Translocation: the app runs from a random read-only path
-# under /var/folders, so anything it writes that points at its own
-# binary (the agent hook symlink, for one) breaks on the next boot.
-# The DMG is signed and notarized in its own right: Gatekeeper checks
-# the container the user actually double-clicks, not just what is
-# inside it.
-codesign --force --sign "$SIGN_IDENTITY" "$DMG"
-xcrun notarytool submit "$DMG" \
-  --key "$KEY" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" --wait
-xcrun stapler staple "$DMG"
-spctl -a -vvv -t open --context context:primary-signature "$DMG"
+# Stage the already-stapled app. dmgbuild writes .DS_Store directly, so CI
+# never needs Apple Events, Finder permissions or an interactive desktop.
+DMG="$OUT/Petdex-$ARCH$SUFFIX.dmg"
+BACKGROUND="$(bun -e 'console.log((await Bun.file(process.argv[1]).json()).dmg.background)' "$PKG/app.package.json")"
+RETINA_BACKGROUND="${BACKGROUND%.*}@2x.${BACKGROUND##*.}"
+export PETDEX_DMG_BACKGROUND="$PKG/$BACKGROUND"
+if [[ -f "$PKG/$RETINA_BACKGROUND" ]]; then
+  tiffutil -cathidpicheck "$PKG/$BACKGROUND" "$PKG/$RETINA_BACKGROUND" -out "$OUT/background.tiff"
+  export PETDEX_DMG_BACKGROUND="$OUT/background.tiff"
+fi
+export PETDEX_PACKAGE_MANIFEST="$PKG/app.package.json"
+export PETDEX_PACKAGED_APP="$OUT/Petdex.app"
+VOLUME_NAME="$(bun -e 'console.log((await Bun.file(process.argv[1]).json()).dmg.volume_name)' "$PKG/app.package.json")"
+"$DMGBUILD" -s "$PKG/packaging/dmg/settings.py" "$VOLUME_NAME" "$DMG"
+# Verify what users actually copy out of the image. Packaging tools can add
+# FinderInfo/resource forks that invalidate even a previously verified app.
+VERIFY_MOUNT="$(mktemp -d "$OUT/dmg-verify.XXXXXX")"
+cleanup_mount() {
+  if [[ -n "$VERIFY_MOUNT" ]]; then
+    hdiutil detach "$VERIFY_MOUNT" >/dev/null 2>&1 || true
+    rmdir "$VERIFY_MOUNT" 2>/dev/null || true
+  fi
+}
+trap cleanup_mount EXIT
+hdiutil attach -readonly -nobrowse -mountpoint "$VERIFY_MOUNT" "$DMG" >/dev/null
+codesign --verify --deep --strict "$VERIFY_MOUNT/Petdex.app"
+[[ "$(readlink "$VERIFY_MOUNT/Applications")" == /Applications ]]
+test -f "$VERIFY_MOUNT/.DS_Store"
+if [[ "$UNSIGNED" == false ]]; then
+  xcrun stapler validate "$VERIFY_MOUNT/Petdex.app"
+fi
+hdiutil detach "$VERIFY_MOUNT" >/dev/null
+rmdir "$VERIFY_MOUNT"
+VERIFY_MOUNT=""
+if [[ "$UNSIGNED" == false ]]; then
+  codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG"
+  codesign --verify --strict "$DMG"
+  xcrun notarytool submit "$DMG" --keychain-profile "$APPLE_NOTARY_PROFILE" \
+    --wait --output-format json > "$OUT/notarization-$ARCH.json"
+  bun -e 'const r = await Bun.file(process.argv[1]).json(); if (r.status !== "Accepted") { console.error(r); process.exit(1); }' "$OUT/notarization-$ARCH.json"
+  xcrun stapler staple "$DMG"
+  xcrun stapler validate "$DMG"
+  spctl -a -vvv -t open --context context:primary-signature "$DMG"
+fi
 
 echo "==> stage release assets"
 # Both zip names carry the same notarized bundle. petdex-desktop-<target>
 # is the name existing installs update through; shipping a bare
 # executable under it does not work, since a lone Mach-O outside its
 # bundle fails Gatekeeper the same way an unsigned app does.
-ditto -c -k --keepParent "$OUT/Petdex.app" "$OUT/petdex-desktop-native-darwin-$ARCH.zip"
-cp "$OUT/petdex-desktop-native-darwin-$ARCH.zip" "$OUT/petdex-desktop-darwin-$ARCH.zip"
+ditto -c -k --keepParent "$OUT/Petdex.app" "$OUT/petdex-desktop-native-darwin-$ARCH$SUFFIX.zip"
+cp "$OUT/petdex-desktop-native-darwin-$ARCH$SUFFIX.zip" "$OUT/petdex-desktop-darwin-$ARCH$SUFFIX.zip"
 
 ls -lh "$OUT"/*.zip "$DMG"
-echo
-echo "Upload with:"
-echo "  gh release upload desktop-vX.Y.Z $OUT/*.zip $DMG --clobber"
+if [[ "$UNSIGNED" == true ]]; then
+  echo "Packaging preview only: ad-hoc signed, not notarized, not for distribution."
+fi
