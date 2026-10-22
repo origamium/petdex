@@ -1221,6 +1221,7 @@ fn startUpdateCheck(model: *Model, manual: bool, fx: *Effects) void {
     fx.fetch(.{
         .key = update_fetch_key,
         .url = updates.endpoint,
+        .headers = &updates.request_headers,
         .timeout_ms = 8000,
         .on_response = Effects.responseMsg(.update_response),
     });

@@ -1,16 +1,24 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const endpoint = "https://petdex.crafter.run/api/desktop/latest-release?format=json";
-pub const release_page = "https://github.com/crafter-station/petdex/releases";
+// The latest published (non-draft, non-prerelease) GitHub release of this
+// repository. Releases here are all desktop releases tagged desktop-vX.Y.Z.
+pub const endpoint = "https://api.github.com/repos/origamium/petdex/releases/latest";
+pub const release_page = "https://github.com/origamium/petdex/releases";
+pub const request_headers = [_]std.http.Header{
+    .{ .name = "accept", .value = "application/vnd.github+json" },
+    .{ .name = "user-agent", .value = "petdex-desktop" },
+};
+const tag_prefix = "desktop-v";
 pub const brew_command = "brew upgrade --cask petdex";
-pub const current_version = "0.9.1";
+pub const current_version = "0.9.2";
 
 pub const Phase = enum { idle, checking, current, available, failed };
 pub const InstallSource = enum { unknown, checking, direct, homebrew };
 
 pub const Latest = struct {
     version: ?[]const u8 = null,
+    tag_name: ?[]const u8 = null,
 };
 
 fn manifestVersion(source: []const u8) ?[]const u8 {
@@ -22,7 +30,12 @@ fn manifestVersion(source: []const u8) ?[]const u8 {
 }
 
 pub fn parseLatest(allocator: std.mem.Allocator, body: []const u8) ?std.json.Parsed(Latest) {
-    const parsed = std.json.parseFromSlice(Latest, allocator, body, .{ .ignore_unknown_fields = true }) catch return null;
+    var parsed = std.json.parseFromSlice(Latest, allocator, body, .{ .ignore_unknown_fields = true }) catch return null;
+    if (parsed.value.version == null) {
+        if (parsed.value.tag_name) |tag| {
+            if (std.mem.startsWith(u8, tag, tag_prefix)) parsed.value.version = tag[tag_prefix.len..];
+        }
+    }
     if (parsed.value.version) |version| {
         if (parseVersion(version) == null) {
             parsed.deinit();
@@ -61,20 +74,11 @@ pub fn isNewer(latest: []const u8, current: []const u8) bool {
 }
 
 pub fn downloadUrl() []const u8 {
-    return switch (builtin.os.tag) {
-        .macos => switch (builtin.cpu.arch) {
-            .aarch64 => "https://petdex.crafter.run/api/desktop/latest-release?asset=darwin-arm64",
-            .x86_64 => "https://petdex.crafter.run/api/desktop/latest-release?asset=darwin-x64",
-            else => release_page,
-        },
-        .windows => "https://petdex.crafter.run/api/desktop/latest-release?asset=win32-x64",
-        .linux => switch (builtin.cpu.arch) {
-            .aarch64 => "https://petdex.crafter.run/api/desktop/latest-release?asset=linux-arm64",
-            .x86_64 => "https://petdex.crafter.run/api/desktop/latest-release?asset=linux-x64",
-            else => release_page,
-        },
-        else => release_page,
-    };
+    // Only the Apple Silicon DMG is published; everything else gets the page.
+    return if (builtin.os.tag == .macos and builtin.cpu.arch == .aarch64)
+        "https://github.com/origamium/petdex/releases/latest/download/Petdex-arm64.dmg"
+    else
+        release_page;
 }
 
 test "current version comes from app.zon" {
@@ -104,4 +108,16 @@ test "latest release payload accepts null and valid versions" {
     try std.testing.expectEqual(@as(?[]const u8, null), unknown.value.version);
 
     try std.testing.expect(parseLatest(std.testing.allocator, "{\"version\":\"next\"}") == null);
+}
+
+test "latest release payload takes the version from a desktop tag" {
+    var parsed = parseLatest(std.testing.allocator, "{\"tag_name\":\"desktop-v0.9.2\",\"draft\":false}").?;
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("0.9.2", parsed.value.version.?);
+
+    var other = parseLatest(std.testing.allocator, "{\"tag_name\":\"web-v1.0.0\"}").?;
+    defer other.deinit();
+    try std.testing.expectEqual(@as(?[]const u8, null), other.value.version);
+
+    try std.testing.expect(parseLatest(std.testing.allocator, "{\"tag_name\":\"desktop-v0.9.2-rc.1\"}") == null);
 }
