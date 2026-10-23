@@ -51,7 +51,7 @@ Petdex は、連携して動く 3 つの要素でできている。
 デスクトップアプリ(`packages/petdex-desktop-native`)は [Native SDK](https://github.com/vercel-labs/native) で作り直した。WebView も Node サイドカーもなく、浮かぶだけのマスコットから、エージェント作業のそばに置く小さな相棒へ育っている。
 
 - **19 種のコーディングエージェントを 1 匹のペットに。** Claude Code、Codex、Gemini CLI、OpenCode、Cursor、Junie、Antigravity、Devin CLI、Grok Build、Copilot CLI、Windsurf / Devin Desktop、Amp、Droid、Qoder、Kimi Code、CodeBuddy、OMP、Hermes、DeepSeek Harness を、設定 → Connections から接続できる。フックやプラグインはホスト側の既存設定にマージされ(他のエントリは保持、隣にバックアップを作成)、Herdr のペインも反映される。対応表と上流側の制約は [`docs/agent-integration-support.md`](./docs/agent-integration-support.md) を参照。
-- **エージェントバブル。** 会話ごとにエージェントのロゴ付きバブルがペットの上に浮かぶ。クリックでカードが開き、プロジェクト、状態、モデル、推論エフォート、直近のテキストを確認でき、Warp のペインや Terminal のタブへ飛べる。待機中のバブルは光り、完了したものにはチェックが付く。
+- **エージェントバブル。** 会話ごとにエージェントのロゴ付きバブルがペットの上に浮かぶ。クリックでカードが開き、プロジェクト、状態、モデル、推論エフォート、直近のテキストを確認でき、Warp のペイン、Terminal や Orca のタブ、T3 Code へ飛べる。右クリックでジャンプや閉じる操作もできる。待機中のバブルは光り、完了したものにはチェックが付く。
 - **ペットとチャット。** ペットをクリックして話しかける。接続先は ChatGPT、またはローカルの OpenAI 互換サーバー(LM Studio、Ollama)。人格は `pet.json`、任意の `persona.md`、`~/.petdex/personas/<slug>.md` から読み込む。履歴はローカルの SQLite に保存され、頼んだ事柄を少数だけ覚えてくれる。ダブルクリックでエージェントの状況報告が聞ける。
 - **ペットから話しかける(任意)。** 数分おきの雑談と、エージェントが待っているときの声かけ。どちらも初期状態ではオフで、チャットを閉じている間や Focus Mode 中は黙っている。
 - **タイマー。** チャット下に常駐するポモドーロとカウントダウン。完了はペットが自分の口調で知らせる。チャットからも操作できる(`25分タイマー始めて`、`timer start`)。

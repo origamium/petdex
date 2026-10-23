@@ -101,7 +101,7 @@ const post_poll_ms: u64 = 5;
 
 /// argv tail after "bubble": [phase, agent?]. Reads stdin, formats,
 /// POSTs bubble + state to the in-process hook server. Never fails outward.
-pub fn run(raw_phase: []const u8, arg_agent: ?[]const u8, origin_app: plat.OriginApplication, source_cwd_raw: ?[]const u8, herdr_pane_raw: ?[]const u8, warp_focus_raw: ?[]const u8, home: []const u8) void {
+pub fn run(raw_phase: []const u8, arg_agent: ?[]const u8, origin_app: plat.OriginApplication, source_cwd_raw: ?[]const u8, herdr_pane_raw: ?[]const u8, warp_focus_raw: ?[]const u8, orca_terminal_raw: ?[]const u8, home: []const u8) void {
     // Consume input with a deadline before any early return. Drain beyond the
     // useful 64 KiB prefix to avoid EPIPE during normal host writes, but do
     // not require EOF from a host that leaves its pipe open.
@@ -174,6 +174,7 @@ pub fn run(raw_phase: []const u8, arg_agent: ?[]const u8, origin_app: plat.Origi
     const hosted = std.mem.eql(u8, agent, "codex");
     settings.focus_url = plat.safeWarpFocusUrl(warp_focus_raw) orelse
         (if (hosted) plat.warpFocusUrlOf("codex", envelopeString(payload, "cwd") orelse "", &focus_buf) else null) orelse "";
+    settings.orca_terminal = plat.safeOrcaTerminal(orca_terminal_raw) orelse "";
     // The account's limits ride Codex's rollout, current at a turn's end;
     // the usage column reads what this leaves. The settings above were
     // copied out of scan_buf, so it is free again.
@@ -383,8 +384,9 @@ pub fn bubbleBodyWithMetadata(out: []u8, text: []const u8, title: []const u8, bu
 
 /// The optional tail of a bubble body: the model and reasoning effort a
 /// session runs with, when the agent says, and Warp's link to the pane it
-/// runs in (`WARP_FOCUS_URL`), when it runs in Warp.
-pub const Settings = struct { model: []const u8 = "", effort: []const u8 = "", focus_url: []const u8 = "" };
+/// runs in (`WARP_FOCUS_URL`), when it runs in Warp, or Orca's handle for
+/// its terminal (`ORCA_TERMINAL_HANDLE`), when it runs in Orca.
+pub const Settings = struct { model: []const u8 = "", effort: []const u8 = "", focus_url: []const u8 = "", orca_terminal: []const u8 = "" };
 
 /// bubbleBodyWithMetadata plus the model and effort, appended last and only
 /// when known: without them the body is byte for byte the one above.
@@ -402,6 +404,11 @@ pub fn bubbleBodyFull(out: []u8, text: []const u8, title: []const u8, busy: bool
     var focus_buf: [96]u8 = undefined;
     const focus_part: []const u8 = if (settings.focus_url.len > 0)
         (std.fmt.bufPrint(&focus_buf, ",\"warp_focus_url\":\"{s}\"", .{settings.focus_url}) catch return null)
+    else
+        "";
+    var orca_buf: [64]u8 = undefined;
+    const orca_part: []const u8 = if (settings.orca_terminal.len > 0)
+        (std.fmt.bufPrint(&orca_buf, ",\"orca_terminal\":\"{s}\"", .{settings.orca_terminal}) catch return null)
     else
         "";
     var title_buf: [256]u8 = undefined;
@@ -424,7 +431,7 @@ pub fn bubbleBodyFull(out: []u8, text: []const u8, title: []const u8, busy: bool
         (std.fmt.bufPrint(&state_buf, ",\"agent_state\":\"{s}\"", .{st}) catch return null)
     else
         "";
-    return std.fmt.bufPrint(out, "{{\"text\":\"{s}\"{s},\"busy\":{},\"agent_source\":\"{s}\"{s}{s}{s}{s}{s}{s}}}", .{ text, title_part, busy, agent, session_part, metadata, state_part, model_part, effort_part, focus_part }) catch null;
+    return std.fmt.bufPrint(out, "{{\"text\":\"{s}\"{s},\"busy\":{},\"agent_source\":\"{s}\"{s}{s}{s}{s}{s}{s}{s}}}", .{ text, title_part, busy, agent, session_part, metadata, state_part, model_part, effort_part, focus_part, orca_part }) catch null;
 }
 
 /// Codex puts `model` in every hook payload; neither agent puts the effort
@@ -1366,7 +1373,7 @@ test "a preview keeps its first lines" {
 test "the longest bubble body fits one POST" {
     var buf: [post_body_cap]u8 = undefined;
     const cwd = "/" ++ ("d" ** 510);
-    const body = bubbleBodyFull(&buf, "x" ** 190, "t" ** 60, true, "claude-code", "a" ** 64, "Apple_Terminal", "/dev/ttys000", cwd, "p" ** 64, "waiting", .{ .model = "m" ** 48, .effort = "e" ** 16, .focus_url = "warppreview://session/" ++ ("a" ** 32) }).?;
+    const body = bubbleBodyFull(&buf, "x" ** 190, "t" ** 60, true, "claude-code", "a" ** 64, "Apple_Terminal", "/dev/ttys000", cwd, "p" ** 64, "waiting", .{ .model = "m" ** 48, .effort = "e" ** 16, .focus_url = "warppreview://session/" ++ ("a" ** 32), .orca_terminal = "term_" ++ ("a" ** 36) }).?;
     // Past the old 1 KiB cap that dropped such a bubble without a word.
     try t.expect(body.len > 1024);
     try t.expect(body.len <= post_body_cap);
@@ -1377,6 +1384,13 @@ test "a Warp pane's link rides the bubble" {
     const url = "warp://session/0123456789abcdef0123456789abcdef";
     const body = bubbleBodyFull(&buf, "t", "", true, "codex", "s1", "", "", "", "", null, .{ .focus_url = url }).?;
     try t.expectEqualStrings(url, hook_server.jsonStringPub(body, "warp_focus_url").?);
+}
+
+test "an Orca terminal's handle rides the bubble" {
+    var buf: [post_body_cap]u8 = undefined;
+    const handle = "term_478583ed-07b5-4ca5-b9fe-f1083ab2a4cf";
+    const body = bubbleBodyFull(&buf, "t", "", true, "claude-code", "s1", "Orca", "", "", "", null, .{ .orca_terminal = handle }).?;
+    try t.expectEqualStrings(handle, hook_server.jsonStringPub(body, "orca_terminal").?);
 }
 
 test "a turn that ends on an error fails its bubble" {

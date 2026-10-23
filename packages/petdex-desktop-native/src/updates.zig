@@ -11,7 +11,7 @@ pub const request_headers = [_]std.http.Header{
 };
 const tag_prefix = "desktop-v";
 pub const brew_command = "brew upgrade --cask petdex";
-pub const current_version = "0.9.2";
+pub const current_version = "0.10.0";
 
 pub const Phase = enum { idle, checking, current, available, failed };
 pub const InstallSource = enum { unknown, checking, direct, homebrew };

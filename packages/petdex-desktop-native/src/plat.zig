@@ -571,6 +571,17 @@ test "DSH browser activation stays strict" {
     try std.testing.expect(!BrowserActivation.activation_failed.succeeded());
 }
 
+test "Orca and T3 Code come from TERM_PROGRAM or the launching app" {
+    try std.testing.expectEqual(OriginApplication.orca, OriginApplication.fromEnvironment("Orca", null));
+    try std.testing.expectEqual(OriginApplication.orca, OriginApplication.fromEnvironment("tmux", "com.stablyai.orca"));
+    try std.testing.expectEqual(OriginApplication.t3code, OriginApplication.fromEnvironment(null, "com.t3tools.t3code"));
+    try std.testing.expectEqual(OriginApplication.terminal, OriginApplication.fromEnvironment("Apple_Terminal", "com.stablyai.orca"));
+    try std.testing.expectEqual(OriginApplication.none, OriginApplication.fromEnvironment("WarpTerminal", "dev.warp.Warp-Stable"));
+    for ([_]OriginApplication{ .orca, .t3code }) |origin| {
+        try std.testing.expectEqual(origin, OriginApplication.fromTermProgram(origin.wireName()));
+    }
+}
+
 /// Own pid, for the /whoami endpoint. std has no portable accessor in
 /// 0.16, so this is the one genuine per-platform branch in this file.
 ///
@@ -655,12 +666,29 @@ pub const OriginApplication = enum(u8) {
     /// terminal rows this is intentionally not a bundle identifier: the
     /// active HTTP handler is resolved at click time on macOS.
     default_browser,
+    orca,
+    t3code,
 
     pub fn fromTermProgram(value: ?[]const u8) OriginApplication {
         const name = value orelse return .none;
         if (std.mem.eql(u8, name, "Apple_Terminal")) return .terminal;
         if (std.mem.eql(u8, name, "vscode")) return .vscode;
         if (std.mem.eql(u8, name, "default_browser")) return .default_browser;
+        if (std.mem.eql(u8, name, "Orca")) return .orca;
+        if (std.mem.eql(u8, name, "t3code")) return .t3code;
+        return .none;
+    }
+
+    /// The hook's own environment: TERM_PROGRAM, else the app LaunchServices
+    /// started the process tree from (`__CFBundleIdentifier`, inherited by
+    /// every child). T3 Code runs its agents without a terminal, so only the
+    /// second names it; a tmux pane inside Orca gets Orca from it too.
+    pub fn fromEnvironment(term_program: ?[]const u8, bundle_id: ?[]const u8) OriginApplication {
+        const origin = fromTermProgram(term_program);
+        if (origin != .none) return origin;
+        const id = bundle_id orelse return .none;
+        if (std.mem.eql(u8, id, "com.stablyai.orca")) return .orca;
+        if (std.mem.eql(u8, id, "com.t3tools.t3code")) return .t3code;
         return .none;
     }
 
@@ -670,6 +698,8 @@ pub const OriginApplication = enum(u8) {
             .terminal => "Apple_Terminal",
             .vscode => "vscode",
             .default_browser => "default_browser",
+            .orca => "Orca",
+            .t3code => "t3code",
         };
     }
 
@@ -679,6 +709,8 @@ pub const OriginApplication = enum(u8) {
             .terminal => "com.apple.Terminal",
             .vscode => "com.microsoft.VSCode",
             .default_browser => null,
+            .orca => "com.stablyai.orca",
+            .t3code => "com.t3tools.t3code",
         };
     }
 };
@@ -770,6 +802,37 @@ test "Herdr pane ids accept only bounded CLI-safe identifiers" {
     try std.testing.expect(safeHerdrPaneId("") == null);
     var too_long: [65]u8 = @splat('a');
     try std.testing.expect(safeHerdrPaneId(&too_long) == null);
+}
+
+/// Orca's handle for the terminal an agent runs in (`ORCA_TERMINAL_HANDLE`):
+/// `term_` and a lowercase UUID, the only shape passed to its CLI.
+pub fn safeOrcaTerminal(value: ?[]const u8) ?[]const u8 {
+    const handle = value orelse return null;
+    if (handle.len != 41 or !std.mem.startsWith(u8, handle, "term_")) return null;
+    for (handle[5..], 0..) |ch, i| {
+        const ok = if (i == 8 or i == 13 or i == 18 or i == 23) ch == '-' else std.ascii.isDigit(ch) or (ch >= 'a' and ch <= 'f');
+        if (!ok) return null;
+    }
+    return handle;
+}
+
+test "Orca terminal handles accept only term_ and a UUID" {
+    try std.testing.expect(safeOrcaTerminal("term_478583ed-07b5-4ca5-b9fe-f1083ab2a4cf") != null);
+    try std.testing.expect(safeOrcaTerminal("term_478583ed-07b5-4ca5-b9fe-f1083ab2a4cF") == null);
+    try std.testing.expect(safeOrcaTerminal("term_478583ed-07b5-4ca5-b9fe-f1083ab2a4c;") == null);
+    try std.testing.expect(safeOrcaTerminal("term_478583ed007b5-4ca5-b9fe-f1083ab2a4cf") == null);
+    try std.testing.expect(safeOrcaTerminal("--terminal") == null);
+    try std.testing.expect(safeOrcaTerminal(null) == null);
+}
+
+/// Bring Orca forward, on the agent's terminal tab when its handle is known.
+/// The CLI ships inside the app; a GUI process has no PATH to find it on.
+pub fn openOrcaTerminal(handle_raw: []const u8) bool {
+    if (builtin.os.tag != .macos) return false;
+    if (safeOrcaTerminal(handle_raw)) |handle| {
+        _ = spawnAndWait(&.{ "/Applications/Orca.app/Contents/Resources/bin/orca", "terminal", "switch", "--terminal", handle });
+    }
+    return spawnAndWait(&.{ "/usr/bin/open", "-b", "com.stablyai.orca" });
 }
 
 /// Warp's link back to one pane (`WARP_FOCUS_URL`, which Warp sets in every

@@ -114,11 +114,17 @@ pub const Bubble = struct {
     /// Every event from that pane carries it.
     focus_url: [64]u8 = @splat(0),
     focus_url_len: usize = 0,
+    /// Orca's handle for the terminal the agent runs in.
+    orca_terminal: [41]u8 = @splat(0),
+    orca_terminal_len: usize = 0,
     counter: u64 = 0,
     received_at: i64 = 0,
 
     pub fn focusUrlSlice(self: *const Bubble) []const u8 {
         return self.focus_url[0..self.focus_url_len];
+    }
+    pub fn orcaTerminalSlice(self: *const Bubble) []const u8 {
+        return self.orca_terminal[0..self.orca_terminal_len];
     }
 
     pub fn modelSlice(self: *const Bubble) []const u8 {
@@ -351,6 +357,8 @@ pub const Mailbox = struct {
             slot.effort_len = effort_len;
             slot.focus_url = focus_url;
             slot.focus_url_len = focus_url_len;
+            slot.orca_terminal = previous.orca_terminal;
+            slot.orca_terminal_len = previous.orca_terminal_len;
         }
         const sn = @min(session.len, slot.session.len);
         @memcpy(slot.session[0..sn], session[0..sn]);
@@ -432,6 +440,20 @@ pub const Mailbox = struct {
             const n = @min(url.len, b.focus_url.len);
             @memcpy(b.focus_url[0..n], url[0..n]);
             b.focus_url_len = n;
+            self.bubbles_dirty = true;
+            return;
+        }
+    }
+
+    /// Record the Orca terminal handle for a session that already has a slot.
+    pub fn setBubbleOrcaTerminal(self: *Mailbox, session: []const u8, handle: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.bubbles[0..self.bubbles_len]) |*b| {
+            if (!std.mem.eql(u8, b.sessionSlice(), session)) continue;
+            const n = @min(handle.len, b.orca_terminal.len);
+            @memcpy(b.orca_terminal[0..n], handle[0..n]);
+            b.orca_terminal_len = n;
             self.bubbles_dirty = true;
             return;
         }
@@ -1194,6 +1216,9 @@ fn route(server: *Server, conn: *Conn, method: []const u8, target: []const u8, p
         if (plat.safeWarpFocusUrl(jsonString(body, "warp_focus_url"))) |url| {
             mailbox.setBubbleFocusUrl(session, url);
         }
+        if (plat.safeOrcaTerminal(jsonString(body, "orca_terminal"))) |handle| {
+            mailbox.setBubbleOrcaTerminal(session, handle);
+        }
         mirrorBubble(server, capped, counter, title[0..@min(title.len, 96)], agent[0..@min(agent.len, 24)], busy) catch {};
         const out = std.fmt.bufPrint(&scratch, "{{\"ok\":true,\"counter\":{d}}}", .{counter}) catch return;
         return respond(conn, 200, out);
@@ -1564,7 +1589,9 @@ test "a conversation keeps its model and effort across updates, and a new one st
     _ = mb.setBubble("s1", "Thinking…", "claude", "", true);
     mb.setBubbleModel("s1", "claude-opus-5", "high");
     mb.setBubbleFocusUrl("s1", "warp://session/0123456789abcdef0123456789abcdef");
+    mb.setBubbleOrcaTerminal("s1", "term_478583ed-07b5-4ca5-b9fe-f1083ab2a4cf");
     _ = mb.setBubble("s1", "Reading main.zig", "claude", "", true);
+    try std.testing.expectEqualStrings("term_478583ed-07b5-4ca5-b9fe-f1083ab2a4cf", mb.bubbles[0].orcaTerminalSlice());
     try std.testing.expectEqualStrings("claude-opus-5", mb.bubbles[0].modelSlice());
     try std.testing.expectEqualStrings("high", mb.bubbles[0].effortSlice());
     // The Warp pane stays too: Codex looks it up at a turn's ends only.
