@@ -78,11 +78,18 @@ agent's logo. A bubble waiting on you glows, with an orange dot; one that hit
 an error wears a red "!". Click a bubble to open it into a card: the project,
 the agent and its status, the model (Claude Code, Codex, OpenCode) and the
 reasoning effort (Claude Code, Codex) when the agent reports them, and the
-first lines of what it is doing or last said. When the agent runs in Warp (2026.05 or later) or in
-Terminal, the card also brings its pane or tab to the front. Click again to
+first lines of what it is doing or last said. When the agent runs in Warp (2026.05 or later),
+Terminal or Orca, the card also brings its pane or tab to the front; in T3 Code
+it brings the app forward (hooks are not told which thread). Click again to
 close it. Any number can be open; the cards stack without overlapping. A finished bubble stays with a green check, its card and terminal
 still a click away, until you clear the bubbles from the pet's menu or the
-tray, or its lifetime in Settings → Notifications runs out. Up to ten conversations float at
+tray, or its lifetime in Settings → Notifications runs out. **Remove finished
+bubbles** there takes them away a set number of minutes after the agent
+finishes; 0 keeps them. Right-click a bubble to open its terminal or app, close
+it, or close them all; a closed bubble returns with its conversation's next
+event. Orca and T3 Code are recognized from the hook's environment
+(`TERM_PROGRAM`, or the app that launched it), so connections installed before
+this keep working. Up to ten conversations float at
 once; past that, the one idle longest makes way. On Linux the bubbles show
 their state but do not open into cards.
 
@@ -136,7 +143,7 @@ A whole message can ask for one small thing, and nothing else in the line:
   for the countdown, and only while the clock is stopped. A running clock
   stays as it is.
 - `開いて`, `待ってるやつ開いて` or `open` brings forward the first waiting
-  conversation that has a Warp pane or Terminal tab.
+  conversation that has a Warp pane, Terminal or Orca tab, or T3 Code.
 - `覚えて、呼び方は先生` or `remember: call me sensei` keeps up to 12 facts,
   80 characters each, per pet. `忘れて` or `forget` drops that pet's facts.
   Chat options lists them and can drop one. The model is not asked to decide

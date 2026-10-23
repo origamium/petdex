@@ -134,6 +134,7 @@ pub const Msg = union(enum) {
     chime_done: native_sdk.EffectExit,
     set_bubble_text_size: f32,
     bubble_lifetime_input: canvas.TextInputEvent,
+    done_bubble_minutes_input: canvas.TextInputEvent,
     font_path_input: canvas.TextInputEvent,
     toggle_hide_dock,
     toggle_launch_at_login,
@@ -229,6 +230,9 @@ pub const Msg = union(enum) {
     // Hook bubbles (bubble_sim.zig).
     bubble_tick: native_sdk.EffectTimer,
     hook_press,
+    /// A bubble's context menu, by its hookId: slots re-sort on every drain.
+    open_bubble_destination: u64,
+    dismiss_bubble: u64,
     noop,
 
     pub const view_unbound = .{ "frame_tick", "poll_tick", "bubble_tick", "frame_clock", "cycle_state", "native_drag_watchdog", "chime_done", "quit_app", "toggle_focus_mode", "shuffle_pet", "dsh_install_done", "dsh_remove_done", "remote_line", "remote_done", "remote_backoff", "update_boot_check", "update_response", "homebrew_done", "homebrew_timeout", "brew_command_copied", "auth_token_response", "auth_avatar_response", "auth_preview_response", "auth_library_done", "chat_line", "chat_response", "chat_models_response", "chatgpt_token_response", "usage_copilot_response", "usage_cursor_response", "usage_grok_response", "usage_antigravity_response", "usage_gemini_project_response", "usage_gemini_quota_response" };
@@ -361,6 +365,10 @@ pub const Model = struct {
     bubble_lifetime_secs: f32 = bubble_lifetime_default_secs,
     bubble_lifetime_text: [2]u8 = .{ '0', 0 },
     bubble_lifetime_text_len: usize = 1,
+    /// Minutes a finished bubble stays after its last update. Zero keeps it.
+    done_bubble_minutes: u16 = 0,
+    done_bubble_minutes_text: [3]u8 = .{ '0', 0, 0 },
+    done_bubble_minutes_text_len: usize = 1,
     /// Bubble layout is user-controlled on every platform: one title line
     /// plus this many answer lines, each with the configured column budget.
     font_path: canvas.TextBuffer(512) = .{},
@@ -1471,7 +1479,7 @@ fn saveSettings(model: *const Model) void {
 // whole save): keep room for the configurable bubble fields, rotation
 // state, a long slug, and negative coordinates. Grown with every key
 // added; `font_path` alone can escape to 1024.
-const settings_json_bytes = 2384;
+const settings_json_bytes = 2416;
 
 fn settingsJson(model: *const Model, buf: []u8) ?[]const u8 {
     const active = if (model.active_pet < catalog_mod.catalog_len) catalog[model.active_pet].slice() else "";
@@ -1488,7 +1496,7 @@ fn settingsJson(model: *const Model, buf: []u8) ?[]const u8 {
     const font_path = std.mem.trim(u8, model.font_path.text(), " \t\r\n");
     const escaped_font = jsonEscapeString(font_path, &escaped_font_buf) orelse return null;
     const latest = model.latest_version[0..model.latest_version_len];
-    return std.fmt.bufPrint(buf, "{{\"active_pet\":\"{s}\",\"scale\":{d:.2},\"bubbles\":{},\"bubbles_per_conversation\":{},\"waiting_sound\":{},\"usage_limits\":{},\"bubble_text\":{d:.1},\"bubble_lifetime\":{d:.0},\"font_path\":\"{s}\",\"hide_dock\":{},\"rotate_pets\":{},\"rotation_day\":{d},\"update_checks\":{},\"last_update_check_ms\":{d},\"latest_desktop_version\":\"{s}\"{s},\"agents_prompted\":{},\"language\":\"{s}\",\"theme\":\"{s}\"}}", .{ active, model.scale, model.bubbles_enabled, model.bubbles_per_conversation, model.waiting_sound, model.usage_limits, model.bubble_text_px, model.bubble_lifetime_secs, escaped_font, model.hide_dock, model.rotate_pets, model.rotation_day, model.update_checks_enabled, model.last_update_check_ms, latest, pos, model.agents_prompted, @tagName(model.language), @tagName(model.theme) }) catch null;
+    return std.fmt.bufPrint(buf, "{{\"active_pet\":\"{s}\",\"scale\":{d:.2},\"bubbles\":{},\"bubbles_per_conversation\":{},\"waiting_sound\":{},\"usage_limits\":{},\"bubble_text\":{d:.1},\"bubble_lifetime\":{d:.0},\"done_bubble_minutes\":{d},\"font_path\":\"{s}\",\"hide_dock\":{},\"rotate_pets\":{},\"rotation_day\":{d},\"update_checks\":{},\"last_update_check_ms\":{d},\"latest_desktop_version\":\"{s}\"{s},\"agents_prompted\":{},\"language\":\"{s}\",\"theme\":\"{s}\"}}", .{ active, model.scale, model.bubbles_enabled, model.bubbles_per_conversation, model.waiting_sound, model.usage_limits, model.bubble_text_px, model.bubble_lifetime_secs, model.done_bubble_minutes, escaped_font, model.hide_dock, model.rotate_pets, model.rotation_day, model.update_checks_enabled, model.last_update_check_ms, latest, pos, model.agents_prompted, @tagName(model.language), @tagName(model.theme) }) catch null;
 }
 
 fn setUnsignedText(buffer: []u8, length: *usize, value: u16) void {
@@ -1652,6 +1660,7 @@ var initial_waiting_sound: bool = false;
 var initial_usage_limits: bool = false;
 var initial_bubble_text_px: f32 = bubble_text_default_px;
 var initial_bubble_lifetime_secs: f32 = bubble_lifetime_default_secs;
+var initial_done_bubble_minutes: u16 = 0;
 var initial_hide_dock: bool = false;
 var initial_rotate_pets: bool = false;
 var initial_rotation_day: u32 = 0;
@@ -1979,6 +1988,9 @@ fn resolveInitialPet(io: std.Io, allocator: std.mem.Allocator, environ_map: *std
             }
             if (hook_server.jsonNumberPub(json, "bubble_lifetime")) |v| {
                 initial_bubble_lifetime_secs = clampBubbleLifetime(@floatCast(v));
+            }
+            if (hook_server.jsonNumberPub(json, "done_bubble_minutes")) |v| {
+                if (v >= 0 and v <= done_bubble_minutes_max) initial_done_bubble_minutes = @intFromFloat(v);
             }
             if (hook_server.jsonStringPub(json, "font_path")) |encoded| {
                 if (jsonUnescapeString(encoded, &initial_font_path)) |value| {
@@ -2359,6 +2371,8 @@ pub fn boot(model: *Model, fx: *Effects) void {
     model.bubble_text_px = initial_bubble_text_px;
     model.bubble_lifetime_secs = initial_bubble_lifetime_secs;
     setUnsignedText(model.bubble_lifetime_text[0..], &model.bubble_lifetime_text_len, @intFromFloat(model.bubble_lifetime_secs));
+    model.done_bubble_minutes = initial_done_bubble_minutes;
+    setUnsignedText(model.done_bubble_minutes_text[0..], &model.done_bubble_minutes_text_len, model.done_bubble_minutes);
     model.font_path.set(initial_font_path[0..initial_font_path_len]);
     model.font_load_failed = initial_font_load_failed;
     model.agents_prompted = initial_agents_prompted;
@@ -3138,6 +3152,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 saveSettings(model);
             }
         },
+        .done_bubble_minutes_input => |edit| {
+            if (editUnsignedText(model.done_bubble_minutes_text[0..], &model.done_bubble_minutes_text_len, edit, 0, done_bubble_minutes_max)) |value| {
+                model.done_bubble_minutes = value;
+                saveSettings(model);
+            }
+        },
         .font_path_input => |edit| {
             model.font_path.apply(edit);
             model.font_path_dirty = true;
@@ -3228,6 +3248,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             tickHookBubbles(model, fx);
         },
         .hook_press => pressHookBubble(model, fx),
+        .open_bubble_destination => |id| if (hookSlot(model, id)) |slot| openDestination(&model.bubbles[slot]),
+        .dismiss_bubble => |id| if (hookSlot(model, id)) |slot| dismissBubble(model, slot),
         .open_pets_folder => {
             if (env_home) |home| {
                 var buf: [512]u8 = undefined;
@@ -3666,6 +3688,15 @@ fn bubbleLifetimeExpired(deadline_ms: i64, now_ms: i64, state: State) bool {
     return state != .waiting and deadline_ms >= 0 and now_ms >= deadline_ms;
 }
 
+const done_bubble_minutes_max: u16 = 999;
+
+/// A finished bubble past its minutes since the agent last spoke. Any
+/// later update (a new prompt, a permission ask) moves `received_at`.
+fn doneBubbleExpired(model: *const Model, slot: usize, now_ms: i64) bool {
+    if (model.done_bubble_minutes == 0 or bubbleState(model, slot) != .done) return false;
+    return now_ms - model.bubbles[slot].received_at * 1000 >= @as(i64, model.done_bubble_minutes) * std.time.ms_per_min;
+}
+
 fn bubbleContentHeight(model: *const Model, row_count: usize) f32 {
     if (row_count == 0) return 0;
     const rows = @as(f32, @floatFromInt(row_count));
@@ -3688,21 +3719,28 @@ fn bubbleCardHeight(model: *const Model, slot: ?usize) f32 {
     return @ceil(inner + bubble_card_padding * 2);
 }
 
-/// Where the card's button takes the user: the agent's pane in Warp, or
-/// its tab in Terminal. Both are macOS verbs.
-const Destination = enum { none, warp, terminal };
+/// Where the card's button takes the user: the agent's pane in Warp, its
+/// tab in Terminal or Orca, or the T3 Code window (which hands hooks no
+/// thread id to open). All are macOS verbs.
+const Destination = enum { none, warp, terminal, orca, t3code };
 
 fn bubbleDestination(bubble: *const hook_server.Bubble) Destination {
     if (builtin.target.os.tag != .macos) return .none;
     if (plat.safeWarpFocusUrl(bubble.focusUrlSlice()) != null) return .warp;
-    if (bubble.origin_app == .terminal and plat.safeSourceTty(bubble.ttySlice()) != null) return .terminal;
-    return .none;
+    return switch (bubble.origin_app) {
+        .terminal => if (plat.safeSourceTty(bubble.ttySlice()) != null) .terminal else .none,
+        .orca => .orca,
+        .t3code => .t3code,
+        else => .none,
+    };
 }
 
 fn destinationLabel(destination: Destination) []const u8 {
     return switch (destination) {
         .warp => i18n.t("Open in Warp", "Warpで開く"),
         .terminal => i18n.t("Open in Terminal", "ターミナルで開く"),
+        .orca => i18n.t("Open in Orca", "Orcaで開く"),
+        .t3code => i18n.t("Open in T3 Code", "T3 Codeで開く"),
         .none => "",
     };
 }
@@ -3711,8 +3749,28 @@ fn openDestination(bubble: *const hook_server.Bubble) void {
     switch (bubbleDestination(bubble)) {
         .warp => _ = plat.openWarpSession(bubble.focusUrlSlice()),
         .terminal => _ = plat.activateOriginApplication(.terminal, bubble.ttySlice(), bubble.cwdSlice()),
+        .orca => _ = plat.openOrcaTerminal(bubble.orcaTerminalSlice()),
+        .t3code => _ = plat.activateOriginApplication(.t3code, "", ""),
         .none => {},
     }
+}
+
+/// A bubble's right-click menu. Unavailable destinations are left out,
+/// not dimmed, as context menus do on macOS.
+fn bubbleContextMenu(ui: *AppUi, model: *const Model, slot: usize) []const AppUi.ContextMenuItem {
+    const bubble = &model.bubbles[slot];
+    const id = hookId(bubble);
+    const items = ui.arena.alloc(AppUi.ContextMenuItem, 4) catch return &.{};
+    var n: usize = 0;
+    const destination = bubbleDestination(bubble);
+    if (destination != .none) {
+        items[0] = .{ .label = destinationLabel(destination), .msg = .{ .open_bubble_destination = id } };
+        items[1] = .{ .separator = true };
+        n = 2;
+    }
+    items[n] = .{ .label = i18n.t("Close", "閉じる"), .msg = .{ .dismiss_bubble = id } };
+    items[n + 1] = .{ .label = i18n.t("Close All", "すべて閉じる"), .msg = .clear_notifications };
+    return items[0 .. n + 2];
 }
 
 /// Opens the first waiting conversation that has a pane or tab to bring
@@ -4206,7 +4264,7 @@ fn expireBubbles(model: *Model, now_ms: i64) bool {
     var kept: usize = 0;
     var dropped = false;
     for (0..model.bubbles_len) |i| {
-        if (bubbleLifetimeExpired(model.bubble_expires_at_ms[i], now_ms, model.state)) {
+        if (bubbleLifetimeExpired(model.bubble_expires_at_ms[i], now_ms, model.state) or doneBubbleExpired(model, i, now_ms)) {
             // Tell the server too: a slot the app stopped drawing must
             // not keep a session alive against the eviction policy.
             hook_server.mailbox.dropBubble(model.bubbles[i].sessionSlice());
@@ -4223,6 +4281,20 @@ fn expireBubbles(model: *Model, now_ms: i64) bool {
     }
     model.bubbles_len = kept;
     return dropped;
+}
+
+/// Close one bubble from its menu. Its conversation's next event brings it
+/// back, the same as after Clear Notifications.
+fn dismissBubble(model: *Model, slot: usize) void {
+    hook_server.mailbox.dropBubble(model.bubbles[slot].sessionSlice());
+    const last = model.bubbles_len - 1;
+    for (slot..last) |i| {
+        model.bubbles[i] = model.bubbles[i + 1];
+        model.bubble_expires_at_ms[i] = model.bubble_expires_at_ms[i + 1];
+    }
+    model.bubbles[last] = .{};
+    model.bubble_expires_at_ms[last] = -1;
+    model.bubbles_len = last;
 }
 
 /// Re-key the deadlines onto a freshly drained stack. The mailbox owns
@@ -5281,7 +5353,7 @@ fn hookBubble(ui: *AppUi, model: *const Model, index: usize, layout: bubble_sim.
             .working => {},
         }
     }
-    var group = ui.el(.stack, .{ .width = s.w, .height = s.h }, @as([]const AppUi.Node, parts[0..len]));
+    var group = ui.el(.stack, .{ .width = s.w, .height = s.h, .context_menu = if (slot) |i| bubbleContextMenu(ui, model, i) else &.{} }, @as([]const AppUi.Node, parts[0..len]));
     // Scale about the bubble's own center (Affine.scale is canvas-origin
     // anchored), then move it to where the simulation has it.
     group.widget.transform = canvas.Affine.translate(s.x - s.w / 2, s.y - s.h / 2)
@@ -5978,12 +6050,12 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, cmd, "bubble")) {
             const phase = args_it.next() orelse return;
             const agent: ?[]const u8 = args_it.next();
-            const origin_app = plat.OriginApplication.fromTermProgram(init.environ_map.get("TERM_PROGRAM"));
+            const origin_app = plat.OriginApplication.fromEnvironment(init.environ_map.get("TERM_PROGRAM"), init.environ_map.get("__CFBundleIdentifier"));
             // Only a pane Warp itself runs has a live link: the variable is
             // inherited (by VS Code or tmux started from Warp), and a stale
             // one would bring the wrong pane forward.
             const in_warp = std.mem.eql(u8, init.environ_map.get("TERM_PROGRAM") orelse "", "WarpTerminal");
-            hook_runner.run(phase, agent, origin_app, init.environ_map.get("PWD"), init.environ_map.get("HERDR_PANE_ID"), if (in_warp) init.environ_map.get("WARP_FOCUS_URL") else null, env_home orelse return);
+            hook_runner.run(phase, agent, origin_app, init.environ_map.get("PWD"), init.environ_map.get("HERDR_PANE_ID"), if (in_warp) init.environ_map.get("WARP_FOCUS_URL") else null, if (origin_app == .orca) init.environ_map.get("ORCA_TERMINAL_HANDLE") else null, env_home orelse return);
             return;
         }
         // Claude Code's statusline, wrapped for the usage column: runs as
@@ -7266,6 +7338,57 @@ test "expiry drops only the bubbles past their deadline" {
     try std.testing.expectEqualStrings("gamma", model.bubbles[1].sessionSlice());
     try std.testing.expectEqual(@as(i64, 9000), model.bubble_expires_at_ms[1]);
     try std.testing.expect(!expireBubbles(&model, 6000));
+}
+
+test "finished bubbles go after their minutes, and only finished ones" {
+    var model: Model = .{};
+    testPushBubble(&model, "done", "finished", false, -1);
+    testPushBubble(&model, "busy", "reading", true, -1);
+    testPushBubble(&model, "failed", "broke", false, -1);
+    model.bubbles[2].agent_state_len = 6;
+    @memcpy(model.bubbles[2].agent_state[0..6], "failed");
+    for (model.bubbles[0..3]) |*b| b.received_at = 100;
+    const after_two_minutes = (100 + 120) * 1000;
+
+    // Off by default: nothing goes.
+    try std.testing.expect(!expireBubbles(&model, after_two_minutes));
+    model.done_bubble_minutes = 2;
+    try std.testing.expect(!expireBubbles(&model, after_two_minutes - 1));
+    try std.testing.expect(expireBubbles(&model, after_two_minutes));
+    try std.testing.expectEqual(@as(usize, 2), model.bubbles_len);
+    try std.testing.expectEqualStrings("busy", model.bubbles[0].sessionSlice());
+    try std.testing.expectEqualStrings("failed", model.bubbles[1].sessionSlice());
+}
+
+test "closing one bubble keeps the rest in order with their deadlines" {
+    var model: Model = .{};
+    testPushBubble(&model, "alpha", "a", false, 1000);
+    testPushBubble(&model, "beta", "b", false, 2000);
+    testPushBubble(&model, "gamma", "c", false, 3000);
+    dismissBubble(&model, 1);
+    try std.testing.expectEqual(@as(usize, 2), model.bubbles_len);
+    try std.testing.expectEqualStrings("alpha", model.bubbles[0].sessionSlice());
+    try std.testing.expectEqualStrings("gamma", model.bubbles[1].sessionSlice());
+    try std.testing.expectEqual(@as(i64, 3000), model.bubble_expires_at_ms[1]);
+    try std.testing.expectEqual(@as(i64, -1), model.bubble_expires_at_ms[2]);
+}
+
+test "a bubble's menu offers its own destination, then closing" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var ui = AppUi.init(arena_state.allocator());
+    var model: Model = .{};
+    testPushBubble(&model, "alpha", "a", false, -1);
+    model.bubbles[0].origin_app = .orca;
+    const menu = bubbleContextMenu(&ui, &model, 0);
+    if (builtin.target.os.tag == .macos) {
+        try std.testing.expectEqual(@as(usize, 4), menu.len);
+        try std.testing.expectEqualStrings(destinationLabel(.orca), menu[0].label);
+        try std.testing.expectEqual(hookId(&model.bubbles[0]), menu[0].msg.?.open_bubble_destination);
+    }
+    const close = menu[menu.len - 2];
+    try std.testing.expectEqual(hookId(&model.bubbles[0]), close.msg.?.dismiss_bubble);
+    try std.testing.expectEqual(Msg.clear_notifications, menu[menu.len - 1].msg.?);
 }
 
 test "an unchanged bubble keeps its deadline when another one updates" {

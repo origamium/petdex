@@ -769,6 +769,21 @@ fn notificationsPage(ui: *AppUi, model: *const Model) AppUi.Node {
         ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
             ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
                 ui.column(.{ .grow = 1 }, .{
+                    ui.text(.{}, i18n.t("Remove finished bubbles", "完了した吹き出しを消す")),
+                    mutedParagraph(ui, i18n.t("Minutes after an agent finishes; 0 keeps them", "完了から指定した分数で消します。0で残します")),
+                }),
+                ui.el(.input, .{
+                    .width = 72,
+                    .height = 34,
+                    .text = model.done_bubble_minutes_text[0..model.done_bubble_minutes_text_len],
+                    .on_input = AppUi.inputMsg(.done_bubble_minutes_input),
+                    .semantics = .{ .label = i18n.t("Minutes before finished bubbles are removed", "完了した吹き出しを消すまでの分数") },
+                }, .{}),
+            }),
+        }),
+        ui.el(.panel, .{ .style_tokens = .{ .background = .surface, .radius = .md } }, .{
+            ui.row(.{ .padding = 12, .cross = .center, .gap = 12 }, .{
+                ui.column(.{ .grow = 1 }, .{
                     ui.text(.{}, i18n.t("Bubble text size", "吹き出しの文字サイズ")),
                     mutedParagraph(ui, i18n.t("Size of the bubble text", "吹き出しに表示する文字の大きさ")),
                 }),
