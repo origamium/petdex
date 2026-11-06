@@ -131,6 +131,7 @@ pub const Msg = union(enum) {
     usage_antigravity_response: native_sdk.EffectResponse,
     usage_gemini_project_response: native_sdk.EffectResponse,
     usage_gemini_quota_response: native_sdk.EffectResponse,
+    usage_claude_response: native_sdk.EffectResponse,
     chime_done: native_sdk.EffectExit,
     set_bubble_text_size: f32,
     bubble_lifetime_input: canvas.TextInputEvent,
@@ -235,7 +236,7 @@ pub const Msg = union(enum) {
     dismiss_bubble: u64,
     noop,
 
-    pub const view_unbound = .{ "frame_tick", "poll_tick", "bubble_tick", "frame_clock", "cycle_state", "native_drag_watchdog", "chime_done", "quit_app", "toggle_focus_mode", "shuffle_pet", "dsh_install_done", "dsh_remove_done", "remote_line", "remote_done", "remote_backoff", "update_boot_check", "update_response", "homebrew_done", "homebrew_timeout", "brew_command_copied", "auth_token_response", "auth_avatar_response", "auth_preview_response", "auth_library_done", "chat_line", "chat_response", "chat_models_response", "chatgpt_token_response", "usage_copilot_response", "usage_cursor_response", "usage_grok_response", "usage_antigravity_response", "usage_gemini_project_response", "usage_gemini_quota_response" };
+    pub const view_unbound = .{ "frame_tick", "poll_tick", "bubble_tick", "frame_clock", "cycle_state", "native_drag_watchdog", "chime_done", "quit_app", "toggle_focus_mode", "shuffle_pet", "dsh_install_done", "dsh_remove_done", "remote_line", "remote_done", "remote_backoff", "update_boot_check", "update_response", "homebrew_done", "homebrew_timeout", "brew_command_copied", "auth_token_response", "auth_avatar_response", "auth_preview_response", "auth_library_done", "chat_line", "chat_response", "chat_models_response", "chatgpt_token_response", "usage_copilot_response", "usage_cursor_response", "usage_grok_response", "usage_antigravity_response", "usage_gemini_project_response", "usage_gemini_quota_response", "usage_claude_response" };
 };
 
 pub const Model = struct {
@@ -3093,6 +3094,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .usage_antigravity_response => |response| onUsageResponse(model, .antigravity, response, usage_mod.windowsFromAntigravityQuota, fx),
         .usage_gemini_project_response => |response| onGeminiProjectResponse(model, response, fx),
         .usage_gemini_quota_response => |response| onUsageResponse(model, .gemini, response, usage_mod.windowsFromGeminiQuota, fx),
+        .usage_claude_response => |response| onUsageResponse(model, .@"claude-code", response, usage_mod.windowsFromClaudeUsage, fx),
         .usage_select => |index| {
             if (index >= usage_mod.agent_count) return;
             const agent: usage_mod.Agent = @enumFromInt(index);
@@ -4646,6 +4648,7 @@ const usage_grok_key: u64 = 62;
 const usage_antigravity_key: u64 = 63;
 const usage_gemini_project_key: u64 = 64;
 const usage_gemini_quota_key: u64 = 65;
+const usage_claude_key: u64 = 66;
 /// The column: rows of logo and percent.
 const usage_rows_w: f32 = 84;
 const usage_row_h: f32 = 22;
@@ -4753,7 +4756,9 @@ fn refreshUsage(model: *Model, fx: *Effects, now: i64) void {
 
 /// The agents' own endpoints, with the sign-ins their own apps keep.
 /// Without one, that row stays hidden. Grok's and Antigravity's tokens
-/// only count while unexpired: refreshing them is the CLIs' job.
+/// only count while unexpired: refreshing them is the CLIs' job. Claude
+/// Code's endpoint adds the per-model weekly limits its relay never
+/// carries; without it the relay's row stays.
 fn fetchUsage(model: *Model, fx: *Effects, home: []const u8) void {
     if (usageFetchReady(model, .copilot)) {
         var token_buf: [256]u8 = undefined;
@@ -4837,6 +4842,21 @@ fn fetchUsage(model: *Model, fx: *Effects, home: []const u8) void {
         } else {
             model.usage.set(.gemini, null);
         }
+    }
+    if (usageFetchReady(model, .@"claude-code")) {
+        var claude_dir_buf: [512]u8 = undefined;
+        var claude_tok_buf: [2048]u8 = undefined;
+        var claude_auth_buf: [2100]u8 = undefined;
+        const claude_dir = agent_mcp.presenceDir(&claude_dir_buf, home, .claude_code);
+        const claude_token = if (claude_dir) |dir| usage_mod.claudeToken(dir, &claude_tok_buf, model.usage.now_s) else null;
+        if (claude_token) |token| {
+            const headers = [_]std.http.Header{
+                .{ .name = "authorization", .value = std.fmt.bufPrint(&claude_auth_buf, "Bearer {s}", .{token}) catch return },
+                .{ .name = "anthropic-beta", .value = "oauth-2025-04-20" },
+                .{ .name = "accept", .value = "application/json" },
+            };
+            fx.fetch(.{ .key = usage_claude_key, .url = usage_mod.claude_usage_url, .headers = &headers, .timeout_ms = 15000, .on_response = Effects.responseMsg(.usage_claude_response) });
+        } else model.usage.set(.@"claude-code", null);
     }
     hook_server.mailbox.publishUsage(model.usage_limits, &model.usage);
 }
@@ -6038,6 +6058,7 @@ pub fn main(init: std.process.Init) !void {
     // column reads it from; the usage fetch honors it separately.
     usage_mod.env_gemini_force_file_storage = std.mem.eql(u8, init.environ_map.get("GEMINI_FORCE_FILE_STORAGE") orelse "", "true");
     usage_mod.env_grok_auth_path = init.environ_map.get("GROK_AUTH_PATH");
+    usage_mod.env_user = init.environ_map.get("USER");
     // Hook hot path: `<binary> bubble <phase> [agent]` runs the
     // in-binary runner and exits before any UI machinery spins up.
     // initAllocator, not init: on Windows the command line arrives as

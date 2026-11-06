@@ -285,8 +285,11 @@ Petdex installs configuration without bypassing that host review.
 
 Usage sources are separate from notifications:
 
-- Claude Code supplies plan limits through its statusline relay; removing the
-  integration or disabling usage restores the previous statusline command.
+- Claude Code supplies plan limits through its statusline relay, and its
+  per-model weekly limits (Opus, Sonnet, Fable) through its own OAuth session
+  against Anthropic's usage endpoint, read on macOS with the `security` tool
+  that keeps it. Removing the integration or disabling usage restores the
+  previous statusline command.
 - Codex uses quota observations in rollout files under the resolved Codex root.
   Resumed sessions are compared by observation time, not creation filenames.
 - Junie uses the latest JetBrains IDE quota observation. Copilot, Cursor and

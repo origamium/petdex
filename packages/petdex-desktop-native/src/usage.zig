@@ -2,7 +2,8 @@
 //! beside the pet: one row per agent at its tightest window, and, for the
 //! row clicked open, every window with its reset.
 //!
-//! Claude Code still reports through its statusline relay. Codex limits are
+//! Claude Code reports through its statusline relay, and its per-model
+//! weekly limits through its own OAuth usage endpoint. Codex limits are
 //! written by the MCP `petdex_report_usage` tool or the Stop hook and compared
 //! with observations from rollouts under the configured Codex root.
 //! Junie's credits sit in the JetBrains IDEs' quota file, a pool
@@ -12,6 +13,7 @@
 //! agent's refresh token signs that agent out.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const plat = @import("plat.zig");
 const sqlite = @import("sqlite.zig");
 
@@ -48,7 +50,7 @@ pub fn displayName(agent: Agent) []const u8 {
 /// Agents with an endpoint source in addition to local observations.
 fn fetchedByNet(agent: Agent) bool {
     return switch (agent) {
-        .cursor, .copilot, .grok, .antigravity, .gemini => true,
+        .@"claude-code", .cursor, .copilot, .grok, .antigravity, .gemini => true,
         else => false,
     };
 }
@@ -103,7 +105,7 @@ pub const State = struct {
         }
         const index = @intFromEnum(agent);
         self.network[index] = observed;
-        self.windows[index] = newestFresh(self.local[index], observed, self.now_s);
+        self.windows[index] = merged(self.local[index], observed, self.now_s);
     }
 };
 
@@ -150,12 +152,27 @@ fn fresh(windows: ?Windows, now_s: i64) ?Windows {
     return if (count == 0 and out.credits_used == null) null else out;
 }
 
-fn newestFresh(a: ?Windows, b: ?Windows, now_s: i64) ?Windows {
-    const left = fresh(a, now_s);
-    const right = fresh(b, now_s);
-    if (left == null) return right;
-    if (right == null) return left;
-    return if (right.?.observed_at > left.?.observed_at) right else left;
+/// The newest fresh observation, plus the other's windows it has none
+/// for: Claude Code's relay never carries the per-model weekly limits its
+/// endpoint does, and the relay's live numbers must not hide them.
+fn merged(a: ?Windows, b: ?Windows, now_s: i64) ?Windows {
+    const left = fresh(a, now_s) orelse return fresh(b, now_s);
+    const right = fresh(b, now_s) orelse return left;
+    const right_newer = right.observed_at > left.observed_at;
+    var out = if (right_newer) right else left;
+    const other = if (right_newer) left else right;
+    for (other.slice()) |win| {
+        if (out.len == out.items.len) break;
+        var known = false;
+        for (out.slice()) |have| {
+            if (have.minutes == win.minutes and std.mem.eql(u8, have.label(), win.label())) known = true;
+        }
+        if (!known) {
+            out.items[out.len] = win;
+            out.len += 1;
+        }
+    }
+    return out;
 }
 
 pub const Windows = struct {
@@ -419,6 +436,70 @@ pub fn windowsFromClaudeStatusline(payload: []const u8) ?Windows {
     return out;
 }
 
+pub const claude_usage_url = "https://api.anthropic.com/api/oauth/usage";
+/// The Keychain item Claude Code keeps its session in, under the login user.
+pub const claude_keychain_service = "Claude Code-credentials";
+pub var env_user: ?[]const u8 = null;
+
+/// Claude Code's OAuth session, while unexpired. On macOS the Keychain
+/// item is read through the `security` tool that wrote it: its ACL refuses
+/// other apps, and Claude Code rewrites it on every refresh, so an "Always
+/// Allow" would not stick. Elsewhere, Claude Code's credentials file.
+pub fn claudeToken(claude_home: []const u8, out: []u8, now_s: i64) ?[]const u8 {
+    var buf: [64 * 1024]u8 = undefined;
+    defer @memset(&buf, 0);
+    if (builtin.os.tag == .macos) {
+        if (builtin.is_test or !@import("secret_store.zig").unlocked()) return null;
+        const user = env_user orelse return null;
+        const json = plat.runCapture(&.{ "/usr/bin/security", "find-generic-password", "-s", claude_keychain_service, "-a", user, "-w" }, &buf) orelse return null;
+        return claudeTokenFrom(json, out, now_s);
+    } else {
+        var path_buf: [768]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/.credentials.json", .{claude_home}) catch return null;
+        return claudeTokenFrom(plat.readFile(path, &buf) orelse return null, out, now_s);
+    }
+}
+
+/// `claudeAiOauth.accessToken` while `expiresAt` (epoch milliseconds) is ahead.
+fn claudeTokenFrom(json: []const u8, out: []u8, now_s: i64) ?[]const u8 {
+    const Session = struct { accessToken: ?[]const u8 = null, expiresAt: ?f64 = null };
+    const Root = struct { claudeAiOauth: ?Session = null };
+    var parsed = std.json.parseFromSlice(Root, std.heap.page_allocator, std.mem.trim(u8, json, " \r\n"), .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    const session = parsed.value.claudeAiOauth orelse return null;
+    const token = session.accessToken orelse return null;
+    const expires_ms = session.expiresAt orelse return null;
+    if (!std.math.isFinite(expires_ms) or expires_ms <= @as(f64, @floatFromInt(now_s)) * 1000) return null;
+    if (token.len == 0 or token.len > out.len or !headerSafe(token)) return null;
+    @memcpy(out[0..token.len], token);
+    return out[0..token.len];
+}
+
+/// The usage endpoint's `limits`: each `group` (session, weekly) with
+/// `percent` and `resets_at`, a scoped one named by its model: the
+/// per-model weekly limits the statusline never carries.
+pub fn windowsFromClaudeUsage(body: []const u8) ?Windows {
+    const Model = struct { display_name: ?[]const u8 = null };
+    const Scope = struct { model: ?Model = null, surface: ?[]const u8 = null };
+    const Limit = struct { group: ?[]const u8 = null, percent: ?f64 = null, resets_at: ?[]const u8 = null, scope: ?Scope = null };
+    const Root = struct { limits: []const Limit = &.{} };
+    var parsed = std.json.parseFromSlice(Root, std.heap.page_allocator, body, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    var out: Windows = .{};
+    for (parsed.value.limits) |limit| {
+        const group = limit.group orelse continue;
+        const minutes: u32 = if (std.mem.eql(u8, group, "session")) five_hour_minutes else if (std.mem.eql(u8, group, "weekly")) week_minutes else 0;
+        const resets_at: i64 = if (limit.resets_at) |r| parseIso(r) orelse 0 else 0;
+        const before = out.len;
+        out.add(limit.percent, @floatFromInt(resets_at), @floatFromInt(minutes));
+        if (out.len == before) continue;
+        const scope = limit.scope orelse continue;
+        const name = (if (scope.model) |m| m.display_name else null) orelse scope.surface orelse continue;
+        out.items[out.len - 1].setLabel(name);
+    }
+    return if (out.len > 0) out else null;
+}
+
 /// A Codex rollout line carrying the account's limits. Lines with
 /// `"rate_limits":null` (an API-key session) are passed over.
 pub fn carriesCodexLimits(line: []const u8) bool {
@@ -558,8 +639,8 @@ pub fn readFiles(state: *State, home: []const u8, now_ms: i64) void {
             else => null,
         };
         const index = @intFromEnum(agent);
-        state.local[index] = newestFresh(windowsFromFile(home, agent), native, state.now_s);
-        state.windows[index] = newestFresh(state.local[index], state.network[index], state.now_s);
+        state.local[index] = merged(windowsFromFile(home, agent), native, state.now_s);
+        state.windows[index] = merged(state.local[index], state.network[index], state.now_s);
     }
 }
 
@@ -1253,6 +1334,50 @@ test "Claude Code's statusline limits, not its context window" {
     try t.expect(windowsFromClaudeStatusline("{\"rate_limits\":{}}") == null);
 }
 
+test "Claude Code's usage endpoint names its per-model weekly limits" {
+    const body =
+        \\{"five_hour":{"utilization":4.0},"limits":[
+        \\{"kind":"session","group":"session","percent":4,"resets_at":"2026-11-06T09:40:00.270611+00:00","scope":null},
+        \\{"kind":"weekly_all","group":"weekly","percent":4,"resets_at":"2026-11-06T16:00:00.270632+00:00","scope":null},
+        \\{"kind":"weekly_scoped","group":"weekly","percent":8,"resets_at":"2026-11-06T16:00:00.270797+00:00","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null}}]}
+    ;
+    const windows = windowsFromClaudeUsage(body).?;
+    try t.expectEqual(@as(usize, 3), windows.len);
+    try t.expectEqual(five_hour_minutes, windows.items[0].minutes);
+    try t.expectEqual(@as(i64, 1793958000), windows.items[0].resets_at);
+    try t.expectEqual(@as(usize, 0), windows.items[1].label_len);
+    try t.expectEqual(week_minutes, windows.items[2].minutes);
+    try t.expectEqual(@as(f64, 8), windows.items[2].used);
+    try t.expectEqualStrings("Fable", windows.items[2].label());
+    try t.expect(windowsFromClaudeUsage("{\"five_hour\":{\"utilization\":4.0}}") == null);
+}
+
+test "Claude Code's session JSON lends only an unexpired token" {
+    var out: [256]u8 = undefined;
+    const json = "{\"mcpOAuth\":{},\"claudeAiOauth\":{\"accessToken\":\"sk-ant-oat01-abc\",\"refreshToken\":\"r\",\"expiresAt\":1793948386381,\"scopes\":[\"user:inference\"]}}\n";
+    try t.expectEqualStrings("sk-ant-oat01-abc", claudeTokenFrom(json, &out, 1793948000).?);
+    try t.expect(claudeTokenFrom(json, &out, 1793948387) == null);
+    try t.expect(claudeTokenFrom("{\"claudeAiOauth\":{\"accessToken\":\"x\"}}", &out, 0) == null);
+}
+
+test "the relay's live windows keep the endpoint's per-model limits" {
+    var relay: Windows = .{ .observed_at = 1000 };
+    relay.add(60, 5000, five_hour_minutes);
+    relay.add(20, 9000, week_minutes);
+    var endpoint: Windows = .{ .observed_at = 900 };
+    endpoint.add(55, 5000, five_hour_minutes);
+    endpoint.add(19, 9000, week_minutes);
+    endpoint.add(8, 9000, week_minutes);
+    endpoint.items[2].setLabel("Fable");
+    const both = merged(relay, endpoint, 1000).?;
+    try t.expectEqual(@as(usize, 3), both.len);
+    try t.expectEqual(@as(f64, 60), both.items[0].used);
+    try t.expectEqualStrings("Fable", both.items[2].label());
+    try t.expectEqual(@as(i64, 1000), both.observed_at);
+    endpoint.observed_at = 1001;
+    try t.expectEqual(@as(f64, 55), merged(relay, endpoint, 1001).?.items[0].used);
+}
+
 test "a Codex token_count line's plan limits" {
     const line =
         \\{"timestamp":"2026-09-13T07:54:43.316Z","ordinal":3442,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1}},"rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":15.0,"window_minutes":10080,"resets_at":1789812651},"secondary":null,"credits":{"has_credits":false,"unlimited":false,"balance":"0"},"individual_limit":null,"spend_control_reached":null,"plan_type":"prolite","rate_limit_reached_type":null}}}
@@ -1606,7 +1731,7 @@ test "fresh local reports survive unavailable endpoints and lose to newer observ
     newer.observed_at = 1000;
     state.set(.cursor, newer);
     try t.expectEqual(@as(?u8, 72), state.used(.cursor));
-    try t.expect(newestFresh(report, newer, 6000) == null);
+    try t.expect(merged(report, newer, 6000) == null);
     try t.expect(fresh(Windows.one(95, 1, 300), 1000) == null);
 }
 

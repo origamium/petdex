@@ -999,6 +999,28 @@ fn runHerdrPluginList(allocator: std.mem.Allocator, binary: []const u8) ?[]u8 {
     return result.stdout;
 }
 
+/// A command's stdout into `out`: null when it fails, says nothing, or
+/// says more than fits. The copy the run allocates is zeroed before it
+/// goes; callers read secrets through this.
+pub fn runCapture(argv: []const []const u8, out: []u8) ?[]const u8 {
+    var scope = Scope.init();
+    defer scope.deinit();
+    const allocator = std.heap.page_allocator;
+    const result = std.process.run(allocator, scope.io(), .{
+        .argv = argv,
+        .stdout_limit = .limited(out.len + 1),
+        .stderr_limit = .limited(4096),
+    }) catch return null;
+    allocator.free(result.stderr);
+    defer {
+        @memset(result.stdout, 0);
+        allocator.free(result.stdout);
+    }
+    if (result.term != .exited or result.term.exited != 0 or result.stdout.len == 0 or result.stdout.len > out.len) return null;
+    @memcpy(out[0..result.stdout.len], result.stdout);
+    return out[0..result.stdout.len];
+}
+
 pub fn herdrPluginListAlloc(allocator: std.mem.Allocator, home: []const u8) ?[]u8 {
     if (runHerdrPluginList(allocator, "herdr")) |source| return source;
     var local_buf: [768]u8 = undefined;
