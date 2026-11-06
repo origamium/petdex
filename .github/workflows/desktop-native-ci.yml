@@ -37,7 +37,7 @@ jobs:
       matrix:
         include:
           - platform: macos
-            runner: macos-14
+            runner: macos-15
             expected_to_fail: false
     env:
       HERDR_PLUGIN_SOURCE: ${{ (github.event.pull_request.head.repo.full_name || github.repository) }}/packages/petdex-desktop-native/integrations/herdr

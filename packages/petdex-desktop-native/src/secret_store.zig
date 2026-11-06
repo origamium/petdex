@@ -32,6 +32,13 @@ pub fn readForeign(service_name: []const u8, account: []const u8, out: []u8) For
     return keychain.readService(service_name, account, out);
 }
 
+/// Whether the login keychain is open. A locked one would have the
+/// `security` tool raise an unlock dialog, which no poll should.
+pub fn unlocked() bool {
+    if (builtin.is_test or !use_keychain) return false;
+    return keychain.unlocked();
+}
+
 pub fn save(home: []const u8, account: []const u8, bytes: []const u8) bool {
     if (!accountOk(account) or bytes.len == 0) return false;
     if (use_keychain) return keychain.save(account, bytes);
@@ -126,6 +133,13 @@ const keychain = struct {
 
     extern "c" fn SecKeychainGetUserInteractionAllowed(allowed: *u8) c_int;
     extern "c" fn SecKeychainSetUserInteractionAllowed(allowed: u8) c_int;
+    extern "c" fn SecKeychainGetStatus(keychain_or_array: ?*const anyopaque, status: *u32) c_int;
+    const sec_unlock_state_status: u32 = 1;
+
+    fn unlocked() bool {
+        var status: u32 = 0;
+        return SecKeychainGetStatus(null, &status) == err_sec_success and status & sec_unlock_state_status != 0;
+    }
     fn readService(service_name: []const u8, account: []const u8, out: []u8) ForeignRead {
         var allowed: u8 = 0;
         if (SecKeychainGetUserInteractionAllowed(&allowed) != 0) return .unavailable;

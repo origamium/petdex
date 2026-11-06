@@ -4,7 +4,7 @@
   "name": "petdex-desktop-native",
   "display_name": "Petdex",
   "description": "Your pixel companion, always nearby.",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "icons": ["assets/icon.png"],
   "platforms": ["macos"],
   "url_schemes": [{ "scheme": "petdex" }],
