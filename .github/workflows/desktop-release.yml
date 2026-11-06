@@ -97,7 +97,7 @@ jobs:
     name: build macos ${{ matrix.arch }}
     needs: validate
     timeout-minutes: 90
-    runs-on: macos-14
+    runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:
