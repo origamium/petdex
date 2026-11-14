@@ -262,6 +262,8 @@ pub const Model = struct {
     hook_sim: bubble_sim.Sim = .{},
     /// The simulation's clock runs while a bubble is on screen.
     hook_ticking: bool = false,
+    /// Its interval: quicker while bubbles move, slower while they drift.
+    hook_tick_ms: u32 = 0,
     hook_last_tick_ms: i64 = 0,
     /// A bubble is under the cursor, so the bubble window takes clicks.
     hook_hover: bool = false,
@@ -466,6 +468,35 @@ pub const Model = struct {
 /// #5266ea family, cool-tinted near-white light surfaces, stone-900
 /// dark cards. High contrast keeps the stock loud register untouched.
 pub fn petdexThemeTokens(model: *const Model) canvas.DesignTokens {
+    // Every rebuild and every chat line measurement asks; the theme and
+    // its accent ramp are costly to derive and change only with these.
+    const key: ThemeKey = .{
+        .dark = model.dark,
+        .high_contrast = model.high_contrast,
+        .reduce_motion = model.reduce_motion,
+        .heading_size = model.bubble_text_px,
+        .custom_font = custom_font_active,
+        .measure = text_measure,
+    };
+    if (theme_cache) |cached| {
+        if (std.meta.eql(cached.key, key)) return cached.tokens;
+    }
+    const tokens = deriveThemeTokens(model);
+    theme_cache = .{ .key = key, .tokens = tokens };
+    return tokens;
+}
+
+const ThemeKey = struct {
+    dark: bool,
+    high_contrast: bool,
+    reduce_motion: bool,
+    heading_size: f32,
+    custom_font: bool,
+    measure: ?*const canvas.TextMeasureProvider,
+};
+var theme_cache: ?struct { key: ThemeKey, tokens: canvas.DesignTokens } = null;
+
+fn deriveThemeTokens(model: *const Model) canvas.DesignTokens {
     const scheme: canvas.ColorScheme = if (model.dark) .dark else .light;
     var tokens = canvas.DesignTokens.theme(.{
         .color_scheme = scheme,
@@ -2515,6 +2546,27 @@ fn selectSettingsPage(model: *Model, raw: u32) bool {
 }
 
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
+    applyMsg(model, msg, fx);
+    const print = viewInputs(model);
+    view_inputs_moved = print != view_inputs;
+    view_inputs = print;
+}
+
+/// What the model-only windows are drawn from: the model and the few
+/// globals their views read. windowScope skips them for a frame clock or
+/// poll tick that left this unchanged.
+fn viewInputs(model: *const Model) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(std.mem.asBytes(model));
+    hasher.update(std.mem.asBytes(&.{ bubble_window_w, bubble_window_h, usage_window_size[0], usage_window_size[1] }));
+    hasher.update(std.mem.asBytes(&.{ agents_icons_ready, tail_ready, custom_font_active }));
+    hasher.update(std.mem.asBytes(&.{ text_measure, i18n.current }));
+    return hasher.final();
+}
+var view_inputs: u64 = 0;
+var view_inputs_moved = true;
+
+fn applyMsg(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
         .frame_tick => |timer| {
             if (timer.outcome != .fired) return;
@@ -3654,6 +3706,9 @@ const bubble_window_max_h: f32 = 480;
 /// The simulation's clock, running only while a bubble is on screen.
 const hook_tick_key: u64 = 0xb0bb1e;
 const hook_tick_interval_ms: u32 = 33;
+/// Bubbles only drifting in place: a few points over seconds, which 20 fps
+/// draws as smoothly at a fraction of the redraws.
+const hook_drift_interval_ms: u32 = 50;
 
 comptime {
     std.debug.assert(bubble_sim.capacity == hook_server.max_bubbles);
@@ -4018,9 +4073,14 @@ fn startHookTicks(model: *Model, fx: *Effects) void {
     if (model.hook_ticking or !model.hook_sim.restless(hookLayout(model))) return;
     model.hook_ticking = true;
     model.hook_last_tick_ms = fx.wallMs();
+    armHookTicks(model, fx, hook_tick_interval_ms);
+}
+
+fn armHookTicks(model: *Model, fx: *Effects, interval_ms: u32) void {
+    model.hook_tick_ms = interval_ms;
     fx.startTimer(.{
         .key = hook_tick_key,
-        .interval_ms = hook_tick_interval_ms,
+        .interval_ms = interval_ms,
         .mode = .repeating,
         .on_fire = Effects.timerMsg(.bubble_tick),
     });
@@ -4047,7 +4107,10 @@ fn tickHookBubbles(model: *Model, fx: *Effects) void {
     if (!model.hook_sim.restless(hookLayout(model))) {
         fx.cancelTimer(hook_tick_key);
         model.hook_ticking = false;
+        return;
     }
+    const interval: u32 = if (model.hook_sim.drifting(hookLayout(model))) hook_drift_interval_ms else hook_tick_interval_ms;
+    if (interval != model.hook_tick_ms) armHookTicks(model, fx, interval);
 }
 
 /// The body under the global cursor, which the bubble window reports
@@ -5863,6 +5926,22 @@ test "preference navigation resets scrolling and ignores invalid destinations" {
     try std.testing.expectEqual(settings_view.Page.notifications, model.settings_page);
 }
 
+/// The clocks that run for as long as the app does touch few windows:
+/// the pet's frames only the pet, the bubbles' only their own window and
+/// the usage column riding beside it. The frame clock (every display
+/// refresh while the pet is on screen) and the poll redraw the others
+/// only when they changed what those are drawn from; settings and the
+/// flock also read what the poll loads, so the poll always redraws them.
+fn windowScope(msg: *const Msg, window_label: []const u8) bool {
+    return switch (msg.*) {
+        .frame_tick => false,
+        .bubble_tick => std.mem.eql(u8, window_label, "bubble") or std.mem.eql(u8, window_label, usage_window_label),
+        .frame_clock => view_inputs_moved,
+        .poll_tick => view_inputs_moved or std.mem.eql(u8, window_label, settings_window_label) or std.mem.eql(u8, window_label, flock_window_label),
+        else => true,
+    };
+}
+
 fn petdexWindowView(ui: *PetdexApp.Ui, model: *const Model, window_label: []const u8) PetdexApp.Ui.Node {
     if (std.mem.eql(u8, window_label, "bubble")) return bubbleView(ui, model);
     if (std.mem.eql(u8, window_label, usage_window_label)) return usageView(ui, model);
@@ -6147,6 +6226,7 @@ pub fn main(init: std.process.Init) !void {
         .on_urls_opened = onUrlsOpened,
         .windows_fn = petdexWindows,
         .window_view = petdexWindowView,
+        .window_scope = windowScope,
         .tokens_fn = petdexTokens,
         .fonts = app_fonts,
         .on_appearance = onAppearance,

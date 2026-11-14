@@ -1,0 +1,167 @@
+diff --git a/src/runtime/ui_app.zig b/src/runtime/ui_app.zig
+--- a/src/runtime/ui_app.zig
++++ b/src/runtime/ui_app.zig
+@@ -691,6 +691,11 @@
+             /// secondary window is a `canvas.CompiledMarkupView` whose
+             /// `build` this fn calls for the matching label.
+             window_view: ?*const fn (ui: *Ui, model: *const ModelT, window_label: []const u8) Ui.Node = null,
++            /// petdex: whether `msg`'s update can change the declared
++            /// window `window_label`. A window it cannot change keeps its
++            /// tree until a Msg that can arrives. Null rebuilds every
++            /// window on every Msg.
++            window_scope: ?*const fn (msg: *const MsgT, window_label: []const u8) bool = null,
+         };
+ 
+         /// Last-navigated webview pane state, tracked per shell label so
+@@ -750,6 +755,8 @@
+             tree: ?Ui.Tree = null,
+             arena_index: usize = 0,
+             arenas: [2]std.heap.ArenaAllocator,
++            /// petdex: a Msg in scope arrived since the last rebuild.
++            stale: bool = true,
+ 
+             fn init(backing: std.mem.Allocator) WindowSlot {
+                 return .{ .arenas = .{
+@@ -1165,6 +1172,7 @@
+             self.bindEffectsChannel(runtime);
+             self.syncModel(runtime, self.canvas_window_id);
+             self.applyMsg(msg);
++            self.markWindowSlots(&msg);
+             self.publishAudioState(runtime);
+             // Before the installing frame there is nothing to render
+             // against: canvas size and scale arrive with the first frame
+@@ -1207,6 +1215,7 @@
+             var dispatched = false;
+             while (self.effects.takeMsg()) |msg| {
+                 self.applyMsg(msg);
++                self.markWindowSlots(&msg);
+                 dispatched = true;
+             }
+             self.publishAudioState(runtime);
+@@ -2074,8 +2083,19 @@
+         /// model generation.
+         fn rebuildWindowSlots(self: *Self, runtime: *Runtime) anyerror!void {
+             for (self.window_slots[0..self.window_slot_count]) |*slot| {
+-                if (!slot.installed) continue;
++                if (!slot.installed or !slot.stale) continue;
+                 try self.rebuildWindowSlot(runtime, slot);
++                slot.stale = false;
++            }
++        }
++
++        /// petdex: flag the windows `msg` can change (`window_scope`).
++        fn markWindowSlots(self: *Self, msg: *const MsgT) void {
++            for (self.window_slots[0..self.window_slot_count]) |*slot| {
++                if (self.options.window_scope) |scope| {
++                    if (!scope(msg, slot.label())) continue;
++                }
++                slot.stale = true;
+             }
+         }
+ 
+@@ -3132,6 +3152,7 @@
+                 try self.rebuildWindowSlot(runtime, slot);
+                 _ = try runtime.emitCanvasWidgetDisplayList(slot.window_id, slot.canvasLabel(), runtime.tokensWithTextMeasure(self.slotEffectiveTokens(slot)));
+                 slot.installed = true;
++                slot.stale = false;
+             } else if (@abs(slot.pixel_snap_scale - scale) > 0.001) {
+                 // THIS window moved to a different density (the main
+                 // canvas may still be on its old monitor): adopt the
+@@ -3643,6 +3664,7 @@
+         /// closing it re-derives the views directly.
+         fn rebuildAllViews(self: *Self, runtime: *Runtime) anyerror!void {
+             if (!self.installed) return;
++            for (self.window_slots[0..self.window_slot_count]) |*slot| slot.stale = true;
+             try self.rebuild(runtime, self.canvas_window_id);
+             try self.rebuildWindowSlots(runtime);
+         }
+diff --git a/src/runtime/ui_app_window_tests.zig b/src/runtime/ui_app_window_tests.zig
+--- a/src/runtime/ui_app_window_tests.zig
++++ b/src/runtime/ui_app_window_tests.zig
+@@ -714,4 +714,86 @@
+     // main window still answers after the secondary's churn.
+     try app_state.dispatch(&harness.runtime, 1, .minimize_main);
+     try std.testing.expectEqual(@as(u32, 3), app_state.effects.windowActionState().minimize_count);
++}
++
++const ScopeModel = struct {
++    loud: u32 = 0,
++    quiet: u32 = 0,
++};
++
++const ScopeMsg = union(enum) {
++    loud,
++    quiet,
++};
++
++const ScopeApp = ui_app_model.UiApp(ScopeModel, ScopeMsg);
++
++fn scopeUpdate(model: *ScopeModel, msg: ScopeMsg) void {
++    switch (msg) {
++        .loud => model.loud += 1,
++        .quiet => model.quiet += 1,
++    }
++}
++
++fn scopeView(ui: *ScopeApp.Ui, model: *const ScopeModel) ScopeApp.Ui.Node {
++    return ui.text(.{}, ui.fmt("main {d} {d}", .{ model.loud, model.quiet }));
++}
++
++fn scopeWindows(model: *const ScopeModel, scratch: *ScopeApp.WindowsScratch) []const ScopeApp.WindowDescriptor {
++    _ = model;
++    scratch.windows[0] = .{ .label = settings_window_label, .canvas_label = settings_canvas_label, .title = "Settings", .width = 320, .height = 240 };
++    return scratch.windows[0..1];
++}
++
++fn scopeWindowView(ui: *ScopeApp.Ui, model: *const ScopeModel, window_label: []const u8) ScopeApp.Ui.Node {
++    _ = window_label;
++    return ui.text(.{}, ui.fmt("window {d} {d}", .{ model.loud, model.quiet }));
++}
++
++fn scopeOfMsg(msg: *const ScopeMsg, window_label: []const u8) bool {
++    _ = window_label;
++    return msg.* != .quiet;
++}
++
++fn layoutHasText(layout: canvas.WidgetLayoutTree, text: []const u8) bool {
++    for (layout.nodes) |node| {
++        if (std.mem.eql(u8, node.widget.text, text)) return true;
++    }
++    return false;
+ }
++
++test "window_scope keeps a window's tree through Msgs out of its scope" {
++    const harness = try core.TestHarness().create(std.testing.allocator, .{ .size = geometry.SizeF.init(400, 300) });
++    defer harness.destroy(std.testing.allocator);
++    harness.null_platform.gpu_surfaces = true;
++    const app_state = try ScopeApp.create(std.heap.page_allocator, .{
++        .name = "ui-app-scope",
++        .scene = panel_scene,
++        .canvas_label = canvas_label,
++        .update = scopeUpdate,
++        .view = scopeView,
++        .windows_fn = scopeWindows,
++        .window_view = scopeWindowView,
++        .window_scope = scopeOfMsg,
++    });
++    defer app_state.destroy();
++    const app = app_state.app();
++    try harness.start(app);
++    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_frame = .{ .label = canvas_label, .size = geometry.SizeF.init(400, 300), .scale_factor = 2, .frame_index = 1, .timestamp_ns = 1_000_000, .nonblank = true } });
++    var buffer: [support.platform.max_windows]support.platform.WindowInfo = undefined;
++    var window_id: support.platform.WindowId = 0;
++    for (harness.runtime.listWindows(&buffer)) |info| {
++        if (std.mem.eql(u8, info.label, settings_window_label)) window_id = info.id;
++    }
++    try std.testing.expect(window_id != 0);
++    try harness.runtime.dispatchPlatformEvent(app, .{ .gpu_surface_frame = .{ .window_id = window_id, .label = settings_canvas_label, .size = geometry.SizeF.init(320, 240), .scale_factor = 2, .frame_index = 1, .timestamp_ns = 2_000_000, .nonblank = true } });
++
++    // Out of scope: the main canvas follows the model, the window does not.
++    try app_state.dispatch(&harness.runtime, 1, .quiet);
++    try std.testing.expect(layoutHasText(try harness.runtime.canvasWidgetLayout(1, canvas_label), "main 0 1"));
++    try std.testing.expect(layoutHasText(try harness.runtime.canvasWidgetLayout(window_id, settings_canvas_label), "window 0 0"));
++
++    // In scope: the window catches up on everything it skipped.
++    try app_state.dispatch(&harness.runtime, 1, .loud);
++    try std.testing.expect(layoutHasText(try harness.runtime.canvasWidgetLayout(window_id, settings_canvas_label), "window 1 1"));
++}

@@ -1,0 +1,204 @@
+diff --git a/src/runtime/shell_layout.zig b/src/runtime/shell_layout.zig
+index ab17e36..9d3043c 100644
+--- a/src/runtime/shell_layout.zig
++++ b/src/runtime/shell_layout.zig
+@@ -21,6 +21,15 @@ pub const RuntimeShellLayout = struct {
+         return self.views[0..self.view_count];
+     }
+ 
++    /// A relocated layout owns new buffers; its views must not borrow the
++    /// previous array slot, which may immediately host another window.
++    pub fn rebindOwnedSlices(self: *RuntimeShellLayout) void {
++        for (self.views[0..self.view_count], 0..) |*view, index| {
++            view.label = self.label_storage[index][0..view.label.len];
++            if (view.parent) |parent| view.parent = self.parent_storage[index][0..parent.len];
++        }
++    }
++
+     pub fn copyViews(self: *RuntimeShellLayout, source: []const app_manifest.ShellView) !void {
+         if (source.len > self.views.len) return error.ViewLimitReached;
+         for (source, 0..) |view, index| {
+diff --git a/src/runtime/state.zig b/src/runtime/state.zig
+index 639b165..b0a0293 100644
+--- a/src/runtime/state.zig
++++ b/src/runtime/state.zig
+@@ -37,6 +37,22 @@ pub const RuntimeWindow = struct {
+     title_storage: [platform.max_window_title_bytes]u8 = undefined,
+     main_parent_storage: [platform.max_view_label_bytes]u8 = undefined,
+     source_storage: RuntimeSourceStorage = .{},
++
++    /// Struct assignment moves the owned buffers, but leaves slices pointing
++    /// at the old slot. Rebind them before that slot can be reused.
++    pub fn rebindOwnedSlices(self: *RuntimeWindow) void {
++        self.info.label = self.label_storage[0..self.info.label.len];
++        self.info.title = self.title_storage[0..self.info.title.len];
++        if (self.main_parent) |parent| self.main_parent = self.main_parent_storage[0..parent.len];
++        if (self.source) |*source| {
++            source.bytes = self.source_storage.bytes[0..source.bytes.len];
++            if (source.asset_options) |*assets| {
++                assets.root_path = self.source_storage.asset_root_path[0..assets.root_path.len];
++                assets.entry = self.source_storage.asset_entry[0..assets.entry.len];
++                assets.origin = self.source_storage.asset_origin[0..assets.origin.len];
++            }
++        }
++    }
+ };
+ 
+ pub const RuntimeMainWebViewState = struct {
+diff --git a/src/runtime/window_command_bridge_tests.zig b/src/runtime/window_command_bridge_tests.zig
+index da73bf5..e0e60f0 100644
+--- a/src/runtime/window_command_bridge_tests.zig
++++ b/src/runtime/window_command_bridge_tests.zig
+@@ -401,3 +401,132 @@ test "runtime handles built-in JavaScript platform support commands" {
+     try std.testing.expect(std.mem.indexOf(u8, chromium_platform.lastBridgeResponse(), "\"invalid_request\"") != null);
+     try std.testing.expect(std.mem.indexOf(u8, chromium_platform.lastBridgeResponse(), "Platform feature is invalid") != null);
+ }
++
++const WindowStorageRegressionApp = struct {
++    fn app(self: *@This()) App {
++        return .{ .context = self, .name = "window-storage-regression", .source = platform.WebViewSource.html("<p>storage</p>") };
++    }
++};
++const WindowStorage = @import("window_storage.zig").RuntimeWindowStorage(Runtime);
++
++test "runtime window storage preserves surviving windows when an earlier window reopens" {
++    const harness = try TestHarness().create(std.testing.allocator, .{});
++    defer harness.destroy(std.testing.allocator);
++    var app_state: WindowStorageRegressionApp = .{};
++    try harness.start(app_state.app());
++    var chat = try harness.runtime.createWindow(.{ .label = "chat", .title = "Chat" });
++    const bubble = try harness.runtime.createWindow(.{ .label = "bubble", .title = "Agent notifications" });
++    const usage = try harness.runtime.createWindow(.{ .label = "usage", .title = "Usage limits" });
++    for (0..100) |_| {
++        try harness.runtime.closeWindow(chat.id);
++        chat = try harness.runtime.createWindow(.{ .label = "chat", .title = "Reopened chat" });
++        var output: [platform.max_windows]platform.WindowInfo = undefined;
++        const windows = harness.runtime.listWindows(&output);
++        try std.testing.expectEqual(@as(usize, 4), windows.len);
++        const bubble_index = WindowStorage.findWindowIndexById(&harness.runtime, bubble.id).?;
++        const usage_index = WindowStorage.findWindowIndexById(&harness.runtime, usage.id).?;
++        try std.testing.expectEqualStrings("bubble", windows[bubble_index].label);
++        try std.testing.expectEqualStrings("Agent notifications", windows[bubble_index].title);
++        try std.testing.expectEqualStrings("usage", windows[usage_index].label);
++        try std.testing.expectEqualStrings("Usage limits", windows[usage_index].title);
++        try std.testing.expect(windows[bubble_index].open and windows[usage_index].open);
++        try std.testing.expectEqual(bubble_index, WindowStorage.findWindowIndexByLabel(&harness.runtime, "bubble").?);
++    }
++}
++
++test "runtime window storage preserves shell labels and parents when an earlier window closes" {
++    const harness = try TestHarness().create(std.testing.allocator, .{});
++    defer harness.destroy(std.testing.allocator);
++    var app_state: WindowStorageRegressionApp = .{};
++    try harness.start(app_state.app());
++    var chat = try harness.runtime.createWindow(.{ .label = "chat", .title = "Chat" });
++    const bubble = try harness.runtime.createWindow(.{ .label = "bubble", .title = "Bubble" });
++    const usage = try harness.runtime.createWindow(.{ .label = "usage", .title = "Usage" });
++    const chat_views: []const app_manifest.ShellView = &.{.{ .label = "chat-canvas", .kind = .gpu_surface, .fill = true }};
++    try WindowStorage.bindShellViews(&harness.runtime, chat.id, chat_views);
++    try WindowStorage.bindShellViews(&harness.runtime, bubble.id, &.{
++        .{ .label = "bubble-root", .kind = .gpu_surface, .fill = true },
++        .{ .label = "bubble-canvas", .kind = .gpu_surface, .parent = "bubble-root", .layer = 7 },
++    });
++    try WindowStorage.bindShellViews(&harness.runtime, usage.id, &.{.{ .label = "usage-canvas", .kind = .gpu_surface, .fill = true }});
++    for (0..100) |_| {
++        try harness.runtime.closeWindow(chat.id);
++        chat = try harness.runtime.createWindow(.{ .label = "chat", .title = "Chat" });
++        try WindowStorage.bindShellViews(&harness.runtime, chat.id, chat_views);
++        const layout = WindowStorage.shellLayoutForWindow(&harness.runtime, bubble.id).?;
++        try std.testing.expectEqual(@as(usize, 2), layout.view_count);
++        try std.testing.expectEqualStrings("bubble-root", layout.views[0].label);
++        try std.testing.expect(layout.views[0].parent == null);
++        try std.testing.expectEqualStrings("bubble-canvas", layout.views[1].label);
++        try std.testing.expectEqualStrings("bubble-root", layout.views[1].parent.?);
++        try std.testing.expectEqual(@as(i32, 7), layout.views[1].layer);
++        try std.testing.expectEqual(layout.label_storage[1][0..].ptr, layout.views[1].label.ptr);
++        try std.testing.expectEqual(layout.parent_storage[1][0..].ptr, layout.views[1].parent.?.ptr);
++        const usage_layout = WindowStorage.shellLayoutForWindow(&harness.runtime, usage.id).?;
++        try std.testing.expectEqualStrings("usage-canvas", usage_layout.views[0].label);
++        try std.testing.expectEqual(usage_layout.label_storage[0][0..].ptr, usage_layout.views[0].label.ptr);
++    }
++}
++
++test "runtime window storage relocation retains all owned source metadata" {
++    const harness = try TestHarness().create(std.testing.allocator, .{});
++    defer harness.destroy(std.testing.allocator);
++    const runtime = &harness.runtime;
++    const sources = [_]?platform.WebViewSource{
++        null,
++        platform.WebViewSource.html("<p>surviving html</p>"),
++        platform.WebViewSource.url("https://example.test/survivor"),
++        platform.WebViewSource.assets(.{ .root_path = "/fixture/assets", .entry = "nested/main.html", .origin = "zero://survivor", .spa_fallback = false }),
++    };
++    _ = try WindowStorage.reserveWindow(runtime, 1, "removed", "Removed", null, true);
++    for (sources, 0..) |source, index| {
++        var label: [32]u8 = undefined;
++        const slot = try WindowStorage.reserveWindow(runtime, index + 2, try std.fmt.bufPrint(&label, "survivor-{d}", .{index}), "Preserved title", source, false);
++        const window = &runtime.windows[slot];
++        @memcpy(window.main_parent_storage[0..6], "parent");
++        window.main_parent = window.main_parent_storage[0..6];
++        window.main_frame_set = true;
++        window.main_layer = 7;
++        window.main_zoom = 1.5;
++    }
++    WindowStorage.removeWindowAt(runtime, 0);
++    _ = try WindowStorage.reserveWindow(runtime, 20, "replacement", "Overwrite old slot", platform.WebViewSource.html("replacement"), true);
++    for (sources, 0..) |expected_source, index| {
++        const window = &runtime.windows[index];
++        var label: [32]u8 = undefined;
++        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&label, "survivor-{d}", .{index}), window.info.label);
++        try std.testing.expectEqualStrings("Preserved title", window.info.title);
++        try std.testing.expectEqualStrings("parent", window.main_parent.?);
++        try std.testing.expectEqual(window.label_storage[0..].ptr, window.info.label.ptr);
++        try std.testing.expectEqual(window.title_storage[0..].ptr, window.info.title.ptr);
++        try std.testing.expectEqual(window.main_parent_storage[0..].ptr, window.main_parent.?.ptr);
++        try std.testing.expect(window.main_frame_set and !window.source_reloads_from_app);
++        try std.testing.expectEqual(@as(i32, 7), window.main_layer);
++        try std.testing.expectEqual(@as(f64, 1.5), window.main_zoom);
++        if (expected_source) |expected| {
++            const actual = window.source.?;
++            try std.testing.expectEqual(expected.kind, actual.kind);
++            try std.testing.expectEqualStrings(expected.bytes, actual.bytes);
++            try std.testing.expectEqual(window.source_storage.bytes[0..].ptr, actual.bytes.ptr);
++            if (expected.asset_options) |assets| {
++                const actual_assets = actual.asset_options.?;
++                try std.testing.expectEqualStrings(assets.root_path, actual_assets.root_path);
++                try std.testing.expectEqualStrings(assets.entry, actual_assets.entry);
++                try std.testing.expectEqualStrings(assets.origin, actual_assets.origin);
++                try std.testing.expectEqual(assets.spa_fallback, actual_assets.spa_fallback);
++                try std.testing.expectEqual(window.source_storage.asset_root_path[0..].ptr, actual_assets.root_path.ptr);
++                try std.testing.expectEqual(window.source_storage.asset_entry[0..].ptr, actual_assets.entry.ptr);
++                try std.testing.expectEqual(window.source_storage.asset_origin[0..].ptr, actual_assets.origin.ptr);
++            } else try std.testing.expect(actual.asset_options == null);
++        } else try std.testing.expect(window.source == null);
++    }
++    // Also cover a middle removal, the last slot, and an out-of-range no-op.
++    WindowStorage.removeWindowAt(runtime, 1);
++    try std.testing.expectEqualStrings("survivor-2", runtime.windows[1].info.label);
++    try std.testing.expectEqualStrings("survivor-3", runtime.windows[2].info.label);
++    try std.testing.expectEqual(runtime.windows[2].source_storage.asset_entry[0..].ptr, runtime.windows[2].source.?.asset_options.?.entry.ptr);
++    WindowStorage.removeWindowAt(runtime, runtime.window_count - 1);
++    WindowStorage.removeWindowAt(runtime, runtime.window_count);
++    try std.testing.expectEqual(@as(usize, 3), runtime.window_count);
++    try std.testing.expectEqualStrings("survivor-0", runtime.windows[0].info.label);
++}
+diff --git a/src/runtime/window_storage.zig b/src/runtime/window_storage.zig
+index f947bd6..ed0c133 100644
+--- a/src/runtime/window_storage.zig
++++ b/src/runtime/window_storage.zig
+@@ -120,6 +120,7 @@ pub fn RuntimeWindowStorage(comptime Runtime: type) type {
+             var cursor = index;
+             while (cursor + 1 < self.window_count) : (cursor += 1) {
+                 self.windows[cursor] = self.windows[cursor + 1];
++                self.windows[cursor].rebindOwnedSlices();
+             }
+             self.window_count -= 1;
+         }
+@@ -223,6 +224,7 @@ pub fn RuntimeWindowStorage(comptime Runtime: type) type {
+             var cursor = index;
+             while (cursor + 1 < self.shell_layout_count) : (cursor += 1) {
+                 self.shell_layouts[cursor] = self.shell_layouts[cursor + 1];
++                self.shell_layouts[cursor].rebindOwnedSlices();
+             }
+             self.shell_layout_count -= 1;
+         }

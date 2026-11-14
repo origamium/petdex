@@ -222,6 +222,40 @@ fn fit(model: *const Model, text: []const u8, width: f32, comptime max: usize) F
 /// fit at any text size: the hook bubble's card measures its text at the
 /// bubble text size.
 pub fn fitSized(model: *const Model, text: []const u8, width: f32, size: f32, line_height: f32, comptime max: usize) Fit {
+    // Every rebuild re-measures the same transcript several times over;
+    // the wrap depends only on these, so remember the recent answers.
+    const key: FitKey = .{
+        .text_hash = std.hash.Wyhash.hash(0, text),
+        .text_len = text.len,
+        .width = width,
+        .size = size,
+        .line_height = line_height,
+        .max = max,
+        .custom_font = app.custom_font_active,
+        .measure = app.text_measure,
+    };
+    const entry = &fit_cache[key.text_hash % fit_cache.len];
+    if (entry.*) |cached| {
+        if (std.meta.eql(cached.key, key)) return cached.fit;
+    }
+    const f = layoutFit(model, text, width, size, line_height, max);
+    entry.* = .{ .key = key, .fit = f };
+    return f;
+}
+
+const FitKey = struct {
+    text_hash: u64,
+    text_len: usize,
+    width: f32,
+    size: f32,
+    line_height: f32,
+    max: usize,
+    custom_font: bool,
+    measure: ?*const canvas.TextMeasureProvider,
+};
+var fit_cache: [64]?struct { key: FitKey, fit: Fit } = @splat(null);
+
+fn layoutFit(model: *const Model, text: []const u8, width: f32, size: f32, line_height: f32, comptime max: usize) Fit {
     const tokens = app.petdexTokens(model);
     var lines: [max + 1]canvas.TextLine = undefined;
     const count = if (canvas.layoutTextRun(.{
