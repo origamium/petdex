@@ -30,6 +30,9 @@ const open_s: f32 = 0.22;
 const pop_s: f32 = 0.25;
 /// Below this speed (points per second) a resting bubble counts as still.
 const settle_speed: f32 = 0.5;
+/// Above this a swaying bubble is going somewhere, not drifting: the
+/// drift alone peaks near drift_px * tau / 3.
+const drift_speed: f32 = 20;
 /// A stall or a sleeping machine must not teleport anything.
 const max_dt: f32 = 0.05;
 
@@ -324,6 +327,28 @@ pub const Sim = struct {
             if (@abs(b.x - homes[i].x) > 0.5 or @abs(b.y - homes[i].y) > 0.5) return true;
         }
         return false;
+    }
+
+    /// Restless only from the drift: nothing grows, pops, opens or is on
+    /// its way somewhere, so a slower clock draws the same motion.
+    pub fn drifting(self: *const Sim, layout: Layout) bool {
+        if (layout.still or self.height != layout.height) return false;
+        var homes: [capacity]Point = undefined;
+        self.placeHomes(layout, &homes);
+        var any = false;
+        for (self.bodies, 0..) |b, i| {
+            if (!b.live()) continue;
+            if (b.leaving or b.pop > 0 or b.born < 1) return false;
+            if (b.open != @as(f32, if (b.opened) 1 else 0)) return false;
+            const sway = b.open == 0 and b.sways();
+            // The drift itself reaches drift_px each way; the spring lags it.
+            const reach: f32 = if (sway) drift_px * 2 else 0.5;
+            const speed: f32 = if (sway) drift_speed else settle_speed;
+            if (@abs(b.x - homes[i].x) > reach or @abs(b.y - homes[i].y) > reach) return false;
+            if (@abs(b.vx) > speed or @abs(b.vy) > speed) return false;
+            any = any or sway;
+        }
+        return any;
     }
 
     /// Anything still on screen, popping ones included.
@@ -734,6 +759,21 @@ test "working and waiting bubbles keep the clock running" {
     try t.expect(!still_sim.restless(still));
     run(&sim, &.{.{ .id = 1, .status = .failed }}, 5);
     try t.expect(!sim.restless(test_layout));
+}
+
+test "a settled working bubble only drifts; a new or popping one does more" {
+    var sim: Sim = .{};
+    run(&sim, &.{.{ .id = 1, .status = .working }}, 0.1);
+    try t.expect(!sim.drifting(test_layout));
+    run(&sim, &.{.{ .id = 1, .status = .working }}, 5);
+    try t.expect(sim.drifting(test_layout));
+    run(&sim, &.{ .{ .id = 1, .status = .working }, .{ .id = 2, .status = .done } }, 0.1);
+    try t.expect(!sim.drifting(test_layout));
+    run(&sim, &.{ .{ .id = 1, .status = .working }, .{ .id = 2, .status = .done } }, 5);
+    try t.expect(sim.drifting(test_layout));
+    // Nothing sways at all: at rest, not drifting.
+    run(&sim, &.{.{ .id = 2, .status = .done }}, 5);
+    try t.expect(!sim.drifting(test_layout));
 }
 
 test "a conversation that leaves pops at once, card and all" {

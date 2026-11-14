@@ -16,6 +16,7 @@ PATCHES=(
   "$ROOT/patches/native-sdk-window-screen.patch"
   "$ROOT/patches/native-sdk-window-quiet-show.patch"
   "$ROOT/patches/native-sdk-window-storage-relocation.patch"
+  "$ROOT/patches/native-sdk-window-scope.patch"
 )
 SDK="${NATIVE_SDK_PATH:-}"
 
