@@ -55,7 +55,9 @@ Petdex は、連携して動く 3 つの要素でできている。
 - **ペットとチャット。** ペットをクリックして話しかける。接続先は ChatGPT、またはローカルの OpenAI 互換サーバー(LM Studio、Ollama)。人格は `pet.json`、任意の `persona.md`、`~/.petdex/personas/<slug>.md` から読み込む。履歴はローカルの SQLite に保存され、頼んだ事柄を少数だけ覚えてくれる。ダブルクリックでエージェントの状況報告が聞ける。
 - **ペットから話しかける(任意)。** 数分おきの雑談と、エージェントが待っているときの声かけ。どちらも初期状態ではオフで、チャットを閉じている間や Focus Mode 中は黙っている。
 - **タイマー。** チャット下に常駐するポモドーロとカウントダウン。完了はペットが自分の口調で知らせる。チャットからも操作できる(`25分タイマー始めて`、`timer start`)。
-- **使用量の上限(macOS)。** 各エージェントの 5 時間枠と週枠がどれだけ使われ、いつリセットされるかをペットの横に表示する。ペット自身もこの数字を把握している。
+- **使用量の上限(macOS)。** 各エージェントのいちばん埋まっている枠の使用率をペットの横に表示する。行をクリックすると、Claude Code のモデル別の週枠も含めて、すべての枠とリセットまでの時間が開く。ペット自身もこの数字を把握している。
+- **Flock。** 実行中のエージェント 1 つにつき 1 匹ずつ、それぞれの状態で並ぶウィンドウ。Herdr から来たものはクリックでそのペインにフォーカスする。
+- **メニュー。** ペットの右クリックメニューとメニューバーから、チャット、タイマー、バブル、Flock、使用量の上限を表示・非表示にできる。Focus Mode、待機中の通知音、通知の消去もここにある。
 - **MCP サーバー。** Node 20+ 用のサーバーを同梱(`petdex_set_state`、`petdex_show_bubble`、`petdex_report_usage`、`petdex_status`、`petdex_get_sessions`)。エージェント側の任意の操作と読み出しに使え、13 ホスト向けのインストーラーがある。
 - **SSH 経由のリモートエージェント。** 別マシンのエージェントも、監視付きのリバーストンネル越しに同じペットを動かせる。[デスクトップ README](./packages/petdex-desktop-native/README.md#remote-agents-ssh) を参照。
 - **言語と外観。** UI は英語と日本語。Auto / Light / Dark、ペットのサイズは 0.4〜2 倍、マルチディスプレイ対応の配置。
@@ -72,8 +74,9 @@ npx petdex install boba
 
 `~/.petdex/pets/boba/` に `pet.json` とスプライトシートが入っていれば OK。
 
-2. [petdex.dev/download](https://petdex.dev/download) からデスクトップアプリを入手する。
-   このフォークのリリースは Apple Silicon の macOS のみ(Linux と Windows はソースからビルド。デスクトップ README を参照)。
+2. このフォークの[最新リリース](https://github.com/origamium/petdex/releases/latest)から `Petdex-arm64.dmg` をダウンロードする。
+   署名・公証済みで、Apple Silicon の Mac のみ(Linux と Windows はソースからビルド。デスクトップ README を参照)。
+   新しいバージョンは 設定 → General で確認できる。
 
 3. アプリを開き、ペットの上で <kbd>Cmd</kbd>+<kbd>,</kbd> を押して設定を開く。
    **Pets** でペットを選び、**Connections** でコーディングエージェントをそれぞれワンクリックで接続する。
@@ -88,7 +91,7 @@ npx petdex install boba
 | ペットを探す | [petdex.dev](https://petdex.dev) を開く |
 | ペットをインストールする | `npx petdex install <slug>` |
 | 表示中のマスコットを切り替える | デスクトップアプリの設定を開く(<kbd>Cmd</kbd>+<kbd>,</kbd>) |
-| デスクトップのフローターを動かす | [petdex.dev/download](https://petdex.dev/download) からダウンロード |
+| デスクトップアプリを使う | [Releases](https://github.com/origamium/petdex/releases/latest) からダウンロード |
 | ペットとチャットする | ペットをクリック、または <kbd>Cmd</kbd>+<kbd>K</kbd> |
 | コーディングエージェントを接続する | 設定 → Connections |
 | ペットを作る | Codex 内で `hatch-pet` スキルを使うか、[Petdex クリエイターツール](https://petdex.dev/create)で作る |
@@ -106,7 +109,7 @@ Petdex の上に何かを作りたい場合(デスクトップクライアント
 - **ペットパッケージ形式** — どのペットも `pet.json` と `spritesheet.{webp,png}` の組み合わせ。スプライトシートは 192x208 フレームの 8x9 グリッド、または v2 の 8x11 グリッド。
 - **ローカルのデスクトップ向けインターフェース** — デスクトップアプリは `127.0.0.1:7777` でトークン保護されたエージェントフックを受け付け、状態の設定、バブル表示、使用量報告、セッションカードの読み出しができる MCP サーバーも同梱する。詳細は [`docs/agent-integration-support.md`](./docs/agent-integration-support.md)。
 
-これらを使ったオープンソース/ソース公開プロジェクトはすでに 21 個ある。一覧は [petdex.dev/built-with](https://petdex.dev/built-with) を参照。自分のプロジェクトは [issue テンプレート](https://github.com/origamium/petdex/issues/new?template=built-with.yml)から登録できる。
+これらを使ったプロジェクトの一覧は [petdex.dev/built-with](https://petdex.dev/built-with) を参照。自分のプロジェクトは [issue テンプレート](https://github.com/origamium/petdex/issues/new?template=built-with.yml)から登録できる。
 
 ## アーキテクチャ
 
