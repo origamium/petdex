@@ -29,6 +29,8 @@
 
 </div>
 
+English | [日本語](./README.ja.md)
+
 ---
 
 ## What is Petdex
@@ -53,7 +55,9 @@ The desktop app (`packages/petdex-desktop-native`) was rebuilt on [Native SDK](h
 - **Chat with the pet.** Click the pet to talk to it through ChatGPT or a local OpenAI-compatible server (LM Studio, Ollama). The persona comes from `pet.json`, an optional `persona.md`, or `~/.petdex/personas/<slug>.md`. History is kept in a local SQLite database, and the pet can remember a few facts you ask it to. Double-click for a catch-up on your agents.
 - **Pet speaks first (opt-in).** Small talk every few minutes, and a nudge when an agent needs you. Both are off by default and silent while chat is closed or Focus Mode is on.
 - **Timer.** A persistent Pomodoro and countdown timer under the chat. The pet announces completions in its own voice, and you can drive the timer from chat (`25分タイマー始めて`, `timer start`).
-- **Usage limits (macOS).** A column beside the pet shows how much of each agent's five-hour and weekly limits is used, and when they reset. The pet knows the numbers too.
+- **Usage limits (macOS).** A column beside the pet shows how full each agent's tightest limit is. Click a row for every window and when it resets, including Claude Code's per-model weekly limits. The pet knows the numbers too.
+- **Flock.** A window with one body per running agent, each in its own state. Click one that came from Herdr to focus its pane.
+- **Menus.** The pet's right-click menu and the menu-bar extra show or hide the chat, timer, bubbles, Flock and usage limits, and hold Focus Mode, the waiting sound and Clear Notifications.
 - **MCP server.** A bundled Node 20+ server (`petdex_set_state`, `petdex_show_bubble`, `petdex_report_usage`, `petdex_status`, `petdex_get_sessions`) gives agents optional controls and readback. Installers exist for 13 hosts.
 - **Remote agents over SSH.** Agents on other machines drive the same pet through a supervised reverse tunnel. See the [desktop README](./packages/petdex-desktop-native/README.md#remote-agents-ssh).
 - **Languages and appearance.** English and Japanese UI, Auto / Light / Dark, pet size from 0.4× to 2×, and multi-display aware placement.
@@ -70,8 +74,9 @@ npx petdex install boba
 
 You should see `~/.petdex/pets/boba/` with `pet.json` and a spritesheet.
 
-2. Get the desktop app from [petdex.dev/download](https://petdex.dev/download). It
-   This fork's releases are Apple Silicon macOS only (Linux and Windows build from source, see the desktop README).
+2. Download `Petdex-arm64.dmg` from this fork's [latest release](https://github.com/origamium/petdex/releases/latest).
+   It is signed and notarized, for Apple Silicon Macs only (Linux and Windows build from source, see the desktop README).
+   Settings → General checks for later versions.
 
 3. Open it, then hit <kbd>Cmd</kbd>+<kbd>,</kbd> over the pet to open Settings.
    Pick your pet under **Pets**, and connect your coding agents under **Connections**
@@ -87,7 +92,7 @@ makes. Click it to chat.
 | Browse pets | Visit [petdex.dev](https://petdex.dev) |
 | Install a pet | `npx petdex install <slug>` |
 | Switch active mascot | Open Settings in the desktop app (<kbd>Cmd</kbd>+<kbd>,</kbd>) |
-| Run the desktop floater | Download it from [petdex.dev/download](https://petdex.dev/download) |
+| Run the desktop app | Download it from [Releases](https://github.com/origamium/petdex/releases/latest) |
 | Chat with your pet | Click it, or press <kbd>Cmd</kbd>+<kbd>K</kbd> |
 | Connect a coding agent | Settings → Connections |
 | Make a pet | Use the `hatch-pet` skill inside Codex, or build one with the [Petdex creator tools](https://petdex.dev/create) |
@@ -104,7 +109,7 @@ If you want to build on top of Petdex (a desktop client, a wearable, an SDK, a D
 - **The pet package format.** Every pet is a `pet.json` plus a `spritesheet.{webp,png}` rendered as an 8x9 grid of 192x208 frames, or the v2 8x11 grid.
 - **The local desktop surfaces.** The desktop app listens on `127.0.0.1:7777` for token-gated agent hooks, and ships an MCP server for agents that want to set state, show a bubble, report usage or read back their session cards. See [`docs/agent-integration-support.md`](./docs/agent-integration-support.md).
 
-21 open-source and source-available projects already build on these. See [petdex.dev/built-with](https://petdex.dev/built-with) for the catalog, then [submit yours via the issue template](https://github.com/origamium/petdex/issues/new?template=built-with.yml).
+See [petdex.dev/built-with](https://petdex.dev/built-with) for projects that build on these, then [submit yours via the issue template](https://github.com/origamium/petdex/issues/new?template=built-with.yml).
 
 ## Architecture
 
